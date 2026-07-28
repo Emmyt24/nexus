@@ -39,6 +39,22 @@ impl NotificationService {
         let from_name = std::env::var("SMTP_FROM_NAME").unwrap_or_else(|_| "NexusCare".to_string());
 
         let mock = smtp_host.is_empty() || smtp_user.is_empty() || smtp_pass.is_empty();
+        if mock {
+            tracing::warn!(
+                "NotificationService in MOCK mode — emails will NOT be sent. \
+                 Missing SMTP config (host_set={}, user_set={}, pass_set={}).",
+                !smtp_host.is_empty(),
+                !smtp_user.is_empty(),
+                !smtp_pass.is_empty(),
+            );
+        } else {
+            tracing::info!(
+                "NotificationService SMTP configured: host={} port={} from={}",
+                smtp_host,
+                smtp_port,
+                from_email,
+            );
+        }
         let smtp = if !mock {
             let creds = Credentials::new(smtp_user, smtp_pass);
             AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&smtp_host)
