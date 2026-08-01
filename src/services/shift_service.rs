@@ -115,6 +115,48 @@ pub enum ShiftServiceError {
 
     #[error("Wallet error: {0}")]
     WalletError(String),
+
+    #[error("Worker location required to list nearby shifts")]
+    LocationRequired,
+
+    #[error("Shift is no longer available")]
+    ShiftUnavailable,
+
+    #[error("Worker already declined this shift")]
+    WorkerAlreadyDeclined,
+
+    #[error("This offer has already been responded to")]
+    OfferAlreadyResponded,
+}
+
+/// A worker's origin for nearby-shift discovery: live GPS supplied on the
+/// request. Persisted as the last-known location when present.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkerOrigin {
+    pub lat: f64,
+    pub lng: f64,
+    pub accuracy_meters: Option<f32>,
+}
+
+/// Pair each shift requirement with whether it is satisfied by the clinician's
+/// qualifications (SCRUM-25 / US-09 AC-04). Matching is case-insensitive and
+/// whitespace-trimmed so "ACLS Certified" matches "acls certified".
+fn match_qualifications(
+    requirements: &[String],
+    quals: &[String],
+) -> Vec<crate::models::shift::QualificationMatch> {
+    use std::collections::HashSet;
+    let held: HashSet<String> = quals
+        .iter()
+        .map(|q| q.trim().to_lowercase())
+        .collect();
+    requirements
+        .iter()
+        .map(|req| crate::models::shift::QualificationMatch {
+            requirement: req.clone(),
+            met: held.contains(&req.trim().to_lowercase()),
+        })
+        .collect()
 }
 
 pub struct ShiftService {
@@ -123,6 +165,7 @@ pub struct ShiftService {
     notification_service: Arc<NotificationService>,
     email_outbox: Arc<EmailOutboxService>,
     wallet_service: Arc<crate::services::wallet_service::WalletService>,
+    push: Arc<crate::services::push_service::PushService>,
 }
 
 impl ShiftService {
@@ -132,6 +175,7 @@ impl ShiftService {
         notification_service: Arc<NotificationService>,
         email_outbox: Arc<EmailOutboxService>,
         wallet_service: Arc<crate::services::wallet_service::WalletService>,
+        push: Arc<crate::services::push_service::PushService>,
     ) -> Self {
         Self {
             shift_repo,
@@ -139,6 +183,7 @@ impl ShiftService {
             notification_service,
             email_outbox,
             wallet_service,
+            push,
         }
     }
 
@@ -293,6 +338,75 @@ impl ShiftService {
             .ok_or(ShiftServiceError::NotFound(shift_id))
     }
 
+    /// Enriched shift detail for the "View Shift Details" screen (SCRUM-25 /
+    /// US-09): base shift plus tasks, requirements, hospital rating, and — for
+    /// in-person shifts — the hospital location. When `requester_user_id` is a
+    /// clinician, each requirement is matched against their qualifications.
+    pub async fn get_shift_detail(
+        &self,
+        shift_id: Uuid,
+        requester_user_id: Option<Uuid>,
+    ) -> Result<crate::models::shift::ShiftDetailResponse, ShiftServiceError> {
+        use crate::models::shift::{
+            HospitalLocation, HospitalRatingSummary, ShiftDetailResponse, ShiftType,
+        };
+
+        let shift = self
+            .shift_repo
+            .get_by_id(shift_id)
+            .await?
+            .ok_or(ShiftServiceError::NotFound(shift_id))?;
+
+        let tasks = self.shift_repo.list_shift_tasks(shift_id).await?;
+        let requirements = self.shift_repo.list_shift_requirements(shift_id).await?;
+
+        let (average, count) = self
+            .shift_repo
+            .hospital_rating_summary(shift.hospital_id)
+            .await?;
+        let hospital_rating = HospitalRatingSummary {
+            average: average.unwrap_or(0.0),
+            count,
+        };
+
+        // Map coordinates only make sense for in-person shifts (AC-06).
+        let hospital_location = match shift.shift_type {
+            ShiftType::InPerson => self
+                .shift_repo
+                .get_hospital_coordinates(shift.hospital_id)
+                .await?
+                .map(|(latitude, longitude)| HospitalLocation {
+                    latitude,
+                    longitude,
+                }),
+            ShiftType::Virtual => None,
+        };
+
+        // Qualification match is only meaningful for a clinician viewer (AC-04).
+        let qualification_match = match requester_user_id {
+            Some(user_id) => match self.shift_repo.find_clinician_id_for_user(user_id).await? {
+                Some(clinician_id) => {
+                    let quals = self
+                        .shift_repo
+                        .list_clinician_qualifications(clinician_id)
+                        .await?;
+                    match_qualifications(&requirements, &quals)
+                }
+                None => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+
+        Ok(ShiftDetailResponse {
+            shift,
+            tasks,
+            requirements,
+            qualification_match,
+            hospital_rating,
+            hospital_location,
+        })
+    }
+
     pub async fn list_shifts(
         &self,
         status_filter: Option<ShiftStatus>,
@@ -324,19 +438,46 @@ impl ShiftService {
             .await?
             .ok_or(ShiftServiceError::NotFound(shift_id))?;
 
-        let is_waitlisted = shift.assigned_clinician_id.is_some();
-        let result = self
+        // US-10 AC-04: interest is only accepted while the shift is open. Once
+        // it has been assigned (or otherwise moved on) it is no longer available.
+        if shift.status != ShiftStatus::Open {
+            return Err(ShiftServiceError::ShiftUnavailable);
+        }
+
+        match self
             .shift_repo
-            .add_interest(shift_id, clinician_id, false, is_waitlisted)
+            .add_interest(shift_id, clinician_id, false, false)
+            .await
+        {
+            Ok(()) => {}
+            Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+                return Err(ShiftServiceError::DuplicateInterest)
+            }
+            Err(err) => return Err(ShiftServiceError::DatabaseError(err)),
+        }
+
+        // US-10 AC-05: let the hospital admin know a worker is available.
+        let worker_name = self
+            .shift_repo
+            .get_clinician_contact(clinician_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|(first, last, _)| format!("{} {}", first.trim(), last.trim()).trim().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "A worker".to_string());
+
+        self.push
+            .notify_best_effort(
+                shift.created_by,
+                "interest_expressed",
+                "New interest in your shift",
+                &format!("{worker_name} is interested in \"{}\"", shift.role_title),
+                serde_json::json!({ "shift_id": shift_id, "clinician_id": clinician_id }),
+            )
             .await;
 
-        match result {
-            Ok(()) => Ok(()),
-            Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
-                Err(ShiftServiceError::DuplicateInterest)
-            }
-            Err(err) => Err(ShiftServiceError::DatabaseError(err)),
-        }
+        Ok(())
     }
 
     pub async fn apply_for_shift(
@@ -660,6 +801,15 @@ impl ShiftService {
             return Err(ShiftServiceError::NotInterested);
         }
 
+        // US-06 AC-04: a worker who already declined cannot be re-offered.
+        if self
+            .shift_repo
+            .has_declined_offer(shift_id, clinician_id)
+            .await?
+        {
+            return Err(ShiftServiceError::WorkerAlreadyDeclined);
+        }
+
         let expires_at = Utc::now() + Duration::minutes(30);
         let assignment_id = match self
             .shift_repo
@@ -690,6 +840,21 @@ impl ShiftService {
             {
                 eprintln!("Warning: Failed to queue shift offer email: {}", e);
             }
+        }
+
+        // Push the offer to the clinician's devices (US-06 AC-01 / US-11 AC-01).
+        if let Ok(Some(clinician_user_id)) =
+            self.shift_repo.get_clinician_user_id(clinician_id).await
+        {
+            self.push
+                .notify_best_effort(
+                    clinician_user_id,
+                    "shift_offered",
+                    "New shift offer",
+                    &format!("You have a shift offer for {}", shift.role_title),
+                    serde_json::json!({ "shift_id": shift_id, "expires_at": expires_at }),
+                )
+                .await;
         }
 
         Ok((assignment_id, expires_at))
@@ -752,9 +917,16 @@ impl ShiftService {
         })?;
 
         let mut tx = self.pool.begin().await?;
-        self.shift_repo
+        // The guarded UPDATE serializes concurrent accepts of the same offer
+        // (US-11 UT020): if it flips no rows, another accept already won — abort
+        // so we don't double-assign. Dropping `tx` rolls back.
+        let updated = self
+            .shift_repo
             .accept_offer_tx(&mut tx, assignment_id, &consent_json)
             .await?;
+        if updated == 0 {
+            return Err(ShiftServiceError::OfferAlreadyResponded);
+        }
         self.shift_repo
             .cancel_sibling_offers_tx(&mut tx, shift_id, assignment_id)
             .await?;
@@ -816,6 +988,18 @@ impl ShiftService {
                 .await;
         }
 
+        // Push the assignment confirmation to the hospital admin who created
+        // the shift (US-06 AC-06 / US-11 AC-10).
+        self.push
+            .notify_best_effort(
+                shift.created_by,
+                "shift_accepted",
+                "Shift assigned",
+                &format!("Your shift \"{}\" was accepted", shift.role_title),
+                serde_json::json!({ "shift_id": shift_id }),
+            )
+            .await;
+
         Ok(assignment_id)
     }
 
@@ -869,6 +1053,17 @@ impl ShiftService {
                     .enqueue_email(&hospital_email, &content)
                     .await;
             }
+
+            // Push the decline to the hospital admin (US-11 AC-12).
+            self.push
+                .notify_best_effort(
+                    shift.created_by,
+                    "shift_declined",
+                    "Offer declined",
+                    &format!("A worker declined your shift \"{}\"", shift.role_title),
+                    serde_json::json!({ "shift_id": shift_id }),
+                )
+                .await;
         }
 
         Ok(())
@@ -1426,13 +1621,23 @@ impl ShiftService {
         Ok(updated)
     }
 
-    /// "Shifts Near You" for the authenticated worker. Returns
-
+    /// Worker shift discovery (SCRUM-24 / US-08). Returns open shifts within
+    /// `radius_km` of the worker's origin, ranked by urgency then distance.
+    ///
+    /// The origin is resolved in priority order: live GPS from the request (also
+    /// persisted for later use), else the worker's last-known location. When
+    /// neither is available a [`ShiftServiceError::LocationRequired`] is returned
+    /// so the caller can prompt for location access. Filtering, sorting and
+    /// paging are performed in SQL — see [`ShiftRepository::list_nearby_shifts`].
     pub async fn list_nearby_shifts_for_worker(
         &self,
         worker_user_id: Uuid,
+        origin: Option<WorkerOrigin>,
+        radius_km: f64,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<crate::models::shift::NearbyShiftCard>, ShiftServiceError> {
-        use crate::models::shift::{NearbyShiftCard, ShiftPriority, ShiftType};
+        use crate::models::shift::NearbyShiftCard;
 
         let clinician_id = self
             .shift_repo
@@ -1440,66 +1645,48 @@ impl ShiftService {
             .await?
             .ok_or(ShiftServiceError::NoClinicianProfile)?;
 
+        // Resolve the origin: live GPS wins and is persisted; otherwise fall
+        // back to the last-known location; otherwise ask the caller for one.
+        let (origin_lat, origin_lng) = match origin {
+            Some(o) => {
+                self.shift_repo
+                    .upsert_clinician_location(clinician_id, o.lat, o.lng, o.accuracy_meters)
+                    .await?;
+                (o.lat, o.lng)
+            }
+            None => self
+                .shift_repo
+                .get_clinician_location(clinician_id)
+                .await?
+                .ok_or(ShiftServiceError::LocationRequired)?,
+        };
+
         let rows = self
             .shift_repo
-            .list_open_shifts_for_worker(clinician_id)
+            .list_nearby_shifts(clinician_id, origin_lat, origin_lng, radius_km, limit, offset)
             .await?;
 
-        let mut cards: Vec<NearbyShiftCard> = rows
+        // Rows arrive already filtered, ranked and paged; map them 1:1.
+        let cards = rows
             .into_iter()
-            .map(|r| {
-                // Distance only meaningful for in-person shifts with both endpoints.
-                let distance_km = match (
-                    r.shift_type.clone(),
-                    r.hospital_lat,
-                    r.hospital_lng,
-                    r.clinician_lat,
-                    r.clinician_lng,
-                ) {
-                    (ShiftType::InPerson, Some(h_lat), Some(h_lng), Some(c_lat), Some(c_lng)) => {
-                        Some(crate::utils::geo::haversine_km(h_lat, h_lng, c_lat, c_lng))
-                    }
-                    _ => None,
-                };
-                NearbyShiftCard {
-                    shift_id: r.shift_id,
-                    hospital_id: r.hospital_id,
-                    hospital_name: r.hospital_name,
-                    role_title: r.role_title,
-                    specialty: r.specialty,
-                    shift_type: r.shift_type,
-                    priority: r.priority,
-                    scheduled_start: r.scheduled_start,
-                    duration_hours: r.duration_hours,
-                    pay_type: r.pay_type,
-                    rate_kobo_per_hour: r.rate_kobo_per_hour,
-                    fixed_rate_kobo: r.fixed_rate_kobo,
-                    stat_bonus_kobo: r.stat_bonus_kobo,
-                    distance_km,
-                    interest_expressed: r.interest_expressed,
-                }
+            .map(|r| NearbyShiftCard {
+                shift_id: r.shift_id,
+                hospital_id: r.hospital_id,
+                hospital_name: r.hospital_name,
+                role_title: r.role_title,
+                specialty: r.specialty,
+                shift_type: r.shift_type,
+                priority: r.priority,
+                scheduled_start: r.scheduled_start,
+                duration_hours: r.duration_hours,
+                pay_type: r.pay_type,
+                rate_kobo_per_hour: r.rate_kobo_per_hour,
+                fixed_rate_kobo: r.fixed_rate_kobo,
+                stat_bonus_kobo: r.stat_bonus_kobo,
+                distance_km: r.distance_km,
+                interest_expressed: r.interest_expressed,
             })
-            .collect(); // Urgency rank: STAT > Urgent > Normal > Scheduled.
-        fn urgency_rank(p: &ShiftPriority) -> u8 {
-            match p {
-                ShiftPriority::Stat => 0,
-                ShiftPriority::Urgent => 1,
-                ShiftPriority::Normal => 2,
-                ShiftPriority::Scheduled => 3,
-            }
-        }
-
-        cards.sort_by(|a, b| {
-            urgency_rank(&a.priority)
-                .cmp(&urgency_rank(&b.priority))
-                .then_with(|| match (a.distance_km, b.distance_km) {
-                    (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                })
-                .then_with(|| a.scheduled_start.cmp(&b.scheduled_start))
-        });
+            .collect();
 
         Ok(cards)
     }
@@ -2489,4 +2676,49 @@ pub struct ShiftPreview {
     pub grand_total_kobo: i64,
     pub virtual_link: Option<String>,
     pub estimated_matches: i32,
+}
+
+#[cfg(test)]
+mod qualification_match_tests {
+    //! SCRUM-25 / US-09 AC-04 (UT009) — requirement/qualification matching.
+    use super::match_qualifications;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// UT009 — met requirements are flagged true, missing ones false.
+    #[test]
+    fn ut009_matches_and_misses() {
+        let reqs = v(&["ACLS Certified", "2+ years experience", "Valid license"]);
+        let quals = v(&["acls certified", "valid license"]);
+        let result = match_qualifications(&reqs, &quals);
+
+        assert_eq!(result.len(), 3);
+        assert!(result[0].met, "case-insensitive match expected");
+        assert!(!result[1].met, "missing qualification should be false");
+        assert!(result[2].met);
+        // Original requirement text is preserved for display.
+        assert_eq!(result[0].requirement, "ACLS Certified");
+    }
+
+    /// Whitespace around tags is ignored when matching.
+    #[test]
+    fn trims_whitespace() {
+        let result = match_qualifications(&v(&["  BLS  "]), &v(&["bls"]));
+        assert!(result[0].met);
+    }
+
+    /// No requirements yields an empty match set (UT020 empty state).
+    #[test]
+    fn empty_requirements_yield_empty() {
+        assert!(match_qualifications(&[], &v(&["anything"])).is_empty());
+    }
+
+    /// A clinician with no qualifications meets nothing.
+    #[test]
+    fn no_quals_meets_nothing() {
+        let result = match_qualifications(&v(&["X", "Y"]), &[]);
+        assert!(result.iter().all(|m| !m.met));
+    }
 }

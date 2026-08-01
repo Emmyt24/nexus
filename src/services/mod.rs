@@ -6,12 +6,14 @@ pub mod distance_service;
 pub mod email_outbox_service;
 pub mod email_templates;
 pub mod encryption;
+pub mod fcm;
 pub mod geocoding;
 pub mod here_maps;
 pub mod identity_verification_service;
 pub mod location_service;
 pub mod notification_service;
 pub mod payout_service;
+pub mod push_service;
 pub mod registration_service;
 pub mod safehaven;
 pub mod shift_service;
@@ -29,8 +31,10 @@ pub use identity_verification_service::{
     IdentityError, IdentityKind, IdentityOwner, IdentityVerificationService,
 };
 pub use location_service::{LocationService, LocationServiceError};
+pub use fcm::{FcmClient, FcmError, PushOutcome};
 pub use notification_service::{NotificationError, NotificationService};
 pub use payout_service::{PayoutService, PayoutServiceError};
+pub use push_service::{PushError, PushService};
 pub use registration_service::{
     HospitalRegistrationResult, RegistrationError, RegistrationService, RegistrationStatusResponse,
 };

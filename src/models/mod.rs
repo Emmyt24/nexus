@@ -11,6 +11,7 @@ pub mod here_maps;
 pub mod hospital;
 pub mod location;
 pub mod permission;
+pub mod notification;
 pub mod registration;
 pub mod shift;
 pub mod user;

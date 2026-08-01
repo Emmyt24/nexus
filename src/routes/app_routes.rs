@@ -21,21 +21,23 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     admin, auth, clinician_registration, distance, earnings, health, here_maps, hospitals,
-    identity, location, registration, shifts, wallet, webhooks,
+    identity, location, notifications, registration, shifts, wallet, webhooks,
 };
 use crate::repositories::{
     admin::AdminRepository, audit::AuditRepository, billing::BillingRepository,
     clinician::ClinicianRepository,
     hospital::HospitalRepository, identity_verification::IdentityVerificationRepository,
-    location::LocationRepository, shift::ShiftRepository, wallet::WalletRepository,
+    location::LocationRepository, notification::NotificationRepository, shift::ShiftRepository,
+    wallet::WalletRepository,
 };
 use crate::services::{
     admin_service::AdminService, audit_service::AuditService, auth_service::AuthService,
     clinician_registration_service::ClinicianRegistrationService,
     distance_service::DistanceService, email_outbox_service::EmailOutboxService,
-    encryption::EncryptionService, geocoding::GeocodingClient, here_maps::HereMapsClient,
-    identity_verification_service::IdentityVerificationService, location_service::LocationService,
-    notification_service::NotificationService, payout_service::PayoutService,
+    encryption::EncryptionService, fcm::FcmClient, geocoding::GeocodingClient,
+    here_maps::HereMapsClient, identity_verification_service::IdentityVerificationService,
+    location_service::LocationService, notification_service::NotificationService,
+    payout_service::PayoutService, push_service::PushService,
     registration_service::RegistrationService, safehaven::SafeHavenClient,
     shift_service::ShiftService, wallet_service::WalletService,
 };
@@ -55,6 +57,7 @@ pub struct AppState {
     pub safehaven: Arc<SafeHavenClient>,
     pub here_maps_client: Arc<HereMapsClient>,
     pub distance_service: Arc<DistanceService>,
+    pub push_service: Arc<PushService>,
 }
 
 #[derive(OpenApi)]
@@ -168,6 +171,11 @@ pub struct AppState {
         crate::handlers::webhooks::safehaven_webhook,
         // Earnings
         crate::handlers::earnings::get_earnings,
+        // Notifications & devices
+        crate::handlers::notifications::register_device,
+        crate::handlers::notifications::revoke_device,
+        crate::handlers::notifications::list_notifications,
+        crate::handlers::notifications::mark_notification_read,
     ),
     components(
         schemas(
@@ -203,6 +211,10 @@ pub struct AppState {
             crate::models::shift::EditRatingRequest,
             crate::models::shift::RatingResponse,
             crate::models::shift::NearbyShiftCard,
+            crate::models::shift::ShiftDetailResponse,
+            crate::models::shift::HospitalRatingSummary,
+            crate::models::shift::QualificationMatch,
+            crate::models::shift::HospitalLocation,
             crate::models::shift::MyApplicationEntry,
             crate::models::shift::ClockinApprovalRequest,
             crate::models::shift::ClockinApprovalDecisionRequest,
@@ -222,6 +234,13 @@ pub struct AppState {
             crate::services::payout_service::PayoutRow,
             crate::handlers::earnings::EarningsSummary,
             crate::handlers::earnings::EarningsTransaction,
+            // Notifications & devices
+            crate::handlers::notifications::ErrorResponse,
+            crate::models::notification::RegisterDeviceRequest,
+            crate::models::notification::RevokeDeviceRequest,
+            crate::models::notification::DevicePlatform,
+            crate::models::notification::Notification,
+            crate::models::notification::NotificationPage,
             // Admin
             crate::handlers::admin::ClinicianListResponse,
             crate::handlers::admin::PaginationMetadata,
@@ -354,7 +373,8 @@ pub struct AppState {
         (name = "wallet", description = "Hospital wallet — balance, deposits, ledger (Tier 2)"),
         (name = "webhooks", description = "Inbound webhooks from external providers (SafeHaven)"),
         (name = "earnings", description = "Worker earnings — totals + transaction history"),
-        (name = "identity", description = "BVN/NIN identity verification and bank list")
+        (name = "identity", description = "BVN/NIN identity verification and bank list"),
+        (name = "notifications", description = "Device push-token registration and the in-app notification center")
     ),
     modifiers(&SecurityAddon)
 )]
@@ -462,12 +482,20 @@ pub fn create_router(
 
     let auth_service = Arc::new(AuthService::new(pool.clone(), email_outbox_service.clone()));
 
+    // Push notifications: FCM client (mock unless FCM_SERVER_KEY is set),
+    // notification repo, and the service tying them together.
+    let notification_repo = Arc::new(NotificationRepository::new(pool.clone()));
+    let fcm_client = Arc::new(FcmClient::from_env());
+    let push_service = Arc::new(PushService::new(notification_repo, fcm_client));
+
+    // Initialize shift service
     let shift_service = Arc::new(ShiftService::new(
         shift_repo,
         pool.clone(),
         notification_service.clone(),
         email_outbox_service.clone(),
         wallet_service.clone(),
+        push_service.clone(),
     ));
 
     // Initialize payout service. Borrows the wallet repo so it can
@@ -496,6 +524,7 @@ pub fn create_router(
         safehaven: safehaven_client.clone(),
         here_maps_client,
         distance_service,
+        push_service,
     };
 
     let api_router = Router::new()
@@ -830,6 +859,19 @@ pub fn create_router(
             "/api/v1/worker/earnings",
             get(earnings::get_earnings)
                 .route_layer(from_fn(require_role(&[UserRole::HealthWorker]))),
+        )
+        // ---- Push notifications — any authenticated user.
+        .route(
+            "/api/v1/devices/token",
+            post(notifications::register_device).delete(notifications::revoke_device),
+        )
+        .route(
+            "/api/v1/notifications",
+            get(notifications::list_notifications),
+        )
+        .route(
+            "/api/v1/notifications/{notification_id}/read",
+            post(notifications::mark_notification_read),
         )
         .layer(TraceLayer::new_for_http())
         .layer(cors)

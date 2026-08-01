@@ -6,6 +6,7 @@ pub mod email_outbox;
 pub mod hospital;
 pub mod identity_verification;
 pub mod location;
+pub mod notification;
 pub mod shift;
 pub mod wallet;
 
