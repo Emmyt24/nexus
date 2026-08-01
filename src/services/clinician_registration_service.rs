@@ -35,7 +35,7 @@ pub enum ClinicianRegistrationError {
     Encryption(String),
     #[error("Clinician not found")]
     NotFound,
-    #[error("BVN and NIN must both be verified before adding a bank account")]
+    #[error("BVN or NIN must be verified before adding a bank account")]
     IdentityNotVerified,
 }
 
@@ -205,10 +205,10 @@ impl ClinicianRegistrationService {
         clinician_id: Uuid,
         req: AddBankAccountRequest,
     ) -> Result<BankAccountResponse, ClinicianRegistrationError> {
-        // Gate: both BVN and NIN must be verified before linking a payout account
+        // Gate: BVN or NIN must be verified before linking a payout account (either suffices)
         let verified = self
             .identity_service
-            .both_verified(IdentityOwner::Clinician, clinician_id)
+            .any_verified(IdentityOwner::Clinician, clinician_id)
             .await
             .map_err(|e| ClinicianRegistrationError::Validation(e.to_string()))?;
         if !verified {

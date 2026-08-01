@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::models::admin_registration::HospitalRegistrationRequest;
 use crate::routes::AppState;
+use crate::utils::extract_claims;
 use crate::services::registration_service::{
     HospitalListResponse, RegistrationError, RegistrationStatusResponse,
 };
@@ -175,10 +176,14 @@ pub async fn get_registration_status(
 )]
 pub async fn approve_hospital(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(hospital_id): Path<Uuid>,
     Json(request): Json<ApprovalRequest>,
 ) -> Result<Json<StatusChangeResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let admin_id = None;
+    // Attribute the approval to the acting admin from the bearer token.
+    let admin_id = extract_claims(&headers)
+        .ok()
+        .and_then(|c| Uuid::parse_str(&c.sub).ok());
 
     match state
         .registration_service
@@ -234,10 +239,14 @@ pub async fn approve_hospital(
 )]
 pub async fn reject_hospital(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(hospital_id): Path<Uuid>,
     Json(request): Json<RejectionRequest>,
 ) -> Result<Json<StatusChangeResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let admin_id = None;
+    // Attribute the rejection to the acting admin from the bearer token.
+    let admin_id = extract_claims(&headers)
+        .ok()
+        .and_then(|c| Uuid::parse_str(&c.sub).ok());
 
     match state
         .registration_service

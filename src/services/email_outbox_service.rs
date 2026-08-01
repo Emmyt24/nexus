@@ -67,6 +67,12 @@ impl EmailOutboxService {
                     processed += 1;
                 }
                 Err(err) => {
+                    tracing::error!(
+                        "Email send failed for {} (attempt {}): {}",
+                        item.to_email,
+                        attempts,
+                        err
+                    );
                     if attempts >= max_attempts {
                         self.repo.mark_failed(item.id, &err.to_string()).await?;
                     } else {

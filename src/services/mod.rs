@@ -1,3 +1,4 @@
+pub mod admin_service;
 pub mod audit_service;
 pub mod auth_service;
 pub mod clinician_registration_service;
@@ -18,6 +19,7 @@ pub mod safehaven;
 pub mod shift_service;
 pub mod wallet_service;
 
+pub use admin_service::AdminService;
 pub use audit_service::{AuditService, AuditServiceError, RegistrationDetails};
 pub use clinician_registration_service::{
     ClinicianRegistrationError, ClinicianRegistrationService,

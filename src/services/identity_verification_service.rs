@@ -198,12 +198,13 @@ impl IdentityVerificationService {
         Ok(())
     }
 
-    pub async fn both_verified(
+    /// True if either BVN or NIN is verified for this owner (either suffices).
+    pub async fn any_verified(
         &self,
         owner: IdentityOwner,
         owner_id: Uuid,
     ) -> Result<bool, IdentityError> {
-        Ok(self.repo.both_verified(owner.as_str(), owner_id).await?)
+        Ok(self.repo.any_verified(owner.as_str(), owner_id).await?)
     }
 
     /// Decrypt a stored, verified identity number (e.g. to pass a verified BVN
