@@ -149,8 +149,9 @@ impl IdentityVerificationRepository {
         ))
     }
 
-    /// True iff both BVN and NIN have `verified` rows for this owner.
-    pub async fn both_verified(
+    /// True if EITHER BVN or NIN has a `verified` row for this owner (either
+    /// one satisfies identity verification; both are no longer required).
+    pub async fn any_verified(
         &self,
         owner_type: &str,
         owner_id: Uuid,
@@ -169,6 +170,6 @@ impl IdentityVerificationRepository {
         .bind(owner_id)
         .fetch_one(&self.pool)
         .await?;
-        Ok(count >= 2)
+        Ok(count >= 1)
     }
 }

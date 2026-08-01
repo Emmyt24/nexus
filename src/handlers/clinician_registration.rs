@@ -149,7 +149,7 @@ fn map_err(e: ClinicianRegistrationError) -> AppError {
             AppError::Validation(format!("Bank account validation failed: {}", e))
         }
         ClinicianRegistrationError::IdentityNotVerified => AppError::Forbidden(
-            "BVN and NIN must both be verified before adding a bank account".to_string(),
+            "BVN or NIN must be verified before adding a bank account".to_string(),
         ),
         e => AppError::Internal(anyhow::anyhow!("{}", e)),
     }

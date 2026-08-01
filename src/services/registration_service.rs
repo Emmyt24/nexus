@@ -48,7 +48,7 @@ pub enum RegistrationError {
     #[error("External service error: {0}")]
     ExternalServiceError(String),
 
-    #[error("Hospital admin BVN and NIN must both be verified before approval")]
+    #[error("Hospital admin BVN or NIN must be verified before approval")]
     IdentityNotVerified,
 }
 
@@ -290,10 +290,10 @@ impl RegistrationService {
             ));
         }
 
-        // Gate: the hospital admin's BVN and NIN must both be verified
+        // Gate: the hospital admin's BVN or NIN must be verified (either suffices)
         let identity_verified = self
             .identity_service
-            .both_verified(IdentityOwner::Hospital, hospital_id)
+            .any_verified(IdentityOwner::Hospital, hospital_id)
             .await
             .map_err(|e| RegistrationError::ExternalServiceError(e.to_string()))?;
         if !identity_verified {

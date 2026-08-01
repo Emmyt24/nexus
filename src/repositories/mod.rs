@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod audit;
 pub mod billing;
 pub mod clinician;
@@ -8,6 +9,7 @@ pub mod location;
 pub mod shift;
 pub mod wallet;
 
+pub use admin::AdminRepository;
 pub use audit::AuditRepository;
 pub use billing::BillingRepository;
 pub use clinician::{ClinicianRepoError, ClinicianRepository};

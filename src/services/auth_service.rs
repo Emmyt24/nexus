@@ -265,9 +265,12 @@ impl AuthService {
 
         let refresh_token = self.issue_refresh_token(user.id).await?;
 
-        // role-based redirect path
+        // role-based redirect path (all admin sub-roles share the admin dashboard)
         let redirect_to = match user.role {
             UserRole::SuperAdmin => "/dashboard/super-admin",
+            UserRole::OperationsAdmin
+            | UserRole::VerificationAdmin
+            | UserRole::FinanceAdmin => "/dashboard/admin",
             UserRole::HospitalAdmin => "/dashboard/hospital",
             UserRole::HealthWorker => "/dashboard/staff",
         }

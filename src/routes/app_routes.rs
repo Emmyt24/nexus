@@ -4,7 +4,8 @@ use axum::{
     Router,
 };
 
-use crate::middlewares::require_role;
+use crate::middlewares::{require_permission, require_role};
+use crate::models::permission::Permission;
 use crate::models::user::UserRole;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -23,12 +24,13 @@ use crate::handlers::{
     identity, location, registration, shifts, wallet, webhooks,
 };
 use crate::repositories::{
-    audit::AuditRepository, billing::BillingRepository, clinician::ClinicianRepository,
+    admin::AdminRepository, audit::AuditRepository, billing::BillingRepository,
+    clinician::ClinicianRepository,
     hospital::HospitalRepository, identity_verification::IdentityVerificationRepository,
     location::LocationRepository, shift::ShiftRepository, wallet::WalletRepository,
 };
 use crate::services::{
-    audit_service::AuditService, auth_service::AuthService,
+    admin_service::AdminService, audit_service::AuditService, auth_service::AuthService,
     clinician_registration_service::ClinicianRegistrationService,
     distance_service::DistanceService, email_outbox_service::EmailOutboxService,
     encryption::EncryptionService, geocoding::GeocodingClient, here_maps::HereMapsClient,
@@ -48,6 +50,7 @@ pub struct AppState {
     pub wallet_service: Arc<WalletService>,
     pub payout_service: Arc<PayoutService>,
     pub clinician_repo: Arc<ClinicianRepository>,
+    pub admin_service: Arc<AdminService>,
     pub identity_service: Arc<IdentityVerificationService>,
     pub safehaven: Arc<SafeHavenClient>,
     pub here_maps_client: Arc<HereMapsClient>,
@@ -123,6 +126,33 @@ pub struct AppState {
         crate::handlers::shifts::reschedule_shift,
         crate::handlers::admin::list_hospitals_admin,
         crate::handlers::admin::list_clinicians_admin,
+        // Admin dashboard (§11)
+        crate::handlers::admin::metrics_dashboard,
+        crate::handlers::admin::metrics_shift_volume,
+        crate::handlers::admin::metrics_geographic,
+        crate::handlers::admin::metrics_worker_performance,
+        crate::handlers::admin::metrics_revenue,
+        crate::handlers::admin::metrics_ai_usage,
+        crate::handlers::admin::hospitals_pending,
+        crate::handlers::admin::workers_pending,
+        crate::handlers::admin::list_disputes,
+        crate::handlers::admin::resolve_dispute,
+        crate::handlers::admin::payments_failed,
+        crate::handlers::admin::reports_generate,
+        crate::handlers::admin::get_settings,
+        crate::handlers::admin::update_settings,
+        crate::handlers::admin::suspend_hospital,
+        crate::handlers::admin::unsuspend_hospital,
+        crate::handlers::admin::verify_worker,
+        crate::handlers::admin::reject_worker,
+        crate::handlers::admin::suspend_worker,
+        crate::handlers::admin::unsuspend_worker,
+        crate::handlers::admin::list_admin_shifts,
+        crate::handlers::admin::cancel_admin_shift,
+        crate::handlers::admin::manual_payout,
+        crate::handlers::admin::create_admin,
+        crate::handlers::admin::list_admins,
+        crate::handlers::admin::update_admin,
         // Wallet
         crate::handlers::wallet::get_wallet,
         crate::handlers::wallet::get_ledger,
@@ -196,6 +226,32 @@ pub struct AppState {
             crate::handlers::admin::ClinicianListResponse,
             crate::handlers::admin::PaginationMetadata,
             crate::handlers::admin::ListCliniciansQuery,
+            // Admin dashboard (§11)
+            crate::models::admin::DashboardMetrics,
+            crate::models::admin::ShiftVolumePoint,
+            crate::models::admin::GeoDistributionPoint,
+            crate::models::admin::RatingBucket,
+            crate::models::admin::WorkerPerformance,
+            crate::models::admin::TopPerformer,
+            crate::models::admin::RevenueSlice,
+            crate::models::admin::RevenueBreakdown,
+            crate::models::admin::AiUsageMetrics,
+            crate::models::admin::LanguageCount,
+            crate::models::admin::FailedPayment,
+            crate::models::admin::Dispute,
+            crate::models::admin::ResolveDisputeRequest,
+            crate::models::admin::PlatformSettings,
+            crate::models::admin::UpdatePlatformSettings,
+            crate::models::admin::GenerateReportRequest,
+            crate::models::admin::GenerateReportResponse,
+            crate::models::admin::ReasonRequest,
+            crate::models::admin::VerifyWorkerRequest,
+            crate::models::admin::AdminActionResponse,
+            crate::models::admin::AdminShiftRow,
+            crate::models::admin::ManualPayoutRequest,
+            crate::models::admin::CreateAdminRequest,
+            crate::models::admin::UpdateAdminRequest,
+            crate::models::admin::AdminSummary,
             // Models
             crate::models::admin_registration::HospitalRegistrationRequest,
             crate::models::admin_registration::Address,
@@ -423,6 +479,9 @@ pub fn create_router(
         encryption_service.clone(),
     ));
 
+    let admin_repo = Arc::new(AdminRepository::new(pool.clone()));
+    let admin_service = Arc::new(AdminService::new(admin_repo));
+
     let state = AppState {
         pool: pool.clone(),
         registration_service,
@@ -432,6 +491,7 @@ pub fn create_router(
         wallet_service,
         payout_service,
         clinician_repo: clinician_repo.clone(),
+        admin_service,
         identity_service,
         safehaven: safehaven_client.clone(),
         here_maps_client,
@@ -457,20 +517,9 @@ pub fn create_router(
             "/api/v1/hospitals/{hospital_id}/status",
             get(registration::get_registration_status),
         )
-        // Admin endpoints
-        .route(
-            "/api/v1/admin/hospitals/{hospital_id}/approve",
-            post(registration::approve_hospital),
-        )
-        .route(
-            "/api/v1/admin/hospitals/{hospital_id}/reject",
-            post(registration::reject_hospital),
-        )
-        .route("/api/v1/admin/hospitals", get(admin::list_hospitals_admin))
-        .route(
-            "/api/v1/admin/clinicians",
-            get(admin::list_clinicians_admin),
-        )
+        // Admin dashboard (§11) — every /admin/* route is permission-gated inside
+        // this group; approve/reject/list moved here to close a prior auth gap.
+        .merge(admin_dashboard_routes())
         // Existing Hospitals endpoints (legacy - for backward compatibility)
         .route("/api/v1/hospitals/create", post(hospitals::create_hospital))
         .route("/api/v1/hospitals/{id}", get(hospitals::get_hospital))
@@ -768,7 +817,8 @@ pub fn create_router(
         )
         .route(
             "/api/v1/admin/payouts/{shift_id}/retry",
-            post(wallet::retry_payout).route_layer(from_fn(require_role(&[UserRole::SuperAdmin]))),
+            post(wallet::retry_payout)
+                .route_layer(from_fn(require_permission(Permission::ProcessPayouts))),
         )
         // ---- Webhooks — authenticated by HMAC signature, not JWT.
         .route(
@@ -791,4 +841,167 @@ pub fn create_router(
         .merge(api_router);
 
     (router, state)
+}
+
+/// Admin dashboard (§11) routes. Each route is guarded by the specific
+/// `Permission` its matrix cell requires (Admin §1.2) via `require_permission`.
+fn admin_dashboard_routes() -> Router<AppState> {
+    use Permission as P;
+    Router::new()
+        // §1 hospital verify (approve/reject) — VerifyHospitals.
+        .route(
+            "/api/v1/admin/hospitals/{hospital_id}/approve",
+            post(registration::approve_hospital)
+                .route_layer(from_fn(require_permission(P::VerifyHospitals))),
+        )
+        .route(
+            "/api/v1/admin/hospitals/{hospital_id}/reject",
+            post(registration::reject_hospital)
+                .route_layer(from_fn(require_permission(P::VerifyHospitals))),
+        )
+        // §1 hospital suspend / unsuspend — SuspendHospitals.
+        .route(
+            "/api/v1/admin/hospitals/{id}/suspend",
+            post(admin::suspend_hospital)
+                .route_layer(from_fn(require_permission(P::SuspendHospitals))),
+        )
+        .route(
+            "/api/v1/admin/hospitals/{id}/unsuspend",
+            post(admin::unsuspend_hospital)
+                .route_layer(from_fn(require_permission(P::SuspendHospitals))),
+        )
+        // §1 hospital listings — ViewHospitals.
+        .route(
+            "/api/v1/admin/hospitals",
+            get(admin::list_hospitals_admin)
+                .route_layer(from_fn(require_permission(P::ViewHospitals))),
+        )
+        .route(
+            "/api/v1/admin/hospitals/pending",
+            get(admin::hospitals_pending)
+                .route_layer(from_fn(require_permission(P::ViewHospitals))),
+        )
+        // §2 worker listings — ViewWorkers.
+        .route(
+            "/api/v1/admin/clinicians",
+            get(admin::list_clinicians_admin)
+                .route_layer(from_fn(require_permission(P::ViewWorkers))),
+        )
+        .route(
+            "/api/v1/admin/workers/pending",
+            get(admin::workers_pending)
+                .route_layer(from_fn(require_permission(P::ViewWorkers))),
+        )
+        // §2 worker license verify / reject — VerifyWorkers.
+        .route(
+            "/api/v1/admin/workers/{id}/verify",
+            post(admin::verify_worker)
+                .route_layer(from_fn(require_permission(P::VerifyWorkers))),
+        )
+        .route(
+            "/api/v1/admin/workers/{id}/reject",
+            post(admin::reject_worker)
+                .route_layer(from_fn(require_permission(P::VerifyWorkers))),
+        )
+        // §2 worker suspend / unsuspend — SuspendWorkers.
+        .route(
+            "/api/v1/admin/workers/{id}/suspend",
+            post(admin::suspend_worker)
+                .route_layer(from_fn(require_permission(P::SuspendWorkers))),
+        )
+        .route(
+            "/api/v1/admin/workers/{id}/unsuspend",
+            post(admin::unsuspend_worker)
+                .route_layer(from_fn(require_permission(P::SuspendWorkers))),
+        )
+        // §3 platform-wide shifts — ViewShifts / CancelShifts.
+        .route(
+            "/api/v1/admin/shifts",
+            get(admin::list_admin_shifts)
+                .route_layer(from_fn(require_permission(P::ViewShifts))),
+        )
+        .route(
+            "/api/v1/admin/shifts/{id}/cancel",
+            post(admin::cancel_admin_shift)
+                .route_layer(from_fn(require_permission(P::CancelShifts))),
+        )
+        // §2 metrics / analytics — ViewAnalytics.
+        .route(
+            "/api/v1/admin/metrics/dashboard",
+            get(admin::metrics_dashboard)
+                .route_layer(from_fn(require_permission(P::ViewAnalytics))),
+        )
+        .route(
+            "/api/v1/admin/metrics/shifts/volume",
+            get(admin::metrics_shift_volume)
+                .route_layer(from_fn(require_permission(P::ViewAnalytics))),
+        )
+        .route(
+            "/api/v1/admin/metrics/geographic",
+            get(admin::metrics_geographic)
+                .route_layer(from_fn(require_permission(P::ViewAnalytics))),
+        )
+        .route(
+            "/api/v1/admin/metrics/workers/performance",
+            get(admin::metrics_worker_performance)
+                .route_layer(from_fn(require_permission(P::ViewAnalytics))),
+        )
+        .route(
+            "/api/v1/admin/metrics/ai/usage",
+            get(admin::metrics_ai_usage)
+                .route_layer(from_fn(require_permission(P::ViewAnalytics))),
+        )
+        // §5 revenue metric — ViewEarnings (financial).
+        .route(
+            "/api/v1/admin/metrics/revenue",
+            get(admin::metrics_revenue)
+                .route_layer(from_fn(require_permission(P::ViewEarnings))),
+        )
+        // §4 disputes — ViewDisputes / ResolveDisputes.
+        .route(
+            "/api/v1/admin/disputes",
+            get(admin::list_disputes)
+                .route_layer(from_fn(require_permission(P::ViewDisputes))),
+        )
+        .route(
+            "/api/v1/admin/disputes/{id}/resolve",
+            post(admin::resolve_dispute)
+                .route_layer(from_fn(require_permission(P::ResolveDisputes))),
+        )
+        // §5 payments — ViewEarnings (failed) / ProcessPayouts (manual).
+        .route(
+            "/api/v1/admin/payments/failed",
+            get(admin::payments_failed)
+                .route_layer(from_fn(require_permission(P::ViewEarnings))),
+        )
+        .route(
+            "/api/v1/admin/payments/manual",
+            post(admin::manual_payout)
+                .route_layer(from_fn(require_permission(P::ProcessPayouts))),
+        )
+        // §7 reports — GenerateReports (financial type checked in-handler).
+        .route(
+            "/api/v1/admin/reports/generate",
+            post(admin::reports_generate)
+                .route_layer(from_fn(require_permission(P::GenerateReports))),
+        )
+        // §8 settings — ManageSettings (super only).
+        .route(
+            "/api/v1/admin/settings",
+            get(admin::get_settings)
+                .put(admin::update_settings)
+                .route_layer(from_fn(require_permission(P::ManageSettings))),
+        )
+        // §1 admin management — ManageAdmins (super only).
+        .route(
+            "/api/v1/admin/admins",
+            post(admin::create_admin)
+                .get(admin::list_admins)
+                .route_layer(from_fn(require_permission(P::ManageAdmins))),
+        )
+        .route(
+            "/api/v1/admin/admins/{id}",
+            axum::routing::patch(admin::update_admin)
+                .route_layer(from_fn(require_permission(P::ManageAdmins))),
+        )
 }
