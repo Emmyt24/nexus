@@ -14,8 +14,14 @@ pub enum UserRole {
     HospitalAdmin,
     /// Clinical staff member — health worker (clinician)
     HealthWorker,
-    /// NexusCare platform super-admin
+    /// NexusCare platform super-admin (holds every permission)
     SuperAdmin,
+    /// Platform monitoring, content, user support, shift cancellation
+    OperationsAdmin,
+    /// Manual verification of hospital and worker licenses/documents
+    VerificationAdmin,
+    /// Payouts, refunds, dispute resolution, financial reports
+    FinanceAdmin,
 }
 
 /// A platform user — can be a hospital admin or staff member.
