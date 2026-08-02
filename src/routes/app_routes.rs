@@ -359,8 +359,8 @@ pub struct AppState {
         contact(name = "NexusCare Support", email = "support@nexuscare.com")
     ),
     servers(
-        (url = "http://localhost:8080", description = "Local development"),
-        (url = "https://api.nexuscare.com", description = "Production")
+        (url = "https://nexus-j2rp.onrender.com", description = "Production (Render)"),
+        (url = "http://localhost:8080", description = "Local development")
     ),
     tags(
         (name = "health", description = "Health check endpoints"),
