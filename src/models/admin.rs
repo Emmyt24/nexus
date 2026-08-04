@@ -280,6 +280,8 @@ pub struct CreateAdminRequest {
     pub phone: Option<String>,
     /// One of: operations_admin, verification_admin, finance_admin, super_admin.
     pub role: String,
+    /// Initial password the new admin uses at POST /auth/admin/login.
+    pub password: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

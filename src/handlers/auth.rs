@@ -11,8 +11,8 @@ use validator::Validate;
 
 use crate::{
     models::user::{
-        EmailLoginRequest, EmailOtpVerifyRequest, LoginResponse, LogoutRequest,
-        RefreshTokenRequest, UserResponse,
+        EmailLoginRequest, EmailOtpVerifyRequest, LoginRequest, LoginResponse, LogoutRequest,
+        RefreshTokenRequest, UserResponse, UserRole,
     },
     routes::AppState,
     services::auth_service::AuthError,
@@ -79,6 +79,52 @@ pub async fn email_otp_verify(
         .await
         .map(Json)
         .map_err(auth_err_to_app)
+}
+
+// Admin password login — separate from the OTP path used by regular users.
+
+/// POST /api/v1/auth/admin/login
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/admin/login",
+    request_body = LoginRequest,
+    responses(
+        (status = 200, description = "Login successful", body = LoginResponse),
+        (status = 401, description = "Invalid email or password"),
+        (status = 403, description = "Not an admin account"),
+        (status = 422, description = "Validation error")
+    ),
+    tag = "auth",
+    summary = "Admin password login",
+    description = "Password login for admin accounts (super/operations/verification/finance)."
+)]
+pub async fn admin_login(
+    State(state): State<AppState>,
+    Json(payload): Json<LoginRequest>,
+) -> AppResult<Json<LoginResponse>> {
+    payload
+        .validate()
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+
+    let resp = state
+        .auth_service
+        .login_with_password(&payload.email, &payload.password)
+        .await
+        .map_err(auth_err_to_app)?;
+
+    // This route is admin-only: reject any non-admin role that has a password.
+    let is_admin = matches!(
+        resp.user.role,
+        UserRole::SuperAdmin
+            | UserRole::OperationsAdmin
+            | UserRole::VerificationAdmin
+            | UserRole::FinanceAdmin
+    );
+    if !is_admin {
+        return Err(AppError::Forbidden("Not an admin account".to_string()));
+    }
+
+    Ok(Json(resp))
 }
 
 // Token refresh

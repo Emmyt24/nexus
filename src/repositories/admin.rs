@@ -545,7 +545,7 @@ impl AdminRepository {
 
     // ----- §1 Admin management (super only) ---------------------------------
 
-    /// Create an admin user row; login is via the platform's OTP flow (no password).
+    /// Create an admin user row with an initial password hash for admin login.
     pub async fn create_admin(
         &self,
         first_name: &str,
@@ -553,11 +553,12 @@ impl AdminRepository {
         email: &str,
         phone: Option<&str>,
         role: &str,
+        password_hash: &str,
     ) -> Result<AdminSummary, sqlx::Error> {
         sqlx::query_as::<_, AdminSummary>(
             r#"
-            INSERT INTO users (first_name, last_name, email, phone, role, is_active)
-            VALUES ($1, $2, $3, $4, $5::user_role, TRUE)
+            INSERT INTO users (first_name, last_name, email, phone, role, password_hash, is_active)
+            VALUES ($1, $2, $3, $4, $5::user_role, $6, TRUE)
             RETURNING id, first_name, last_name, email, role::TEXT AS role, is_active, created_at
             "#,
         )
@@ -566,6 +567,7 @@ impl AdminRepository {
         .bind(email)
         .bind(phone)
         .bind(role)
+        .bind(password_hash)
         .fetch_one(&self.pool)
         .await
     }
