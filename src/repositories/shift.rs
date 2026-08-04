@@ -51,10 +51,10 @@ pub struct NearbyShiftRow {
     pub rate_kobo_per_hour: Option<i64>,
     pub fixed_rate_kobo: Option<i64>,
     pub stat_bonus_kobo: Option<i64>,
-    pub hospital_lat: Option<f64>,
-    pub hospital_lng: Option<f64>,
-    pub clinician_lat: Option<f64>,
-    pub clinician_lng: Option<f64>,
+    /// Great-circle distance from the worker's origin to the hospital, in km.
+    /// `None` for virtual shifts and for in-person shifts whose hospital has no
+    /// recorded location. Computed in SQL so paging and sorting stay correct.
+    pub distance_km: Option<f64>,
     pub interest_expressed: bool,
 }
 
@@ -149,6 +149,18 @@ impl ShiftRepository {
         .await
     }
 
+    /// Resolve `users.id` from a `clinicians.id` — used to target push
+    /// notifications at the clinician behind a shift assignment.
+    pub async fn get_clinician_user_id(
+        &self,
+        clinician_id: Uuid,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar::<_, Uuid>(r#"SELECT user_id FROM clinicians WHERE id = $1"#)
+            .bind(clinician_id)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
     /// Get the hospital's first registered location coordinates
 
     pub async fn get_hospital_coordinates(
@@ -227,13 +239,17 @@ impl ShiftRepository {
 
     /// Accept an offer inside a transaction
 
+    /// Accept an offer inside a transaction. The `status = 'offered'` guard plus
+    /// the row lock the UPDATE takes serialize concurrent accepts: only the
+    /// first transaction flips the row, so callers must treat a `0` return
+    /// (no rows updated) as "already responded to" and abort.
     pub async fn accept_offer_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         assignment_id: Uuid,
         ndpr_consent: &serde_json::Value,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
             r#"
             UPDATE shift_assignments
                SET status        = 'accepted',
@@ -246,7 +262,28 @@ impl ShiftRepository {
         .bind(ndpr_consent)
         .execute(&mut **tx)
         .await?;
-        Ok(())
+        Ok(result.rows_affected())
+    }
+
+    /// Whether this clinician has already declined an offer for this shift
+    /// (SCRUM-14 / US-06 AC-04 — cannot re-offer a decliner).
+    pub async fn has_declined_offer(
+        &self,
+        shift_id: Uuid,
+        clinician_id: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM shift_assignments
+                WHERE shift_id = $1 AND clinician_id = $2 AND status = 'declined'
+            )
+            "#,
+        )
+        .bind(shift_id)
+        .bind(clinician_id)
+        .fetch_one(&self.pool)
+        .await
     }
 
     /// Cancel sibling offers when one is accepted. Marks every
@@ -808,14 +845,31 @@ impl ShiftRepository {
         Ok(())
     }
 
-    /// Discover open shifts for a worker.
-
-    pub async fn list_open_shifts_for_worker(
+    /// Open shifts within `radius_km` of the worker's origin, excluding shifts
+    /// they have dismissed. Virtual shifts are always included (they have no
+    /// location to filter on); in-person shifts are kept only when the exact
+    /// haversine distance from `(origin_lat, origin_lng)` to the hospital is
+    /// within the radius. Results are ordered by urgency rank, then distance
+    /// (nulls last), then start time, and paged with `limit`/`offset`.
+    ///
+    /// The bounding-box predicate is an index-friendly prefilter; correctness
+    /// comes from the exact haversine `<= radius_km` gate that follows it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_nearby_shifts(
         &self,
         clinician_id: Uuid,
+        origin_lat: f64,
+        origin_lng: f64,
+        radius_km: f64,
+        limit: i64,
+        offset: i64,
     ) -> Result<Vec<NearbyShiftRow>, sqlx::Error> {
         sqlx::query_as::<_, NearbyShiftRow>(
             r#"
+            WITH origin AS (
+                SELECT $2::double precision AS lat,
+                       $3::double precision AS lng
+            )
             SELECT
                 s.id              AS shift_id,
                 s.hospital_id,
@@ -830,29 +884,120 @@ impl ShiftRepository {
                 s.rate_kobo_per_hour,
                 s.fixed_rate_kobo,
                 s.stat_bonus_kobo,
-                hl.latitude       AS hospital_lat,
-                hl.longitude      AS hospital_lng,
-                cl.latitude       AS clinician_lat,
-                cl.longitude      AS clinician_lng,
+                -- Exact great-circle distance (km). NULL when the hospital has
+                -- no recorded coordinates. 6371.0088 = mean Earth radius (km).
+                CASE WHEN hl.latitude IS NOT NULL THEN
+                    2 * 6371.0088 * asin(sqrt(
+                        power(sin(radians(hl.latitude - o.lat) / 2), 2)
+                        + cos(radians(o.lat)) * cos(radians(hl.latitude))
+                          * power(sin(radians(hl.longitude - o.lng) / 2), 2)
+                    ))
+                END               AS distance_km,
                 EXISTS (
                     SELECT 1 FROM shift_interests si
                     WHERE si.shift_id = s.id AND si.clinician_id = $1
                 ) AS interest_expressed
             FROM shifts s
-            JOIN hospitals h               ON h.id = s.hospital_id
+            JOIN hospitals h                ON h.id = s.hospital_id
             LEFT JOIN hospital_locations hl ON hl.hospital_id = h.id
-            LEFT JOIN clinician_locations cl ON cl.clinician_id = $1
+            CROSS JOIN origin o
             WHERE s.status = 'open'
               AND NOT EXISTS (
                   SELECT 1 FROM shift_dismissals sd
                   WHERE sd.shift_id = s.id AND sd.clinician_id = $1
               )
-            ORDER BY s.scheduled_start ASC
+              AND (
+                  -- Virtual shifts: no location, always in range.
+                  s.shift_type = 'virtual'
+                  -- In-person without coordinates: data gap, don't hide it.
+                  OR hl.latitude IS NULL
+                  -- In-person with coordinates: bounding box (index prefilter)
+                  -- then exact haversine gate. 111.045 km per degree latitude;
+                  -- longitude degrees shrink by cos(lat), clamped to avoid a
+                  -- divide-by-zero near the poles.
+                  OR (
+                      hl.latitude BETWEEN o.lat - ($4 / 111.045)
+                                      AND o.lat + ($4 / 111.045)
+                      AND hl.longitude BETWEEN
+                              o.lng - ($4 / (111.045 * GREATEST(cos(radians(o.lat)), 0.01)))
+                          AND o.lng + ($4 / (111.045 * GREATEST(cos(radians(o.lat)), 0.01)))
+                      AND 2 * 6371.0088 * asin(sqrt(
+                              power(sin(radians(hl.latitude - o.lat) / 2), 2)
+                              + cos(radians(o.lat)) * cos(radians(hl.latitude))
+                                * power(sin(radians(hl.longitude - o.lng) / 2), 2)
+                          )) <= $4
+                  )
+              )
+            ORDER BY
+                CASE s.priority
+                    WHEN 'stat'      THEN 0
+                    WHEN 'urgent'    THEN 1
+                    WHEN 'normal'    THEN 2
+                    WHEN 'scheduled' THEN 3
+                    ELSE 4
+                END,
+                distance_km ASC NULLS LAST,
+                s.scheduled_start ASC
+            LIMIT $5 OFFSET $6
             "#,
         )
         .bind(clinician_id)
+        .bind(origin_lat)
+        .bind(origin_lng)
+        .bind(radius_km)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// Upsert the worker's last-known GPS position. Called when a nearby-shift
+    /// request supplies live coordinates so later requests and other features
+    /// (Workforce Pool distance, clock-in) see the freshest location.
+    pub async fn upsert_clinician_location(
+        &self,
+        clinician_id: Uuid,
+        latitude: f64,
+        longitude: f64,
+        accuracy_meters: Option<f32>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO clinician_locations
+                (clinician_id, latitude, longitude, accuracy_meters, recorded_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (clinician_id) DO UPDATE
+                SET latitude        = EXCLUDED.latitude,
+                    longitude       = EXCLUDED.longitude,
+                    accuracy_meters = EXCLUDED.accuracy_meters,
+                    recorded_at     = NOW()
+            "#,
+        )
+        .bind(clinician_id)
+        .bind(latitude)
+        .bind(longitude)
+        .bind(accuracy_meters)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|_| ())
+    }
+
+    /// The worker's last-known GPS origin, if any has been recorded.
+    pub async fn get_clinician_location(
+        &self,
+        clinician_id: Uuid,
+    ) -> Result<Option<(f64, f64)>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (f64, f64)>(
+            r#"
+            SELECT latitude, longitude
+            FROM clinician_locations
+            WHERE clinician_id = $1
+            "#,
+        )
+        .bind(clinician_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     /// List a clinician's expressed interests + formal applications
@@ -1270,6 +1415,43 @@ impl ShiftRepository {
         .bind(shift_id)
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// Ordered task labels for a shift (SCRUM-25 / US-09 AC-03), i.e. the
+    /// `task` category of `shift_description_items`.
+    pub async fn list_shift_tasks(&self, shift_id: Uuid) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT label
+            FROM shift_description_items
+            WHERE shift_id = $1 AND category = 'task'
+            ORDER BY sort_order ASC, created_at ASC
+            "#,
+        )
+        .bind(shift_id)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Average score (1–5) and count of submitted ratings for a hospital
+    /// (SCRUM-25 / US-09 AC-05). Returns `(None, 0)` when the hospital has no
+    /// ratings yet.
+    pub async fn hospital_rating_summary(
+        &self,
+        hospital_id: Uuid,
+    ) -> Result<(Option<f64>, i64), sqlx::Error> {
+        let row = sqlx::query_as::<_, (Option<f64>, i64)>(
+            r#"
+            SELECT AVG(score)::float8 AS average,
+                   COUNT(*)          AS count
+            FROM shift_ratings
+            WHERE ratee_kind = 'hospital' AND ratee_id = $1
+            "#,
+        )
+        .bind(hospital_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     /// Insert a clock-in approval request. Returns the record id.

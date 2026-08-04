@@ -897,6 +897,52 @@ pub struct EditRatingRequest {
     pub dimensions: Option<HospitalRatingDimensions>,
 }
 
+// Shift detail (SCRUM-25 / US-09)
+
+/// Aggregated hospital rating shown on the shift detail screen (AC-05).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct HospitalRatingSummary {
+    /// Mean of submitted 1–5 scores, `0.0` when there are no ratings yet.
+    pub average: f64,
+    /// Number of ratings the average is drawn from.
+    pub count: i64,
+}
+
+/// One requirement paired with whether the requesting clinician meets it (AC-04).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct QualificationMatch {
+    pub requirement: String,
+    pub met: bool,
+}
+
+/// Hospital coordinates for the in-person shift map view (AC-06).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct HospitalLocation {
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+/// Enriched shift detail returned by `GET /api/v1/shifts/{shift_id}`. The base
+/// `Shift` is flattened so existing fields stay top-level (backwards
+/// compatible), with tasks, requirements, qualification match, hospital rating
+/// and — for in-person shifts — the hospital location added.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ShiftDetailResponse {
+    #[serde(flatten)]
+    pub shift: Shift,
+    /// Clinical tasks for the shift (AC-03); empty when none are defined.
+    pub tasks: Vec<String>,
+    /// Required qualification tags (AC-04); empty when none are defined.
+    pub requirements: Vec<String>,
+    /// Per-requirement match against the requesting clinician's qualifications
+    /// (AC-04). Empty when the caller is not a clinician.
+    pub qualification_match: Vec<QualificationMatch>,
+    /// Aggregated hospital rating (AC-05).
+    pub hospital_rating: HospitalRatingSummary,
+    /// Hospital coordinates for the map (AC-06); `None` for virtual shifts.
+    pub hospital_location: Option<HospitalLocation>,
+}
+
 // Worker discovery
 
 /// A shift card returned by `GET /api/v1/worker/shifts/nearby`.

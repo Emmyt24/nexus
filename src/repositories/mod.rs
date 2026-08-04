@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod audit;
 pub mod billing;
 pub mod clinician;
@@ -5,11 +6,11 @@ pub mod email_outbox;
 pub mod hospital;
 pub mod identity_verification;
 pub mod location;
-pub mod patient;
-pub mod patient_prediction;
+pub mod notification;
 pub mod shift;
 pub mod wallet;
 
+pub use admin::AdminRepository;
 pub use audit::AuditRepository;
 pub use billing::BillingRepository;
 pub use clinician::{ClinicianRepoError, ClinicianRepository};

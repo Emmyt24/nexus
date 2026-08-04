@@ -1,5 +1,6 @@
 pub mod access_policy;
 pub mod accreditation;
+pub mod admin;
 pub mod admin_registration;
 pub mod billing;
 pub mod clinician;
@@ -9,8 +10,8 @@ pub mod email_outbox;
 pub mod here_maps;
 pub mod hospital;
 pub mod location;
-pub mod patient;
-pub mod patient_prediction;
+pub mod permission;
+pub mod notification;
 pub mod registration;
 pub mod shift;
 pub mod user;

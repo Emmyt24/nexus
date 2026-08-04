@@ -14,6 +14,7 @@ use crate::{
         EditRatingRequest, HandoverResponse, HandoverRevisionRequest, MyApplicationEntry,
         NearbyShiftCard, RankedInterestedClinician, RateHospitalRequest, RateWorkerRequest,
         RatingResponse, Shift, ShiftApplication, ShiftApplicationRequest, ShiftApplicationsQuery,
+        ShiftDetailResponse,
         ShiftAssignRequest, ShiftCancelRequest, ShiftInterestRequest, ShiftListQuery,
         ShiftOfferRequest, ShiftOfferResponse, ShiftRescheduleRequest, SubmitHandoverRequest,
     },
@@ -210,20 +211,31 @@ pub async fn preview_shift(
         ("shift_id" = Uuid, Path, description = "Shift unique identifier")
     ),
     responses(
-        (status = 200, description = "Shift details retrieved successfully", body = Shift),
+        (status = 200, description = "Enriched shift details retrieved successfully", body = ShiftDetailResponse),
         (status = 404, description = "Shift not found", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse)
     ),
     tag = "shifts",
     summary = "Get shift details",
-    description = "Retrieve detailed information about a specific shift by its ID."
+    description = "Retrieve the full shift-detail view: base shift fields plus tasks, requirements, hospital rating, and — for in-person shifts — the hospital location. When the caller is a clinician, each requirement is matched against their qualifications."
 )]
 pub async fn get_shift(
     State(state): State<AppState>,
     Path(shift_id): Path<Uuid>,
-) -> AppResult<Json<Shift>> {
-    match state.shift_service.get_shift(shift_id).await {
-        Ok(shift) => Ok(Json(shift)),
+    headers: HeaderMap,
+) -> AppResult<Json<crate::models::shift::ShiftDetailResponse>> {
+    // Best-effort identity: a clinician viewer gets qualification matching;
+    // anyone else (or an unauthenticated caller) gets the shift without it.
+    let requester_user_id = extract_claims(&headers)
+        .ok()
+        .and_then(|claims| Uuid::parse_str(&claims.sub).ok());
+
+    match state
+        .shift_service
+        .get_shift_detail(shift_id, requester_user_id)
+        .await
+    {
+        Ok(detail) => Ok(Json(detail)),
         Err(e) => Err(map_shift_error(e)),
     }
 }
@@ -239,12 +251,12 @@ pub async fn get_shift(
     responses(
         (status = 201, description = "Interest recorded"),
         (status = 404, description = "Shift not found", body = ErrorResponse),
-        (status = 409, description = "Interest already exists", body = ErrorResponse),
+        (status = 409, description = "Interest already exists, or shift is no longer available", body = ErrorResponse),
         (status = 422, description = "Validation error", body = ErrorResponse)
     ),
     tag = "shifts",
     summary = "Express interest in a shift",
-    description = "Clinician expresses interest in an open shift"
+    description = "Clinician expresses interest in an open shift. The hospital admin is notified. Rejected with 409 if the shift is no longer open (BR: no longer available)."
 )]
 pub async fn express_interest(
     State(state): State<AppState>,
@@ -400,7 +412,7 @@ pub async fn list_interested_for_shift(
         (status = 401, description = "Missing or invalid token", body = ErrorResponse),
         (status = 403, description = "Not the shift creator", body = ErrorResponse),
         (status = 404, description = "Shift not found", body = ErrorResponse),
-        (status = 409, description = "Clinician did not express interest, shift not open, or already offered", body = ErrorResponse)
+        (status = 409, description = "Clinician did not express interest, shift not open, already offered, or worker already declined this shift", body = ErrorResponse)
     ),
     tag = "shifts",
     summary = "Send a shift offer to an interested clinician",
@@ -446,7 +458,7 @@ pub async fn offer_shift(
         (status = 401, description = "Missing or invalid token", body = ErrorResponse),
         (status = 403, description = "Caller has no clinician profile", body = ErrorResponse),
         (status = 404, description = "No pending offer for this shift", body = ErrorResponse),
-        (status = 409, description = "Offer expired, clinician busy, or schedule conflict", body = ErrorResponse),
+        (status = 409, description = "Offer expired, already responded to, clinician busy, or schedule conflict", body = ErrorResponse),
         (status = 422, description = "NDPR consent missing", body = ErrorResponse)
     ),
     tag = "shifts",
@@ -808,30 +820,115 @@ pub async fn edit_rating(
     Ok(Json(rating))
 }
 
+/// Default search radius (km) when the client does not supply one.
+const NEARBY_DEFAULT_RADIUS_KM: f64 = 5.0;
+/// Hard cap on the search radius (km) a client may request.
+const NEARBY_MAX_RADIUS_KM: f64 = 50.0;
+/// Default page size for nearby-shift discovery.
+const NEARBY_DEFAULT_LIMIT: i64 = 50;
+/// Hard cap on the page size a client may request.
+const NEARBY_MAX_LIMIT: i64 = 100;
+
+/// Query parameters for `GET /api/v1/worker/shifts/nearby`.
+#[derive(Debug, serde::Deserialize)]
+pub struct NearbyShiftsQuery {
+    /// Live latitude of the worker. Must be paired with `lng`.
+    pub lat: Option<f64>,
+    /// Live longitude of the worker. Must be paired with `lat`.
+    pub lng: Option<f64>,
+    /// Optional GPS accuracy in metres, stored with the location.
+    pub accuracy_meters: Option<f32>,
+    /// Search radius in km (default 5, max 50).
+    pub radius_km: Option<f64>,
+    /// Page size (default 50, max 100).
+    pub limit: Option<i64>,
+    /// Rows to skip for pagination (default 0).
+    pub offset: Option<i64>,
+}
+
+/// Normalized nearby-shift request: a validated origin plus paging.
+type NearbyParams = (Option<shift_service::WorkerOrigin>, f64, i64, i64);
+
+impl NearbyShiftsQuery {
+    /// Validate the raw query and normalize it into `(origin, radius_km, limit,
+    /// offset)`. Coordinates are all-or-nothing and range-checked; radius is
+    /// clamped to `NEARBY_MAX_RADIUS_KM`; limit is clamped to `NEARBY_MAX_LIMIT`.
+    /// Returns a human-readable message on invalid input (mapped to `400`).
+    fn resolve(&self) -> Result<NearbyParams, String> {
+        let origin = match (self.lat, self.lng) {
+            (Some(lat), Some(lng)) => {
+                if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
+                    return Err("lat must be -90..90 and lng must be -180..180".to_string());
+                }
+                Some(shift_service::WorkerOrigin {
+                    lat,
+                    lng,
+                    accuracy_meters: self.accuracy_meters,
+                })
+            }
+            (None, None) => None,
+            _ => return Err("lat and lng must be supplied together".to_string()),
+        };
+
+        let radius_km = match self.radius_km {
+            Some(r) if r <= 0.0 || r.is_nan() => {
+                return Err("radius_km must be greater than 0".to_string())
+            }
+            Some(r) => r.min(NEARBY_MAX_RADIUS_KM),
+            None => NEARBY_DEFAULT_RADIUS_KM,
+        };
+        let limit = match self.limit {
+            Some(l) if l < 1 => return Err("limit must be at least 1".to_string()),
+            Some(l) => l.min(NEARBY_MAX_LIMIT),
+            None => NEARBY_DEFAULT_LIMIT,
+        };
+        let offset = match self.offset {
+            Some(o) if o < 0 => return Err("offset must not be negative".to_string()),
+            Some(o) => o,
+            None => 0,
+        };
+
+        Ok((origin, radius_km, limit, offset))
+    }
+}
+
 /// GET /api/v1/worker/shifts/nearby
 #[utoipa::path(
     get,
     path = "/api/v1/worker/shifts/nearby",
+    params(
+        ("lat" = Option<f64>, Query, description = "Live worker latitude (-90..90); pair with lng"),
+        ("lng" = Option<f64>, Query, description = "Live worker longitude (-180..180); pair with lat"),
+        ("accuracy_meters" = Option<f32>, Query, description = "Optional GPS accuracy in metres"),
+        ("radius_km" = Option<f64>, Query, description = "Search radius in km (default 5, max 50)"),
+        ("limit" = Option<i64>, Query, description = "Page size (default 50, max 100)"),
+        ("offset" = Option<i64>, Query, description = "Rows to skip (default 0)")
+    ),
     responses(
-        (status = 200, description = "Open shifts near the worker", body = Vec<NearbyShiftCard>),
+        (status = 200, description = "Open shifts within the radius, ranked by urgency then distance", body = Vec<NearbyShiftCard>),
+        (status = 400, description = "Invalid coordinates or paging parameters", body = ErrorResponse),
         (status = 401, body = ErrorResponse),
-        (status = 403, description = "Caller has no clinician profile", body = ErrorResponse)
+        (status = 403, description = "Caller has no clinician profile", body = ErrorResponse),
+        (status = 409, description = "No location supplied and none on file", body = ErrorResponse)
     ),
     tag = "shifts",
     summary = "Shifts Near You (worker discovery)",
-    description = "Returns open shifts the worker can apply for, sorted by urgency rank then distance. Distance is computed from the clinician's last known GPS to the hospital location; virtual shifts have no distance restriction."
+    description = "Returns open shifts within `radius_km` of the worker, ranked by urgency (STAT first) then distance. Supply live `lat`/`lng` to refresh the worker's location; otherwise the last-known location is used. Virtual shifts are always included and carry no distance."
 )]
 pub async fn list_nearby_shifts(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<NearbyShiftsQuery>,
 ) -> AppResult<Json<Vec<NearbyShiftCard>>> {
     let claims = extract_claims(&headers)?;
     let worker_user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| AppError::Unauthorized("Invalid user ID in token".to_string()))?;
 
+    let (origin, radius_km, limit, offset) = query.resolve().map_err(AppError::BadRequest)?;
+
     let cards = state
         .shift_service
-        .list_nearby_shifts_for_worker(worker_user_id)
+        .list_nearby_shifts_for_worker(worker_user_id, origin, radius_km, limit, offset)
         .await
         .map_err(map_shift_error)?;
     Ok(Json(cards))
@@ -1315,5 +1412,104 @@ fn map_shift_error(e: ShiftServiceError) -> AppError {
         ShiftServiceError::WalletError(msg) => {
             AppError::Conflict(format!("Wallet error: {msg}"))
         }
+        ShiftServiceError::LocationRequired => AppError::Conflict(
+            "Location required. Share your location or enable GPS to see nearby shifts."
+                .to_string(),
+        ),
+        ShiftServiceError::ShiftUnavailable => {
+            AppError::Conflict("Shift is no longer available".to_string())
+        }
+        ShiftServiceError::WorkerAlreadyDeclined => {
+            AppError::Conflict("Worker already declined this shift".to_string())
+        }
+        ShiftServiceError::OfferAlreadyResponded => {
+            AppError::Conflict("This offer has already been responded to".to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod nearby_query_tests {
+    //! SCRUM-24 / US-08 — validation of the `GET /worker/shifts/nearby`
+    //! query parameters (origin resolution, radius/limit/offset normalization).
+    use super::*;
+
+    fn q(
+        lat: Option<f64>,
+        lng: Option<f64>,
+        radius_km: Option<f64>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> NearbyShiftsQuery {
+        NearbyShiftsQuery {
+            lat,
+            lng,
+            accuracy_meters: None,
+            radius_km,
+            limit,
+            offset,
+        }
+    }
+
+    /// UT001/UT019 — omitting coordinates is valid; origin falls back to the
+    /// worker's last-known location downstream (None here).
+    #[test]
+    fn ut001_no_coords_defaults() {
+        let (origin, radius, limit, offset) = q(None, None, None, None, None).resolve().unwrap();
+        assert!(origin.is_none());
+        assert_eq!(radius, NEARBY_DEFAULT_RADIUS_KM);
+        assert_eq!(limit, NEARBY_DEFAULT_LIMIT);
+        assert_eq!(offset, 0);
+    }
+
+    /// UT003 — valid live GPS is accepted and carried through as the origin.
+    #[test]
+    fn ut003_valid_gps_accepted() {
+        let (origin, _, _, _) = q(Some(6.5244), Some(3.3792), None, None, None)
+            .resolve()
+            .unwrap();
+        let origin = origin.expect("origin present");
+        assert!((origin.lat - 6.5244).abs() < 1e-9);
+        assert!((origin.lng - 3.3792).abs() < 1e-9);
+    }
+
+    /// UT020 — coordinates are all-or-nothing; a lone lat is rejected.
+    #[test]
+    fn ut020_partial_coords_rejected() {
+        assert!(q(Some(6.5), None, None, None, None).resolve().is_err());
+        assert!(q(None, Some(3.3), None, None, None).resolve().is_err());
+    }
+
+    /// Out-of-range coordinates are rejected.
+    #[test]
+    fn out_of_range_coords_rejected() {
+        assert!(q(Some(91.0), Some(3.3), None, None, None).resolve().is_err());
+        assert!(q(Some(6.5), Some(181.0), None, None, None).resolve().is_err());
+    }
+
+    /// UT004 — radius is honored and clamped to the 50km ceiling.
+    #[test]
+    fn ut004_radius_clamped() {
+        let (_, radius, _, _) = q(None, None, Some(3.0), None, None).resolve().unwrap();
+        assert_eq!(radius, 3.0);
+        let (_, clamped, _, _) = q(None, None, Some(999.0), None, None).resolve().unwrap();
+        assert_eq!(clamped, NEARBY_MAX_RADIUS_KM);
+    }
+
+    /// A non-positive radius is invalid.
+    #[test]
+    fn non_positive_radius_rejected() {
+        assert!(q(None, None, Some(0.0), None, None).resolve().is_err());
+        assert!(q(None, None, Some(-1.0), None, None).resolve().is_err());
+    }
+
+    /// Paging is validated and the page size clamped to its ceiling.
+    #[test]
+    fn paging_validated_and_clamped() {
+        assert!(q(None, None, None, Some(0), None).resolve().is_err());
+        assert!(q(None, None, None, None, Some(-1)).resolve().is_err());
+        let (_, _, limit, offset) = q(None, None, None, Some(9999), Some(40)).resolve().unwrap();
+        assert_eq!(limit, NEARBY_MAX_LIMIT);
+        assert_eq!(offset, 40);
     }
 }
