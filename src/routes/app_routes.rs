@@ -68,6 +68,7 @@ pub struct AppState {
         // Auth
         crate::handlers::auth::email_otp_send,
         crate::handlers::auth::email_otp_verify,
+        crate::handlers::auth::admin_login,
         crate::handlers::auth::me,
         crate::handlers::auth::refresh_token,
         crate::handlers::auth::logout,
@@ -294,6 +295,7 @@ pub struct AppState {
             crate::models::shift::ShiftCancelRequest,
             crate::models::shift::ShiftRescheduleRequest,
             crate::models::user::UserResponse,
+            crate::models::user::LoginRequest,
             crate::models::user::LoginResponse,
             crate::handlers::auth::MeResponse,
             crate::handlers::auth::ClinicianProfile,
@@ -533,6 +535,7 @@ pub fn create_router(
         // Auth (OTP-only).
         .route("/api/v1/auth/otp/send", post(auth::email_otp_send))
         .route("/api/v1/auth/otp/verify", post(auth::email_otp_verify))
+        .route("/api/v1/auth/admin/login", post(auth::admin_login))
         .route("/api/v1/auth/refresh", post(auth::refresh_token))
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/auth/me", get(auth::me))

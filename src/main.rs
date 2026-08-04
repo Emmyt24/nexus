@@ -55,6 +55,10 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Database migrations applied successfully");
 
+    // Bootstrap the first super admin from env so the admin API has an initial
+    // owner; every later admin (including more super admins) is made via the API.
+    seed_super_admin(&pool).await?;
+
     let notification_service = Arc::new(NotificationService::new());
     let email_outbox_repo = Arc::new(EmailOutboxRepository::new(pool.clone()));
     let email_outbox_service = Arc::new(EmailOutboxService::new(
@@ -94,5 +98,41 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
 
+    Ok(())
+}
+
+/// Idempotently seed the initial super admin from SUPER_ADMIN_EMAIL and
+/// SUPER_ADMIN_PASSWORD. No-op when the env vars are unset; on conflict it
+/// promotes the existing user to super_admin and refreshes the password.
+async fn seed_super_admin(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    // Both env vars are required; skip seeding when either is missing.
+    let (email, password) =
+        match (std::env::var("SUPER_ADMIN_EMAIL"), std::env::var("SUPER_ADMIN_PASSWORD")) {
+            (Ok(e), Ok(p)) if !e.trim().is_empty() && !p.is_empty() => (e, p),
+            _ => {
+                tracing::info!("SUPER_ADMIN_EMAIL/PASSWORD not set; skipping super-admin seed");
+                return Ok(());
+            }
+        };
+
+    // Hash with the same argon2 helper used by password login.
+    let email = email.trim().to_lowercase();
+    let password_hash = nexuscare_backend::services::auth_service::hash_password(&password)
+        .map_err(|e| anyhow::anyhow!("failed to hash super-admin password: {e}"))?;
+
+    // Upsert: create the row, or promote/refresh an existing user by email.
+    sqlx::query(
+        "INSERT INTO users (first_name, last_name, email, role, password_hash, is_active)
+         VALUES ('Super', 'Admin', $1, 'super_admin', $2, TRUE)
+         ON CONFLICT (email)
+         DO UPDATE SET role = 'super_admin', password_hash = $2, is_active = TRUE",
+    )
+    .bind(&email)
+    .bind(&password_hash)
+    .execute(pool)
+    .await
+    .context("Failed to seed super admin")?;
+
+    tracing::info!("Super admin seeded/updated for {}", email);
     Ok(())
 }
