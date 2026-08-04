@@ -20,12 +20,14 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     admin, auth, clinician_registration, distance, earnings, health, here_maps, hospitals,
-    identity, location, registration, shifts, wallet, webhooks,
+    identity, location, patients, pipeline, registration, shifts, wallet, webhooks,
 };
 use crate::repositories::{
     audit::AuditRepository, billing::BillingRepository, clinician::ClinicianRepository,
     hospital::HospitalRepository, identity_verification::IdentityVerificationRepository,
-    location::LocationRepository, shift::ShiftRepository, wallet::WalletRepository,
+    location::LocationRepository, patient::PatientRepository,
+    patient_prediction::PatientPredictionRepository, shift::ShiftRepository,
+    wallet::WalletRepository,
 };
 use crate::services::{
     audit_service::AuditService, auth_service::AuthService,
@@ -33,7 +35,8 @@ use crate::services::{
     distance_service::DistanceService, email_outbox_service::EmailOutboxService,
     encryption::EncryptionService, geocoding::GeocodingClient, here_maps::HereMapsClient,
     identity_verification_service::IdentityVerificationService, location_service::LocationService,
-    notification_service::NotificationService, payout_service::PayoutService,
+    ml_client::MlClient, notification_service::NotificationService,
+    patient_prediction_service::PatientPredictionService, payout_service::PayoutService,
     registration_service::RegistrationService, safehaven::SafeHavenClient,
     shift_service::ShiftService, wallet_service::WalletService,
 };
@@ -52,6 +55,9 @@ pub struct AppState {
     pub safehaven: Arc<SafeHavenClient>,
     pub here_maps_client: Arc<HereMapsClient>,
     pub distance_service: Arc<DistanceService>,
+    pub patient_repo: Arc<PatientRepository>,
+    pub patient_prediction_service: Arc<PatientPredictionService>,
+    pub pipeline_events: Arc<tokio::sync::broadcast::Sender<crate::models::patient_prediction::PipelineEvent>>,
 }
 
 #[derive(OpenApi)]
@@ -123,6 +129,10 @@ pub struct AppState {
         crate::handlers::shifts::reschedule_shift,
         crate::handlers::admin::list_hospitals_admin,
         crate::handlers::admin::list_clinicians_admin,
+        // Patients / ML pipeline
+        crate::handlers::patients::ingest_patient,
+        crate::handlers::patients::get_patient,
+        crate::handlers::pipeline::pipeline_events,
         // Wallet
         crate::handlers::wallet::get_wallet,
         crate::handlers::wallet::get_ledger,
@@ -177,6 +187,14 @@ pub struct AppState {
             crate::models::shift::ClockinApprovalRequest,
             crate::models::shift::ClockinApprovalDecisionRequest,
             crate::models::shift::ClockinApprovalRecord,
+            // Patients / ML pipeline
+            crate::models::patient::NewPatientRequest,
+            crate::models::patient::PatientResponse,
+            crate::models::patient_prediction::PredictionResponse,
+            crate::handlers::patients::IngestPatientResponse,
+            crate::handlers::patients::PatientDetailResponse,
+            crate::handlers::patients::ErrorResponse,
+            crate::handlers::patients::ErrorDetail,
             // Wallet
             crate::models::wallet::WalletSummary,
             crate::models::wallet::WalletLedgerEntry,
@@ -298,7 +316,8 @@ pub struct AppState {
         (name = "wallet", description = "Hospital wallet — balance, deposits, ledger (Tier 2)"),
         (name = "webhooks", description = "Inbound webhooks from external providers (SafeHaven)"),
         (name = "earnings", description = "Worker earnings — totals + transaction history"),
-        (name = "identity", description = "BVN/NIN identity verification and bank list")
+        (name = "identity", description = "BVN/NIN identity verification and bank list"),
+        (name = "patients", description = "Patient intake and async ML triage pipeline (diagnosis, risk, recommendation, routing)")
     ),
     modifiers(&SecurityAddon)
 )]
@@ -346,6 +365,8 @@ pub fn create_router(
     let audit_repo = Arc::new(AuditRepository::new(pool.clone()));
     let clinician_repo = Arc::new(ClinicianRepository::new(pool.clone()));
     let shift_repo = Arc::new(ShiftRepository::new(pool.clone()));
+    let patient_repo = Arc::new(PatientRepository::new(pool.clone()));
+    let patient_prediction_repo = Arc::new(PatientPredictionRepository::new(pool.clone()));
 
     let geocoding_client = Arc::new(GeocodingClient::new(std::env::var("GEOCODING_API_URL").ok()));
 
@@ -423,6 +444,20 @@ pub fn create_router(
         encryption_service.clone(),
     ));
 
+    // ML pipeline: patient intake -> ml-service -> SSE. An empty
+    // ML_SERVICE_URL flips MlClient into mock mode (mirrors SafeHavenClient).
+    let ml_client = Arc::new(MlClient::from_env());
+    let (pipeline_tx, _pipeline_rx) =
+        tokio::sync::broadcast::channel::<crate::models::patient_prediction::PipelineEvent>(256);
+    let pipeline_events = Arc::new(pipeline_tx);
+    let patient_prediction_service = Arc::new(PatientPredictionService::new(
+        pool.clone(),
+        patient_repo.clone(),
+        patient_prediction_repo,
+        ml_client,
+        pipeline_events.clone(),
+    ));
+
     let state = AppState {
         pool: pool.clone(),
         registration_service,
@@ -436,6 +471,9 @@ pub fn create_router(
         safehaven: safehaven_client.clone(),
         here_maps_client,
         distance_service,
+        patient_repo,
+        patient_prediction_service,
+        pipeline_events,
     };
 
     let api_router = Router::new()
@@ -780,6 +818,28 @@ pub fn create_router(
             "/api/v1/worker/earnings",
             get(earnings::get_earnings)
                 .route_layer(from_fn(require_role(&[UserRole::HealthWorker]))),
+        )
+        // ---- Patient intake + ML pipeline — HealthWorker and HospitalAdmin.
+        .route(
+            "/api/v1/ingest/patient",
+            post(patients::ingest_patient).route_layer(from_fn(require_role(&[
+                UserRole::HealthWorker,
+                UserRole::HospitalAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/patients/{id}",
+            get(patients::get_patient).route_layer(from_fn(require_role(&[
+                UserRole::HealthWorker,
+                UserRole::HospitalAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/pipeline/events",
+            get(pipeline::pipeline_events).route_layer(from_fn(require_role(&[
+                UserRole::HealthWorker,
+                UserRole::HospitalAdmin,
+            ]))),
         )
         .layer(TraceLayer::new_for_http())
         .layer(cors)

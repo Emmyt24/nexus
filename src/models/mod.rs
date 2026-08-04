@@ -9,6 +9,8 @@ pub mod email_outbox;
 pub mod here_maps;
 pub mod hospital;
 pub mod location;
+pub mod patient;
+pub mod patient_prediction;
 pub mod registration;
 pub mod shift;
 pub mod user;
