@@ -311,6 +311,14 @@ impl AdminService {
         req: CreateAdminRequest,
     ) -> Result<AdminSummary, AppError> {
         Self::validate_admin_role(&req.role)?;
+        // Enforce a minimum password length before hashing.
+        if req.password.len() < 8 {
+            return Err(AppError::BadRequest(
+                "password must be at least 8 characters".into(),
+            ));
+        }
+        let password_hash = crate::services::auth_service::hash_password(&req.password)
+            .map_err(|e| AppError::InternalServerError(e.to_string()))?;
         Ok(self
             .repo
             .create_admin(
@@ -319,6 +327,7 @@ impl AdminService {
                 &req.email,
                 req.phone.as_deref(),
                 &req.role,
+                &password_hash,
             )
             .await?)
     }
