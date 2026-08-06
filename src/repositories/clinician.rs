@@ -191,7 +191,8 @@ impl ClinicianRepository {
             r#"
             SELECT c.id, c.user_id, c.first_name, c.last_name, u.email,
                    c.license_number, c.clinician_role as role, c.specialty,
-                   c.is_verified, c.is_active, c.created_at
+                   c.is_verified, c.is_active, c.created_at,
+                   c.rating::REAL AS rating, c.rating_count, c.availability
             FROM clinicians c
             JOIN users u ON c.user_id = u.id
             WHERE c.first_name <> ''

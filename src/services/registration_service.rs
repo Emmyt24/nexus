@@ -541,10 +541,25 @@ pub struct HospitalSummary {
     pub status: Option<RegistrationStatus>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub approved_at: Option<chrono::DateTime<chrono::Utc>>,
+    // Enriched card fields (from the same hospital row — no extra query).
+    pub address: String,
+    pub verification_status: String,
+    pub registration_step: String,
+    pub setup_progress_percent: i16,
+    pub logo_url: Option<String>,
 }
 
 impl From<Hospital> for HospitalSummary {
     fn from(hospital: Hospital) -> Self {
+        // Serialize the enums to their snake_case wire form for the card.
+        let verification_status = serde_json::to_value(&hospital.verification_status)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let registration_step = serde_json::to_value(&hospital.registration_step)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
         Self {
             id: hospital.id,
             name: hospital.name,
@@ -554,6 +569,11 @@ impl From<Hospital> for HospitalSummary {
             status: hospital.admin_registration_status,
             created_at: hospital.created_at,
             approved_at: hospital.approved_at,
+            address: hospital.address,
+            verification_status,
+            registration_step,
+            setup_progress_percent: hospital.setup_progress_percent,
+            logo_url: hospital.logo_url,
         }
     }
 }
