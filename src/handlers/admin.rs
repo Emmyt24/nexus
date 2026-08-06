@@ -618,3 +618,102 @@ pub async fn list_clinicians_admin(
         },
     }))
 }
+
+// ===========================================================================
+// Detail views, revenue trend, recent activities, global search
+// ===========================================================================
+
+/// GET /api/v1/admin/hospitals/{hospital_id}
+#[utoipa::path(get, path = "/api/v1/admin/hospitals/{hospital_id}", tag = "admin",
+    params(("hospital_id" = Uuid, Path, description = "Hospital id")),
+    responses(
+        (status = 200, description = "Hospital detail", body = HospitalDetail),
+        (status = 404, description = "Hospital not found")))]
+pub async fn get_hospital_detail(
+    State(state): State<AppState>,
+    Path(hospital_id): Path<Uuid>,
+) -> Result<Json<HospitalDetail>, AppError> {
+    Ok(Json(state.admin_service.hospital_detail(hospital_id).await?))
+}
+
+/// GET /api/v1/admin/workers/{clinician_id}
+#[utoipa::path(get, path = "/api/v1/admin/workers/{clinician_id}", tag = "admin",
+    params(("clinician_id" = Uuid, Path, description = "Clinician id")),
+    responses(
+        (status = 200, description = "Worker detail", body = WorkerDetail),
+        (status = 404, description = "Worker not found")))]
+pub async fn get_worker_detail(
+    State(state): State<AppState>,
+    Path(clinician_id): Path<Uuid>,
+) -> Result<Json<WorkerDetail>, AppError> {
+    Ok(Json(state.admin_service.worker_detail(clinician_id).await?))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RevenueTrendQuery {
+    /// `day` (default), `week`, or `month`.
+    pub period: Option<String>,
+    /// Inclusive window start (RFC3339). Defaults to 30 days before `to`.
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    /// Exclusive window end (RFC3339). Defaults to now.
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// GET /api/v1/admin/metrics/revenue/trend
+#[utoipa::path(get, path = "/api/v1/admin/metrics/revenue/trend", tag = "admin",
+    params(
+        ("period" = Option<String>, Query, description = "day | week | month (default day)"),
+        ("from" = Option<String>, Query, description = "Window start (RFC3339)"),
+        ("to" = Option<String>, Query, description = "Window end (RFC3339)")),
+    responses(
+        (status = 200, description = "Revenue trend", body = RevenueTrend),
+        (status = 422, description = "Invalid period")))]
+pub async fn metrics_revenue_trend(
+    State(state): State<AppState>,
+    Query(q): Query<RevenueTrendQuery>,
+) -> Result<Json<RevenueTrend>, AppError> {
+    Ok(Json(
+        state
+            .admin_service
+            .revenue_trend(q.period.as_deref(), q.from, q.to)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ActivitiesQuery {
+    /// Max items (default 20, max 100).
+    pub limit: Option<i64>,
+}
+
+/// GET /api/v1/admin/activities
+#[utoipa::path(get, path = "/api/v1/admin/activities", tag = "admin",
+    params(("limit" = Option<i64>, Query, description = "Max items (default 20, max 100)")),
+    responses((status = 200, description = "Recent activity feed", body = Vec<ActivityItem>)))]
+pub async fn recent_activities(
+    State(state): State<AppState>,
+    Query(q): Query<ActivitiesQuery>,
+) -> Result<Json<Vec<ActivityItem>>, AppError> {
+    Ok(Json(
+        state.admin_service.recent_activities(q.limit.unwrap_or(20)).await?,
+    ))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SearchQuery {
+    /// Search string (min 2 chars).
+    pub q: String,
+}
+
+/// GET /api/v1/admin/search
+#[utoipa::path(get, path = "/api/v1/admin/search", tag = "admin",
+    params(("q" = String, Query, description = "Search string (min 2 chars)")),
+    responses(
+        (status = 200, description = "Grouped search results", body = SearchResults),
+        (status = 422, description = "Query too short")))]
+pub async fn global_search(
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+) -> Result<Json<SearchResults>, AppError> {
+    Ok(Json(state.admin_service.search(&q.q).await?))
+}

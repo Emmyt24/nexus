@@ -349,4 +349,65 @@ impl AdminService {
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Admin {id} not found")))
     }
+
+    // ----- Detail views -----------------------------------------------------
+
+    pub async fn hospital_detail(&self, id: Uuid) -> Result<HospitalDetail, AppError> {
+        self.repo
+            .get_hospital_detail(id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Hospital {id} not found")))
+    }
+
+    pub async fn worker_detail(&self, id: Uuid) -> Result<WorkerDetail, AppError> {
+        self.repo
+            .get_worker_detail(id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Worker {id} not found")))
+    }
+
+    // ----- Revenue trend ----------------------------------------------------
+
+    /// Revenue over time. `period` ∈ {day, week, month}; window defaults to the
+    /// last 30 days when `from`/`to` are omitted.
+    pub async fn revenue_trend(
+        &self,
+        period: Option<&str>,
+        from: Option<chrono::DateTime<chrono::Utc>>,
+        to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RevenueTrend, AppError> {
+        let period = period.unwrap_or("day").to_ascii_lowercase();
+        if !matches!(period.as_str(), "day" | "week" | "month") {
+            return Err(AppError::Validation(
+                "period must be one of: day, week, month".to_string(),
+            ));
+        }
+        let to = to.unwrap_or_else(chrono::Utc::now);
+        let from = from.unwrap_or_else(|| to - chrono::Duration::days(30));
+        let points = self.repo.revenue_trend(&period, from, to).await?;
+        Ok(RevenueTrend { period, points })
+    }
+
+    // ----- Recent activities ------------------------------------------------
+
+    pub async fn recent_activities(&self, limit: i64) -> Result<Vec<ActivityItem>, AppError> {
+        Ok(self.repo.recent_activities(limit.clamp(1, 100)).await?)
+    }
+
+    // ----- Global search ----------------------------------------------------
+
+    pub async fn search(&self, query: &str) -> Result<SearchResults, AppError> {
+        let query = query.trim();
+        if query.len() < 2 {
+            return Err(AppError::Validation(
+                "search query must be at least 2 characters".to_string(),
+            ));
+        }
+        let (hospitals, workers) = self.repo.search(query, 10).await?;
+        Ok(SearchResults {
+            query: query.to_string(),
+            hospitals,
+            workers,
+        })
+    }
 }

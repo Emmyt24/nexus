@@ -157,6 +157,11 @@ pub struct AppState {
         crate::handlers::admin::create_admin,
         crate::handlers::admin::list_admins,
         crate::handlers::admin::update_admin,
+        crate::handlers::admin::get_hospital_detail,
+        crate::handlers::admin::get_worker_detail,
+        crate::handlers::admin::metrics_revenue_trend,
+        crate::handlers::admin::recent_activities,
+        crate::handlers::admin::global_search,
         // Wallet
         crate::handlers::wallet::get_wallet,
         crate::handlers::wallet::get_ledger,
@@ -272,6 +277,16 @@ pub struct AppState {
             crate::models::admin::CreateAdminRequest,
             crate::models::admin::UpdateAdminRequest,
             crate::models::admin::AdminSummary,
+            crate::models::admin::HospitalDetail,
+            crate::models::admin::WorkerDetail,
+            crate::models::admin::RevenuePoint,
+            crate::models::admin::RevenueTrend,
+            crate::models::admin::ActivityItem,
+            crate::models::admin::SearchHit,
+            crate::models::admin::SearchResults,
+            crate::handlers::admin::RevenueTrendQuery,
+            crate::handlers::admin::ActivitiesQuery,
+            crate::handlers::admin::SearchQuery,
             // Models
             crate::models::admin_registration::HospitalRegistrationRequest,
             crate::models::admin_registration::Address,
@@ -1048,5 +1063,34 @@ fn admin_dashboard_routes() -> Router<AppState> {
             "/api/v1/admin/admins/{id}",
             axum::routing::patch(admin::update_admin)
                 .route_layer(from_fn(require_permission(P::ManageAdmins))),
+        )
+        // Detail views — ViewHospitals / ViewWorkers.
+        .route(
+            "/api/v1/admin/hospitals/{hospital_id}",
+            get(admin::get_hospital_detail)
+                .route_layer(from_fn(require_permission(P::ViewHospitals))),
+        )
+        .route(
+            "/api/v1/admin/workers/{clinician_id}",
+            get(admin::get_worker_detail)
+                .route_layer(from_fn(require_permission(P::ViewWorkers))),
+        )
+        // Revenue trend (time series) — ViewEarnings (financial).
+        .route(
+            "/api/v1/admin/metrics/revenue/trend",
+            get(admin::metrics_revenue_trend)
+                .route_layer(from_fn(require_permission(P::ViewEarnings))),
+        )
+        // Recent activity feed — ViewAnalytics.
+        .route(
+            "/api/v1/admin/activities",
+            get(admin::recent_activities)
+                .route_layer(from_fn(require_permission(P::ViewAnalytics))),
+        )
+        // Global search (hospitals + workers) — ViewHospitals.
+        .route(
+            "/api/v1/admin/search",
+            get(admin::global_search)
+                .route_layer(from_fn(require_permission(P::ViewHospitals))),
         )
 }
