@@ -160,7 +160,7 @@ impl IdentityVerificationService {
         owner_id: Uuid,
         id_type: IdentityKind,
         otp: &str,
-    ) -> Result<(), IdentityError> {
+    ) -> Result<serde_json::Value, IdentityError> {
         let row = self
             .repo
             .get(owner.as_str(), owner_id, id_type.as_db())
@@ -195,7 +195,7 @@ impl IdentityVerificationService {
             .mark_verified(owner.as_str(), owner_id, id_type.as_db(), &payload)
             .await?;
 
-        Ok(())
+        Ok(payload)
     }
 
     /// True if either BVN or NIN is verified for this owner (either suffices).

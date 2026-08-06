@@ -29,6 +29,12 @@ pub struct ValidateIdentityRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct IdentityStatusResponse {
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -201,6 +207,9 @@ async fn initiate(
     Ok(Json(IdentityStatusResponse {
         message: "Verification initiated. An OTP has been sent to the registered phone number."
             .to_string(),
+        first_name: None,
+        last_name: None,
+        full_name: None,
     }))
 }
 
@@ -213,14 +222,33 @@ async fn validate(
     let id_type = IdentityKind::parse(&req.id_type)
         .ok_or_else(|| AppError::Validation("type must be BVN or NIN".to_string()))?;
 
-    state
+    let payload = state
         .identity_service
         .validate(owner, owner_id, id_type, &req.otp)
         .await
         .map_err(map_err)?;
 
+    let first_name = payload
+        .get("firstName")
+        .or_else(|| payload.get("first_name"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let last_name = payload
+        .get("lastName")
+        .or_else(|| payload.get("last_name"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let full_name = payload
+        .get("fullName")
+        .or_else(|| payload.get("full_name"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
     Ok(Json(IdentityStatusResponse {
         message: "Identity verified successfully.".to_string(),
+        first_name,
+        last_name,
+        full_name,
     }))
 }
 
