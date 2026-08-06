@@ -228,21 +228,42 @@ async fn validate(
         .await
         .map_err(map_err)?;
 
-    let first_name = payload
+    let target = payload.get("identity").unwrap_or(&payload);
+
+    let mut first_name = target
         .get("firstName")
-        .or_else(|| payload.get("first_name"))
+        .or_else(|| target.get("first_name"))
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let last_name = payload
+    let mut last_name = target
         .get("lastName")
-        .or_else(|| payload.get("last_name"))
+        .or_else(|| target.get("last_name"))
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let full_name = payload
+    let full_name = target
         .get("fullName")
-        .or_else(|| payload.get("full_name"))
+        .or_else(|| target.get("full_name"))
+        .or_else(|| target.get("name"))
         .and_then(|v| v.as_str())
         .map(str::to_string);
+
+    if (first_name.is_none() || last_name.is_none()) && full_name.is_some() {
+        if let Some(ref full) = full_name {
+            let parts: Vec<&str> = full.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if first_name.is_none() {
+                    first_name = Some(parts[0].to_string());
+                }
+                if last_name.is_none() {
+                    last_name = Some(parts[1..].join(" "));
+                }
+            } else if parts.len() == 1 {
+                if first_name.is_none() {
+                    first_name = Some(parts[0].to_string());
+                }
+            }
+        }
+    }
 
     Ok(Json(IdentityStatusResponse {
         message: "Identity verified successfully.".to_string(),
