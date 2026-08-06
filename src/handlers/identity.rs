@@ -207,6 +207,9 @@ async fn initiate(
     Ok(Json(IdentityStatusResponse {
         message: "Verification initiated. An OTP has been sent to the registered phone number."
             .to_string(),
+        first_name: None,
+        last_name: None,
+        full_name: None,
     }))
 }
 

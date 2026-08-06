@@ -5,6 +5,8 @@
 
 set -e  # Exit on error
 
+export PATH="$HOME/.cargo/bin:$PATH"
+
 echo "🏥 NexusCare Local Database Setup"
 echo "=================================="
 echo ""
@@ -240,7 +242,7 @@ echo "📋 Step 8: Checking sqlx-cli..."
 if ! command -v sqlx &> /dev/null; then
     echo -e "${YELLOW}⚠️  sqlx-cli not found. Installing...${NC}"
     echo "This may take a few minutes..."
-    cargo install sqlx-cli --no-default-features --features postgres
+    cargo install sqlx-cli --version 0.8.3 --no-default-features --features postgres
     echo -e "${GREEN}✅ sqlx-cli installed${NC}"
 else
     echo -e "${GREEN}✅ sqlx-cli is already installed${NC}"
