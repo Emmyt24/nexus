@@ -594,12 +594,20 @@ pub fn create_router(
         )
         // Identity verification (BVN/NIN) + bank list
         .route(
+            "/api/v1/hospitals/{hospital_id}/identity",
+            get(identity::hospital_get_identity),
+        )
+        .route(
             "/api/v1/hospitals/{hospital_id}/identity/initiate",
             post(identity::hospital_initiate),
         )
         .route(
             "/api/v1/hospitals/{hospital_id}/identity/validate",
             post(identity::hospital_validate),
+        )
+        .route(
+            "/api/v1/clinicians/{clinician_id}/identity",
+            get(identity::clinician_get_identity),
         )
         .route(
             "/api/v1/clinicians/{clinician_id}/identity/initiate",
@@ -609,6 +617,7 @@ pub fn create_router(
             "/api/v1/clinicians/{clinician_id}/identity/validate",
             post(identity::clinician_validate),
         )
+
         .route("/api/v1/banks", get(identity::list_banks))
         .route("/api/v1/banks/resolve", post(identity::resolve_account))
         // Location services

@@ -172,4 +172,31 @@ impl IdentityVerificationRepository {
         .await?;
         Ok(count >= 1)
     }
+
+    /// Fetch stored `provider_payload` + `identity_type` for a verified identity row if present.
+    pub async fn get_verified_payload(
+        &self,
+        owner_type: &str,
+        owner_id: Uuid,
+    ) -> Result<Option<(String, Value)>, IdentityRepoError> {
+        let row: Option<(String, Value)> = sqlx::query_as(
+            r#"
+            SELECT identity_type::text, provider_payload
+            FROM identity_verifications
+            WHERE owner_type = $1::identity_owner
+              AND owner_id   = $2
+              AND status     = 'verified'
+              AND provider_payload IS NOT NULL
+            ORDER BY verified_at DESC NULLS LAST
+            LIMIT 1
+            "#,
+        )
+        .bind(owner_type)
+        .bind(owner_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
 }
+
