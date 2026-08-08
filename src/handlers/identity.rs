@@ -37,6 +37,153 @@ pub struct IdentityStatusResponse {
     pub full_name: Option<String>,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GetIdentityResponse {
+    pub verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_name: Option<String>,
+}
+
+fn title_case(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let is_all_upper = trimmed.chars().any(|c| c.is_alphabetic())
+        && trimmed.chars().all(|c| !c.is_alphabetic() || c.is_uppercase());
+
+    if is_all_upper {
+        trimmed
+            .split_whitespace()
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    None => String::new(),
+                    Some(f) => {
+                        f.to_uppercase().collect::<String>()
+                            + chars.as_str().to_lowercase().as_str()
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn extract_string_by_keys(val: &Value, keys: &[&str]) -> Option<String> {
+    match val {
+        Value::Object(map) => {
+            for &key in keys {
+                if let Some(v) = map.get(key) {
+                    if let Some(s) = v.as_str() {
+                        let trimmed = s.trim();
+                        if !trimmed.is_empty() {
+                            return Some(title_case(trimmed));
+                        }
+                    }
+                }
+            }
+            for (_k, v) in map {
+                if v.is_object() || v.is_array() {
+                    if let Some(found) = extract_string_by_keys(v, keys) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                if let Some(found) = extract_string_by_keys(item, keys) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+pub fn extract_identity_names(
+    payload: &Value,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let fn_keys = &[
+        "firstName",
+        "first_name",
+        "first_Name",
+        "firstnames",
+        "givenName",
+        "given_name",
+    ];
+    let ln_keys = &[
+        "lastName",
+        "last_name",
+        "last_Name",
+        "surname",
+        "surName",
+        "familyName",
+        "family_name",
+    ];
+    let mn_keys = &[
+        "middleName",
+        "middle_name",
+        "otherNames",
+        "other_names",
+    ];
+    let full_keys = &[
+        "fullName",
+        "full_name",
+        "formattedName",
+        "formatted_name",
+        "name",
+    ];
+
+    let mut first_name = extract_string_by_keys(payload, fn_keys);
+    let mut last_name = extract_string_by_keys(payload, ln_keys);
+    let middle_name = extract_string_by_keys(payload, mn_keys);
+    let full_name = extract_string_by_keys(payload, full_keys);
+
+    if (first_name.is_none() || last_name.is_none()) && full_name.is_some() {
+        if let Some(ref full) = full_name {
+            let parts: Vec<&str> = full.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if first_name.is_none() {
+                    first_name = Some(title_case(parts[0]));
+                }
+                if last_name.is_none() {
+                    last_name = Some(title_case(&parts[1..].join(" ")));
+                }
+            } else if parts.len() == 1 {
+                if first_name.is_none() {
+                    first_name = Some(title_case(parts[0]));
+                }
+            }
+        }
+    }
+
+    if last_name.is_none() && middle_name.is_some() {
+        last_name = middle_name;
+    }
+
+    let computed_full_name = full_name.or_else(|| match (&first_name, &last_name) {
+        (Some(f), Some(l)) => Some(format!("{f} {l}")),
+        (Some(f), None) => Some(f.clone()),
+        (None, Some(l)) => Some(l.clone()),
+        _ => None,
+    });
+
+    (first_name, last_name, computed_full_name)
+}
+
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ResolveAccountRequest {
     /// 10-digit NUBAN account number
@@ -189,6 +336,73 @@ pub async fn resolve_account(
     }))
 }
 
+/// GET /api/v1/hospitals/{hospital_id}/identity
+#[utoipa::path(
+    get,
+    path = "/api/v1/hospitals/{hospital_id}/identity",
+    params(("hospital_id" = Uuid, Path, description = "Hospital unique identifier")),
+    responses(
+        (status = 200, description = "Hospital identity status and names", body = GetIdentityResponse)
+    ),
+    tag = "identity",
+    summary = "Get hospital admin verified identity details"
+)]
+pub async fn hospital_get_identity(
+    State(state): State<AppState>,
+    axum::extract::Path(hospital_id): axum::extract::Path<Uuid>,
+) -> AppResult<Json<GetIdentityResponse>> {
+    get_identity(&state, IdentityOwner::Hospital, hospital_id).await
+}
+
+/// GET /api/v1/clinicians/{clinician_id}/identity
+#[utoipa::path(
+    get,
+    path = "/api/v1/clinicians/{clinician_id}/identity",
+    params(("clinician_id" = Uuid, Path, description = "Clinician unique identifier")),
+    responses(
+        (status = 200, description = "Clinician identity status and names", body = GetIdentityResponse)
+    ),
+    tag = "identity",
+    summary = "Get clinician verified identity details"
+)]
+pub async fn clinician_get_identity(
+    State(state): State<AppState>,
+    axum::extract::Path(clinician_id): axum::extract::Path<Uuid>,
+) -> AppResult<Json<GetIdentityResponse>> {
+    get_identity(&state, IdentityOwner::Clinician, clinician_id).await
+}
+
+async fn get_identity(
+    state: &AppState,
+    owner: IdentityOwner,
+    owner_id: Uuid,
+) -> AppResult<Json<GetIdentityResponse>> {
+    let payload_row = state
+        .identity_service
+        .get_verified_payload(owner, owner_id)
+        .await
+        .map_err(map_err)?;
+
+    if let Some((id_type, payload)) = payload_row {
+        let (first_name, last_name, full_name) = extract_identity_names(&payload);
+        Ok(Json(GetIdentityResponse {
+            verified: true,
+            identity_type: Some(id_type.to_uppercase()),
+            first_name,
+            last_name,
+            full_name,
+        }))
+    } else {
+        Ok(Json(GetIdentityResponse {
+            verified: false,
+            identity_type: None,
+            first_name: None,
+            last_name: None,
+            full_name: None,
+        }))
+    }
+}
+
 async fn initiate(
     state: &AppState,
     owner: IdentityOwner,
@@ -228,42 +442,7 @@ async fn validate(
         .await
         .map_err(map_err)?;
 
-    let target = payload.get("identity").unwrap_or(&payload);
-
-    let mut first_name = target
-        .get("firstName")
-        .or_else(|| target.get("first_name"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let mut last_name = target
-        .get("lastName")
-        .or_else(|| target.get("last_name"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let full_name = target
-        .get("fullName")
-        .or_else(|| target.get("full_name"))
-        .or_else(|| target.get("name"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-
-    if (first_name.is_none() || last_name.is_none()) && full_name.is_some() {
-        if let Some(ref full) = full_name {
-            let parts: Vec<&str> = full.split_whitespace().collect();
-            if parts.len() >= 2 {
-                if first_name.is_none() {
-                    first_name = Some(parts[0].to_string());
-                }
-                if last_name.is_none() {
-                    last_name = Some(parts[1..].join(" "));
-                }
-            } else if parts.len() == 1 {
-                if first_name.is_none() {
-                    first_name = Some(parts[0].to_string());
-                }
-            }
-        }
-    }
+    let (first_name, last_name, full_name) = extract_identity_names(&payload);
 
     Ok(Json(IdentityStatusResponse {
         message: "Identity verified successfully.".to_string(),
@@ -288,3 +467,51 @@ fn map_err(e: IdentityError) -> AppError {
         e => AppError::Internal(anyhow::anyhow!("{e}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_extract_identity_names_bvn_surname() {
+        let payload = json!({
+            "identity": {
+                "firstName": "CHINEDU",
+                "surname": "ADEBAYO",
+                "middleName": "EMMANUEL"
+            }
+        });
+        let (fn_opt, ln_opt, full_opt) = extract_identity_names(&payload);
+        assert_eq!(fn_opt.as_deref(), Some("Chinedu"));
+        assert_eq!(ln_opt.as_deref(), Some("Adebayo"));
+        assert_eq!(full_opt.as_deref(), Some("Chinedu Adebayo"));
+    }
+
+    #[test]
+    fn test_extract_identity_names_bvn_details_nested() {
+        let payload = json!({
+            "bvnDetails": {
+                "first_name": "ADAOBI",
+                "last_name": "OKAFOR"
+            }
+        });
+        let (fn_opt, ln_opt, full_opt) = extract_identity_names(&payload);
+        assert_eq!(fn_opt.as_deref(), Some("Adaobi"));
+        assert_eq!(ln_opt.as_deref(), Some("Okafor"));
+        assert_eq!(full_opt.as_deref(), Some("Adaobi Okafor"));
+    }
+
+    #[test]
+    fn test_extract_identity_names_full_name_fallback() {
+        let payload = json!({
+            "fullName": "JOHN OBI DOE"
+        });
+        let (fn_opt, ln_opt, full_opt) = extract_identity_names(&payload);
+        assert_eq!(fn_opt.as_deref(), Some("John"));
+        assert_eq!(ln_opt.as_deref(), Some("Obi Doe"));
+        assert_eq!(full_opt.as_deref(), Some("John Obi Doe"));
+    }
+}
+
+

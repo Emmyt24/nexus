@@ -207,6 +207,19 @@ impl IdentityVerificationService {
         Ok(self.repo.any_verified(owner.as_str(), owner_id).await?)
     }
 
+    /// Fetch stored `provider_payload` + `identity_type` for a verified identity.
+    pub async fn get_verified_payload(
+        &self,
+        owner: IdentityOwner,
+        owner_id: Uuid,
+    ) -> Result<Option<(String, serde_json::Value)>, IdentityError> {
+        Ok(self
+            .repo
+            .get_verified_payload(owner.as_str(), owner_id)
+            .await?)
+    }
+
+
     /// Decrypt a stored, verified identity number (e.g. to pass a verified BVN
     /// into wallet sub-account provisioning). Returns None if not present.
     pub async fn decrypted_number(
