@@ -337,6 +337,17 @@ pub struct HospitalDetail {
     pub total_spent_kobo: i64,
     // Identity
     pub identity_verified: bool,
+    // Compliance documents summary + payment method presence (image 2)
+    pub documents_status: String,
+    pub payment_method_on_file: bool,
+    // Ratings (from workers rating this hospital after shifts)
+    pub average_rating: Option<f64>,
+    pub rating_count: i64,
+    // Per-dimension averages for the rating breakdown (image 2)
+    pub rating_staff_support: Option<f64>,
+    pub rating_equipment_availability: Option<f64>,
+    pub rating_communication: Option<f64>,
+    pub rating_payment_timeliness: Option<f64>,
 }
 
 /// Full worker (clinician) record for the admin drill-down view.
