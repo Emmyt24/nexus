@@ -1,7 +1,12 @@
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    Json,
+};
 use uuid::Uuid;
 use validator::Validate;
 
+use crate::models::clinician::WorkerPublicDetail;
 use crate::models::clinician_registration::{
     AddBankAccountRequest, BankAccountResponse, CompleteProfileRequest, ProfileResponse,
     SendOtpRequest, SendOtpResponse, VerifyOtpRequest, VerifyOtpResponse,
@@ -9,6 +14,59 @@ use crate::models::clinician_registration::{
 use crate::routes::AppState;
 use crate::services::clinician_registration_service::ClinicianRegistrationError;
 use crate::utils::errors::{AppError, AppResult};
+
+/// GET /api/v1/workers/{id}
+/// Public (ungated) worker profile with rating, completed shifts, verification
+/// and location. Excludes contact, bank-account and earnings (admin-only).
+#[utoipa::path(
+    get,
+    path = "/api/v1/workers/{id}",
+    tag = "clinicians",
+    params(("id" = Uuid, Path, description = "Clinician id")),
+    responses(
+        (status = 200, description = "Worker public profile", body = WorkerPublicDetail),
+        (status = 404, description = "Worker not found")
+    )
+)]
+pub async fn get_worker_public(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<WorkerPublicDetail>> {
+    let worker: Option<WorkerPublicDetail> = sqlx::query_as(
+        r#"
+        SELECT
+            c.id,
+            c.first_name,
+            c.last_name,
+            c.specialty::TEXT      AS specialty,
+            c.role_title,
+            c.license_number,
+            c.rating::REAL         AS rating,
+            c.rating_count,
+            c.acceptance_rate_pct,
+            c.availability::TEXT   AS availability,
+            c.is_verified,
+            c.is_active,
+            EXISTS (SELECT 1 FROM identity_verifications iv
+                WHERE iv.owner_type = 'clinician' AND iv.owner_id = c.id
+                  AND iv.status = 'verified')                                  AS identity_verified,
+            (SELECT COUNT(*) FROM shifts s WHERE s.assigned_clinician_id = c.id
+                AND s.status = 'completed')::BIGINT                            AS completed_shifts,
+            cl.latitude   AS latitude,
+            cl.longitude  AS longitude,
+            c.created_at
+        FROM clinicians c
+        LEFT JOIN clinician_locations cl ON cl.clinician_id = c.id
+        WHERE c.id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let worker = worker.ok_or_else(|| AppError::NotFound(format!("Worker {} not found", id)))?;
+    Ok(Json(worker))
+}
 
 /// POST /api/v1/clinicians/otp/send
 #[utoipa::path(

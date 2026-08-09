@@ -1,8 +1,42 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use utoipa::ToSchema;
 use uuid::Uuid;
 use validator::Validate;
+
+/// Public hospital profile with ratings, shift counts, documents status and
+/// payment-method presence — the general (ungated) drill-down. Excludes the
+/// sensitive wallet balance, admin contact and spend that stay admin-only.
+#[derive(Debug, Serialize, Deserialize, ToSchema, FromRow)]
+pub struct HospitalPublicDetail {
+    pub id: Uuid,
+    pub name: String,
+    pub registration_number: String,
+    pub email: String,
+    pub address: String,
+    pub phone_number: String,
+    pub verification_status: String,
+    pub registration_step: String,
+    pub setup_progress_percent: i16,
+    pub logo_url: Option<String>,
+    pub created_at: DateTime<Utc>,
+    // Shift aggregates
+    pub total_shifts: i64,
+    pub active_shifts: i64,
+    pub completed_shifts: i64,
+    // Identity + compliance + payment presence
+    pub identity_verified: bool,
+    pub documents_status: String,
+    pub payment_method_on_file: bool,
+    // Ratings (workers rating this hospital) + 4-dimension breakdown
+    pub average_rating: Option<f64>,
+    pub rating_count: i64,
+    pub rating_staff_support: Option<f64>,
+    pub rating_equipment_availability: Option<f64>,
+    pub rating_communication: Option<f64>,
+    pub rating_payment_timeliness: Option<f64>,
+}
 
 /// Verification status of a hospital against the CAC register.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]

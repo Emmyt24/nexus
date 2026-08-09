@@ -509,8 +509,39 @@ impl RegistrationService {
         // Calculate pagination metadata
         let total_pages = (total as f64 / page_size as f64).ceil() as i64;
 
+        // Build the summaries, then enrich the page with completed-shift counts
+        // and average ratings in a single batch query (no N+1).
+        let mut summaries: Vec<HospitalSummary> =
+            hospitals.into_iter().map(HospitalSummary::from).collect();
+        let ids: Vec<Uuid> = summaries.iter().map(|h| h.id).collect();
+        if !ids.is_empty() {
+            let aggregates: Vec<(Uuid, i64, Option<f64>)> = sqlx::query_as(
+                r#"
+                SELECT
+                    h.id,
+                    (SELECT COUNT(*) FROM shifts s
+                        WHERE s.hospital_id = h.id AND s.status = 'completed')::BIGINT AS completed_shifts,
+                    (SELECT AVG(sr.score)::FLOAT8 FROM shift_ratings sr
+                        WHERE sr.ratee_kind = 'hospital' AND sr.ratee_id = h.id)       AS average_rating
+                FROM hospitals h
+                WHERE h.id = ANY($1)
+                "#,
+            )
+            .bind(&ids)
+            .fetch_all(&self.db_pool)
+            .await?;
+
+            // Merge aggregates back onto their matching summary by id.
+            for (id, completed, avg) in aggregates {
+                if let Some(h) = summaries.iter_mut().find(|h| h.id == id) {
+                    h.completed_shifts = completed;
+                    h.average_rating = avg;
+                }
+            }
+        }
+
         Ok(HospitalListResponse {
-            hospitals: hospitals.into_iter().map(HospitalSummary::from).collect(),
+            hospitals: summaries,
             pagination: PaginationMetadata {
                 current_page: page,
                 page_size,
@@ -547,6 +578,9 @@ pub struct HospitalSummary {
     pub registration_step: String,
     pub setup_progress_percent: i16,
     pub logo_url: Option<String>,
+    // Aggregates for the admin list (image 1): filled by list_hospitals.
+    pub completed_shifts: i64,
+    pub average_rating: Option<f64>,
 }
 
 impl From<Hospital> for HospitalSummary {
@@ -574,6 +608,9 @@ impl From<Hospital> for HospitalSummary {
             registration_step,
             setup_progress_percent: hospital.setup_progress_percent,
             logo_url: hospital.logo_url,
+            // Defaults; list_hospitals fills these from a batch aggregate query.
+            completed_shifts: 0,
+            average_rating: None,
         }
     }
 }
