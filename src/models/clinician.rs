@@ -144,4 +144,31 @@ pub struct ClinicianAdminSummary {
     pub rating: f32,
     pub rating_count: i32,
     pub availability: ClinicianAvailability,
+    // Completed-shift count + last-known location for the admin list (image).
+    pub completed_shifts: i64,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+}
+
+/// Public worker profile — the general (ungated) drill-down. Excludes the
+/// sensitive contact, bank-account and earnings data that stay admin-only.
+#[derive(Debug, Serialize, Deserialize, ToSchema, FromRow)]
+pub struct WorkerPublicDetail {
+    pub id: Uuid,
+    pub first_name: String,
+    pub last_name: String,
+    pub specialty: String,
+    pub role_title: String,
+    pub license_number: Option<String>,
+    pub rating: f32,
+    pub rating_count: i32,
+    pub acceptance_rate_pct: Option<f32>,
+    pub availability: String,
+    pub is_verified: bool,
+    pub is_active: bool,
+    pub identity_verified: bool,
+    pub completed_shifts: i64,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub created_at: DateTime<Utc>,
 }

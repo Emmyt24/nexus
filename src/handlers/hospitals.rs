@@ -8,8 +8,8 @@ use validator::Validate;
 
 use crate::{
     models::hospital::{
-        CreateHospitalRequest, Hospital, HospitalResponse, RegistrationStep, UpdateHospitalRequest,
-        VerificationStatus,
+        CreateHospitalRequest, Hospital, HospitalPublicDetail, HospitalResponse, RegistrationStep,
+        UpdateHospitalRequest, VerificationStatus,
     },
     routes::AppState,
     utils::errors::{AppError, AppResult},
@@ -63,16 +63,75 @@ pub async fn create_hospital(
 }
 
 /// GET /api/v1/hospitals/:id
+/// Public (ungated) hospital profile enriched with ratings, shift counts,
+/// documents status and payment-method presence. Sensitive wallet/contact/spend
+/// data is intentionally excluded here and served only from the admin detail.
+#[utoipa::path(
+    get,
+    path = "/api/v1/hospitals/{id}",
+    tag = "hospitals",
+    params(("id" = Uuid, Path, description = "Hospital id")),
+    responses(
+        (status = 200, description = "Hospital public profile", body = HospitalPublicDetail),
+        (status = 404, description = "Hospital not found")
+    )
+)]
 pub async fn get_hospital(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> AppResult<Json<HospitalResponse>> {
-    let hospital: Option<Hospital> = sqlx::query_as(
+) -> AppResult<Json<HospitalPublicDetail>> {
+    let hospital: Option<HospitalPublicDetail> = sqlx::query_as(
         r#"
-        SELECT id, name, registration_number, email, address, phone_number,
-               verification_status, registration_step, logo_url, created_at, updated_at
-        FROM hospitals
-        WHERE id = $1
+        SELECT
+            h.id,
+            h.name,
+            h.registration_number,
+            h.email,
+            h.address,
+            h.phone_number,
+            h.verification_status::TEXT           AS verification_status,
+            h.registration_step::TEXT             AS registration_step,
+            h.setup_progress_percent,
+            h.logo_url,
+            h.created_at,
+            (SELECT COUNT(*) FROM shifts s WHERE s.hospital_id = h.id)::BIGINT AS total_shifts,
+            (SELECT COUNT(*) FROM shifts s WHERE s.hospital_id = h.id
+                AND s.status IN ('open','assigned','in_progress'))::BIGINT     AS active_shifts,
+            (SELECT COUNT(*) FROM shifts s WHERE s.hospital_id = h.id
+                AND s.status = 'completed')::BIGINT                            AS completed_shifts,
+            EXISTS (SELECT 1 FROM identity_verifications iv
+                WHERE iv.owner_type = 'hospital' AND iv.owner_id = h.id
+                  AND iv.status = 'verified')                                  AS identity_verified,
+            CASE
+                WHEN EXISTS (SELECT 1 FROM hospital_documents d WHERE d.hospital_id = h.id
+                    AND d.submission_status = 'approved') THEN 'verified'
+                WHEN EXISTS (SELECT 1 FROM hospital_documents d WHERE d.hospital_id = h.id
+                    AND d.submission_status = 'under_review') THEN 'under_review'
+                WHEN EXISTS (SELECT 1 FROM hospital_documents d WHERE d.hospital_id = h.id)
+                    THEN 'submitted'
+                ELSE 'unverified'
+            END                                                               AS documents_status,
+            EXISTS (SELECT 1 FROM hospital_wallets w WHERE w.hospital_id = h.id
+                AND w.safehaven_account_number IS NOT NULL)                   AS payment_method_on_file,
+            r.avg_rating                          AS average_rating,
+            COALESCE(r.rating_count, 0)::BIGINT   AS rating_count,
+            r.avg_staff_support                   AS rating_staff_support,
+            r.avg_equipment_availability          AS rating_equipment_availability,
+            r.avg_communication                   AS rating_communication,
+            r.avg_payment_timeliness              AS rating_payment_timeliness
+        FROM hospitals h
+        LEFT JOIN LATERAL (
+            SELECT
+                AVG(sr.score)::FLOAT8                                     AS avg_rating,
+                COUNT(*)                                                  AS rating_count,
+                AVG((sr.dimensions->>'staff_support')::NUMERIC)::FLOAT8   AS avg_staff_support,
+                AVG((sr.dimensions->>'equipment_availability')::NUMERIC)::FLOAT8 AS avg_equipment_availability,
+                AVG((sr.dimensions->>'communication')::NUMERIC)::FLOAT8   AS avg_communication,
+                AVG((sr.dimensions->>'payment_timeliness')::NUMERIC)::FLOAT8 AS avg_payment_timeliness
+            FROM shift_ratings sr
+            WHERE sr.ratee_kind = 'hospital' AND sr.ratee_id = h.id
+        ) r ON TRUE
+        WHERE h.id = $1
         "#,
     )
     .bind(id)
@@ -81,7 +140,7 @@ pub async fn get_hospital(
 
     let hospital =
         hospital.ok_or_else(|| AppError::NotFound(format!("Hospital {} not found", id)))?;
-    Ok(Json(HospitalResponse::from(hospital)))
+    Ok(Json(hospital))
 }
 
 /// PATCH /api/v1/hospitals/:id

@@ -666,10 +666,40 @@ impl AdminRepository {
                       AND bt.status = 'success')::BIGINT                           AS total_spent_kobo,
                 EXISTS (SELECT 1 FROM identity_verifications iv
                     WHERE iv.owner_type = 'hospital' AND iv.owner_id = h.id
-                      AND iv.status = 'verified')                                  AS identity_verified
+                      AND iv.status = 'verified')                                  AS identity_verified,
+                -- Summary of compliance-document review state (image 2).
+                CASE
+                    WHEN EXISTS (SELECT 1 FROM hospital_documents d WHERE d.hospital_id = h.id
+                        AND d.submission_status = 'approved') THEN 'verified'
+                    WHEN EXISTS (SELECT 1 FROM hospital_documents d WHERE d.hospital_id = h.id
+                        AND d.submission_status = 'under_review') THEN 'under_review'
+                    WHEN EXISTS (SELECT 1 FROM hospital_documents d WHERE d.hospital_id = h.id)
+                        THEN 'submitted'
+                    ELSE 'unverified'
+                END                                                                AS documents_status,
+                -- Payment method = a provisioned SafeHaven wallet account.
+                (w.safehaven_account_number IS NOT NULL)                           AS payment_method_on_file,
+                r.avg_rating                          AS average_rating,
+                COALESCE(r.rating_count, 0)::BIGINT   AS rating_count,
+                r.avg_staff_support                   AS rating_staff_support,
+                r.avg_equipment_availability          AS rating_equipment_availability,
+                r.avg_communication                   AS rating_communication,
+                r.avg_payment_timeliness              AS rating_payment_timeliness
             FROM hospitals h
             LEFT JOIN users u            ON u.id = h.admin_user_id
             LEFT JOIN hospital_wallets w ON w.hospital_id = h.id
+            -- Aggregate worker-submitted ratings for this hospital (4 dimensions).
+            LEFT JOIN LATERAL (
+                SELECT
+                    AVG(sr.score)::FLOAT8                                     AS avg_rating,
+                    COUNT(*)                                                  AS rating_count,
+                    AVG((sr.dimensions->>'staff_support')::NUMERIC)::FLOAT8   AS avg_staff_support,
+                    AVG((sr.dimensions->>'equipment_availability')::NUMERIC)::FLOAT8 AS avg_equipment_availability,
+                    AVG((sr.dimensions->>'communication')::NUMERIC)::FLOAT8   AS avg_communication,
+                    AVG((sr.dimensions->>'payment_timeliness')::NUMERIC)::FLOAT8 AS avg_payment_timeliness
+                FROM shift_ratings sr
+                WHERE sr.ratee_kind = 'hospital' AND sr.ratee_id = h.id
+            ) r ON TRUE
             WHERE h.id = $1
             "#,
         )

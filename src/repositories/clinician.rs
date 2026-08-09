@@ -192,9 +192,14 @@ impl ClinicianRepository {
             SELECT c.id, c.user_id, c.first_name, c.last_name, u.email,
                    c.license_number, c.clinician_role as role, c.specialty,
                    c.is_verified, c.is_active, c.created_at,
-                   c.rating::REAL AS rating, c.rating_count, c.availability
+                   c.rating::REAL AS rating, c.rating_count, c.availability,
+                   (SELECT COUNT(*) FROM shifts s WHERE s.assigned_clinician_id = c.id
+                        AND s.status = 'completed')::BIGINT AS completed_shifts,
+                   cl.latitude  AS latitude,
+                   cl.longitude AS longitude
             FROM clinicians c
             JOIN users u ON c.user_id = u.id
+            LEFT JOIN clinician_locations cl ON cl.clinician_id = c.id
             WHERE c.first_name <> ''
               AND c.last_name <> ''
               AND c.license_number IS NOT NULL

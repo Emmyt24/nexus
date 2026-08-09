@@ -69,6 +69,8 @@ pub struct AppState {
         crate::handlers::auth::email_otp_send,
         crate::handlers::auth::email_otp_verify,
         crate::handlers::auth::admin_login,
+        crate::handlers::hospitals::get_hospital,
+        crate::handlers::clinician_registration::get_worker_public,
         crate::handlers::auth::me,
         crate::handlers::auth::refresh_token,
         crate::handlers::auth::logout,
@@ -312,6 +314,8 @@ pub struct AppState {
             crate::models::user::UserResponse,
             crate::models::user::LoginRequest,
             crate::models::user::LoginResponse,
+            crate::models::hospital::HospitalPublicDetail,
+            crate::models::clinician::WorkerPublicDetail,
             crate::handlers::auth::MeResponse,
             crate::handlers::auth::ClinicianProfile,
             crate::handlers::auth::HospitalProfile,
@@ -583,6 +587,11 @@ pub fn create_router(
         .route(
             "/api/v1/clinicians/otp/verify",
             post(clinician_registration::verify_otp),
+        )
+        // Public (ungated) worker profile.
+        .route(
+            "/api/v1/workers/{id}",
+            get(clinician_registration::get_worker_public),
         )
         .route(
             "/api/v1/clinicians/{clinician_id}/profile",
