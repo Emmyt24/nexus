@@ -1,8 +1,10 @@
 use anyhow::Context;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use nexuscare_backend::repositories::EmailOutboxRepository;
@@ -39,11 +41,18 @@ async fn main() -> anyhow::Result<()> {
 
     // Load configuration
     let cfg = AppConfig::from_env().context("Failed to load configuration")?;
-
-    // Connect to database
+    // and don't pin idle connections open (so Neon can autosuspend).
+    let mut connect_opts =
+        PgConnectOptions::from_str(&cfg.database.url).context("invalid DATABASE_URL")?;
+    let host = connect_opts.get_host().to_string();
+    if host != "localhost" && host != "127.0.0.1" {
+        connect_opts = connect_opts.ssl_mode(PgSslMode::Require);
+    }
     let pool = PgPoolOptions::new()
         .max_connections(cfg.database.max_connections)
-        .connect(&cfg.database.url)
+        .min_connections(0)
+        .acquire_timeout(Duration::from_secs(30))
+        .connect_with(connect_opts)
         .await
         .context("Failed to connect to PostgreSQL")?;
 
