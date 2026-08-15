@@ -649,10 +649,13 @@ impl AdminRepository {
                 h.logo_url,
                 h.approved_at,
                 h.created_at,
-                u.first_name                          AS admin_first_name,
-                u.last_name                           AS admin_last_name,
-                u.email                               AS admin_email,
-                u.phone                               AS admin_phone,
+                -- Fall back to the admin details captured at registration so
+                -- the contact is populated even before the admin `users` row
+                -- exists (i.e. pre-approval). Avoids a null "unknown user".
+                COALESCE(NULLIF(u.first_name, ''), h.admin_first_name) AS admin_first_name,
+                COALESCE(NULLIF(u.last_name, ''), h.admin_last_name)   AS admin_last_name,
+                COALESCE(u.email, h.email)            AS admin_email,
+                COALESCE(u.phone, h.phone_number)     AS admin_phone,
                 COALESCE(w.balance_kobo, 0)::BIGINT   AS wallet_balance_kobo,
                 COALESCE(w.held_kobo, 0)::BIGINT      AS wallet_held_kobo,
                 w.safehaven_account_number,

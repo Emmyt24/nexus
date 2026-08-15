@@ -657,3 +657,37 @@ pub fn password_reset(reset_link: &str) -> EmailContent {
         html_body,
     }
 }
+
+/// Invitation sent to a newly-created sub-admin with their login credentials.
+pub fn admin_invite(
+    first_name: &str,
+    role: &str,
+    email: &str,
+    temp_password: &str,
+    login_url: &str,
+) -> EmailContent {
+    let role_label = role.replace('_', " ");
+    let subject = "You've been invited to the NexusCare admin console".to_string();
+    let text_body = format!(
+        "Hi {first_name},\n\nYou have been invited to the NexusCare admin console as {role_label}.\n\nSign in at: {login_url}\nEmail: {email}\nTemporary password: {temp_password}\n\nPlease sign in and change your password.\n"
+    );
+    let html_body = wrap_html(
+        "Admin invitation",
+        &format!(
+            "<p style=\"margin:0 0 12px 0;\">Hi {first_name},</p>
+             <p style=\"margin:0 0 16px 0;\">You have been invited to the NexusCare admin console as <strong>{role_label}</strong>.</p>
+             <table style=\"margin:0 0 16px 0; font-size:14px;\">
+               <tr><td style=\"padding:2px 8px 2px 0; color:#64748b;\">Email</td><td><strong>{email}</strong></td></tr>
+               <tr><td style=\"padding:2px 8px 2px 0; color:#64748b;\">Temporary password</td><td><strong>{temp_password}</strong></td></tr>
+             </table>
+             <p style=\"margin:0 0 16px 0;\"><a href=\"{login_url}\" style=\"display:inline-block; background:#2563eb; color:#ffffff; text-decoration:none; padding:10px 16px; border-radius:8px; font-weight:bold;\">Sign in</a></p>
+             <p style=\"margin:0; color:#64748b; font-size:13px;\">Please sign in and change your password as soon as possible.</p>"
+        ),
+    );
+
+    EmailContent {
+        subject,
+        text_body,
+        html_body,
+    }
+}

@@ -94,6 +94,10 @@ pub async fn get_hospital(
             h.setup_progress_percent,
             h.logo_url,
             h.created_at,
+            h.admin_first_name,
+            h.admin_last_name,
+            h.email                               AS contact_email,
+            h.phone_number                        AS contact_phone,
             (SELECT COUNT(*) FROM shifts s WHERE s.hospital_id = h.id)::BIGINT AS total_shifts,
             (SELECT COUNT(*) FROM shifts s WHERE s.hospital_id = h.id
                 AND s.status IN ('open','assigned','in_progress'))::BIGINT     AS active_shifts,

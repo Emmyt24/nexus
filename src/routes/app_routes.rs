@@ -20,7 +20,7 @@ use utoipa::{
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
-    admin, auth, clinician_registration, distance, earnings, health, here_maps, hospitals,
+    admin, auth, clinician_registration, distance, earnings, emails, health, here_maps, hospitals,
     identity, location, notifications, registration, shifts, wallet, webhooks,
 };
 use crate::repositories::{
@@ -58,6 +58,7 @@ pub struct AppState {
     pub here_maps_client: Arc<HereMapsClient>,
     pub distance_service: Arc<DistanceService>,
     pub push_service: Arc<PushService>,
+    pub email_outbox: Arc<EmailOutboxService>,
 }
 
 #[derive(OpenApi)]
@@ -74,6 +75,7 @@ pub struct AppState {
         crate::handlers::auth::me,
         crate::handlers::auth::refresh_token,
         crate::handlers::auth::logout,
+        crate::handlers::emails::send_email,
         crate::handlers::registration::register_hospital,
         crate::handlers::registration::list_hospitals,
         crate::handlers::registration::get_registration_status,
@@ -187,6 +189,9 @@ pub struct AppState {
     ),
     components(
         schemas(
+            // Emails
+            crate::handlers::emails::SendEmailRequest,
+            crate::handlers::emails::SendEmailResponse,
             // Registration
             crate::handlers::registration::HospitalRegistrationResponse,
             crate::handlers::registration::StatusChangeResponse,
@@ -395,7 +400,8 @@ pub struct AppState {
         (name = "webhooks", description = "Inbound webhooks from external providers (SafeHaven)"),
         (name = "earnings", description = "Worker earnings — totals + transaction history"),
         (name = "identity", description = "BVN/NIN identity verification and bank list"),
-        (name = "notifications", description = "Device push-token registration and the in-app notification center")
+        (name = "notifications", description = "Device push-token registration and the in-app notification center"),
+        (name = "emails", description = "Generic frontend-templated transactional email relay")
     ),
     modifiers(&SecurityAddon)
 )]
@@ -529,7 +535,7 @@ pub fn create_router(
     ));
 
     let admin_repo = Arc::new(AdminRepository::new(pool.clone()));
-    let admin_service = Arc::new(AdminService::new(admin_repo));
+    let admin_service = Arc::new(AdminService::new(admin_repo, email_outbox_service.clone()));
 
     let state = AppState {
         pool: pool.clone(),
@@ -546,6 +552,7 @@ pub fn create_router(
         here_maps_client,
         distance_service,
         push_service,
+        email_outbox: email_outbox_service.clone(),
     };
 
     let api_router = Router::new()
@@ -557,6 +564,8 @@ pub fn create_router(
         .route("/api/v1/auth/admin/login", post(auth::admin_login))
         .route("/api/v1/auth/refresh", post(auth::refresh_token))
         .route("/api/v1/auth/logout", post(auth::logout))
+        // Generic frontend-templated email relay (authenticated).
+        .route("/api/v1/emails/send", post(emails::send_email))
         .route("/api/v1/auth/me", get(auth::me))
         // Hospital Registration
         .route(
