@@ -41,9 +41,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Load configuration
     let cfg = AppConfig::from_env().context("Failed to load configuration")?;
-
-    // Connect to database. Force TLS for any remote host (e.g. Neon) while
-    // keeping localhost plaintext for local dev; tolerate serverless cold-starts
     // and don't pin idle connections open (so Neon can autosuspend).
     let mut connect_opts =
         PgConnectOptions::from_str(&cfg.database.url).context("invalid DATABASE_URL")?;
