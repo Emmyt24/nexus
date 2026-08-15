@@ -21,6 +21,11 @@ pub struct HospitalPublicDetail {
     pub setup_progress_percent: i16,
     pub logo_url: Option<String>,
     pub created_at: DateTime<Utc>,
+    // Admin / contact person (from the hospital row; always populated)
+    pub admin_first_name: Option<String>,
+    pub admin_last_name: Option<String>,
+    pub contact_email: String,
+    pub contact_phone: String,
     // Shift aggregates
     pub total_shifts: i64,
     pub active_shifts: i64,

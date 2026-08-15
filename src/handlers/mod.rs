@@ -3,6 +3,7 @@ pub mod auth;
 pub mod clinician_registration;
 pub mod distance;
 pub mod earnings;
+pub mod emails;
 pub mod health;
 pub mod here_maps;
 pub mod hospitals;
