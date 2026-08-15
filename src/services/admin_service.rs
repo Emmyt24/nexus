@@ -7,15 +7,27 @@ use uuid::Uuid;
 use crate::models::admin::*;
 use crate::models::user::UserRole;
 use crate::repositories::admin::AdminRepository;
+use crate::services::email_outbox_service::EmailOutboxService;
+use crate::services::email_templates;
 use crate::utils::errors::AppError;
 
 pub struct AdminService {
     repo: Arc<AdminRepository>,
+    email_outbox: Arc<EmailOutboxService>,
+    /// Base URL of the admin console, used to build the invite login link.
+    admin_app_url: String,
 }
 
 impl AdminService {
-    pub fn new(repo: Arc<AdminRepository>) -> Self {
-        Self { repo }
+    pub fn new(repo: Arc<AdminRepository>, email_outbox: Arc<EmailOutboxService>) -> Self {
+        let admin_app_url = std::env::var("ADMIN_APP_URL")
+            .or_else(|_| std::env::var("API_BASE_URL"))
+            .unwrap_or_else(|_| "http://localhost:8080".to_string());
+        Self {
+            repo,
+            email_outbox,
+            admin_app_url,
+        }
     }
 
     pub async fn dashboard(&self) -> Result<DashboardMetrics, AppError> {
@@ -319,7 +331,7 @@ impl AdminService {
         }
         let password_hash = crate::services::auth_service::hash_password(&req.password)
             .map_err(|e| AppError::InternalServerError(e.to_string()))?;
-        Ok(self
+        let admin = self
             .repo
             .create_admin(
                 &req.first_name,
@@ -329,7 +341,22 @@ impl AdminService {
                 &req.role,
                 &password_hash,
             )
-            .await?)
+            .await?;
+
+        // Best-effort invite email with the login link + initial password.
+        let login_url = format!("{}/admin/login", self.admin_app_url.trim_end_matches('/'));
+        let content = email_templates::admin_invite(
+            &req.first_name,
+            &req.role,
+            &req.email,
+            &req.password,
+            &login_url,
+        );
+        if let Err(e) = self.email_outbox.enqueue_email(&req.email, &content).await {
+            tracing::warn!("Failed to queue admin invite email for {}: {e}", req.email);
+        }
+
+        Ok(admin)
     }
 
     pub async fn list_admins(&self) -> Result<Vec<AdminSummary>, AppError> {
