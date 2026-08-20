@@ -11,7 +11,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use crate::models::wallet::{
-    CreateDepositRequest, DepositResponse, WalletLedgerEntry, WalletSummary,
+    CreateDepositRequest, DepositInstructions, DepositResponse, WalletLedgerEntry, WalletSummary,
 };
 use crate::routes::AppState;
 use crate::services::wallet_service::WalletServiceError;
@@ -130,31 +130,30 @@ pub async fn get_ledger(
     path = "/api/v1/wallet/deposits",
     request_body = CreateDepositRequest,
     responses(
-        (status = 201, description = "Deposit virtual account minted", body = DepositResponse),
+        (status = 200, description = "Sub-account funding instructions", body = DepositInstructions),
         (status = 401, body = ErrorResponse),
         (status = 403, body = ErrorResponse),
-        (status = 409, description = "Payment provider error", body = ErrorResponse),
-        (status = 422, description = "Validation error", body = ErrorResponse)
+        (status = 422, description = "No wallet yet / validation error", body = ErrorResponse)
     ),
     tag = "wallet",
-    summary = "Request a deposit virtual account",
-    description = "Returns a SafeHaven virtual account the hospital can transfer into. We credit the wallet automatically when SafeHaven fires the inbound webhook."
+    summary = "Get wallet funding instructions",
+    description = "Returns the hospital's dedicated SafeHaven sub-account to transfer into. The wallet is credited automatically when SafeHaven fires the inbound credit webhook. (Create the wallet first via /wallet/sub-account/*.)"
 )]
 pub async fn create_deposit(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<CreateDepositRequest>,
-) -> AppResult<(StatusCode, Json<DepositResponse>)> {
+) -> AppResult<(StatusCode, Json<DepositInstructions>)> {
     payload
         .validate()
         .map_err(|e| AppError::Validation(e.to_string()))?;
     let hospital_id = hospital_id_from_claims(&headers)?;
-    let row = state
+    let instructions = state
         .wallet_service
-        .request_deposit(hospital_id, payload.amount_kobo)
+        .deposit_instructions(hospital_id, payload.amount_kobo)
         .await
         .map_err(map_wallet_error)?;
-    Ok((StatusCode::CREATED, Json(row.into())))
+    Ok((StatusCode::OK, Json(instructions)))
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]

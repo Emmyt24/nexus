@@ -6,7 +6,7 @@ use chrono::{Duration, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::models::wallet::{Wallet, WalletDepositRequest, WalletLedgerEntry};
+use crate::models::wallet::{DepositInstructions, Wallet, WalletDepositRequest, WalletLedgerEntry};
 use crate::repositories::wallet::{WalletRepoError, WalletRepository};
 use crate::services::safehaven::{SafeHavenClient, SafeHavenError};
 
@@ -176,11 +176,17 @@ impl WalletService {
 
     /// Mint a one-shot virtual account at SafeHaven and record a pending deposit
 
-    pub async fn request_deposit(
+    /// Return the hospital's sub-account funding instructions. Hospitals fund
+    /// their wallet by transferring into their dedicated SafeHaven sub-account;
+    /// the inbound `account.credit` webhook then credits `balance_kobo`.
+    ///
+    /// (Per-deposit virtual accounts are unavailable while the SafeHaven account
+    /// is KYC-restricted, so this replaces the old `create_virtual_account` path.)
+    pub async fn deposit_instructions(
         &self,
         hospital_id: Uuid,
         amount_kobo: i64,
-    ) -> Result<WalletDepositRequest, WalletServiceError> {
+    ) -> Result<DepositInstructions, WalletServiceError> {
         if amount_kobo < 100_000 {
             return Err(WalletServiceError::Validation(
                 "Minimum deposit is ₦1,000".to_string(),
@@ -188,64 +194,36 @@ impl WalletService {
         }
 
         self.repo.ensure_wallet_row(hospital_id).await?;
+        let wallet = self
+            .repo
+            .find_wallet(hospital_id)
+            .await?
+            .ok_or(WalletServiceError::WalletNotFound(hospital_id))?;
 
-        let amount_naira = amount_kobo / 100;
-        let external_reference = format!("dep_{}", Uuid::new_v4());
-
-        // Settle into the hospital's sub-account only when we have BOTH a
-        // non-blank bank code and account number; otherwise pass no settlement
-        // override (SafeHaven rejects an empty settlement bank code).
-        let wallet = self.repo.find_wallet(hospital_id).await?;
-        let (settlement_bank, settlement_acct) = wallet
-            .as_ref()
-            .and_then(|w| match (&w.safehaven_bank_code, &w.safehaven_account_number) {
-                (Some(b), Some(a)) if !b.trim().is_empty() && !a.trim().is_empty() => {
-                    Some((Some(b.clone()), Some(a.clone())))
-                }
-                _ => None,
-            })
-            .unwrap_or((None, None));
-
-        let callback = if self.callback_url.trim().is_empty() {
-            // Mock mode tolerates a placeholder URL; real SafeHaven rejects it.
-            if self.safehaven.is_mock() {
-                "https://mock.invalid/webhook".to_string()
-            } else {
+        let account_number = match wallet
+            .safehaven_account_number
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(a) => a.to_string(),
+            None => {
                 return Err(WalletServiceError::Validation(
-                    "SAFEHAVEN_CALLBACK_URL is not configured".to_string(),
-                ));
+                    "No wallet account yet. Create your wallet first.".to_string(),
+                ))
             }
-        } else {
-            self.callback_url.clone()
         };
 
-        let va = self
-            .safehaven
-            .create_virtual_account(
-                amount_naira,
-                self.deposit_validity.num_seconds(),
-                &callback,
-                settlement_bank.as_deref(),
-                settlement_acct.as_deref(),
-                &external_reference,
-            )
-            .await?;
-
-        let valid_until = Utc::now() + self.deposit_validity;
-        let row = self
-            .repo
-            .insert_deposit_request(
-                hospital_id,
-                amount_kobo,
-                &va.account_number,
-                va.bank_code.as_deref(),
-                va.account_name.as_deref(),
-                valid_until,
-                &external_reference,
-            )
-            .await?;
-
-        Ok(row)
+        Ok(DepositInstructions {
+            account_number,
+            bank_name: "Safe Haven MFB".to_string(),
+            bank_code: wallet.safehaven_bank_code.clone(),
+            account_name: wallet.safehaven_account_name.clone(),
+            amount_kobo,
+            instructions:
+                "Transfer the amount into the account above to fund your wallet. \
+                 Your balance updates automatically once the transfer is received."
+                    .to_string(),
+        })
     }
 
     pub async fn try_hold_in_tx(
@@ -280,13 +258,22 @@ impl WalletService {
         &self,
         payload: &serde_json::Value,
     ) -> Result<WebhookOutcome, WalletServiceError> {
-        let event_id = payload
-            .get("data")
-            .and_then(|d| d.get("_id"))
-            .or_else(|| payload.get("data").and_then(|d| d.get("sessionId")))
-            .and_then(|v| v.as_str());
+        // Idempotency id: prefer the transaction id / sessionId / paymentReference,
+        // looked up at top level or under `data` (SafeHaven nests transaction
+        // details under `data`).
+        let event_id = first_str(
+            payload,
+            &["_id", "sessionId", "paymentReference"],
+        )
+        .or_else(|| {
+            payload
+                .get("data")
+                .and_then(|d| first_str(d, &["_id", "sessionId", "paymentReference"]))
+        });
+        // SafeHaven sends the event under `eventType`; accept `type`/`event` too.
         let event_type = payload
-            .get("type")
+            .get("eventType")
+            .or_else(|| payload.get("type"))
             .or_else(|| payload.get("event"))
             .and_then(|v| v.as_str());
 
@@ -299,16 +286,30 @@ impl WalletService {
             None => return Ok(WebhookOutcome::AlreadySeen),
         };
 
+        // SafeHaven's real inbound-credit event is `type: "transfer"` with
+        // `data.type: "Inwards"` (confirmed from a live capture); `account.credit`
+        // / `virtualAccount.transfer` / `subaccount.inflow` are kept defensively.
+        let data_dir = payload
+            .get("data")
+            .and_then(|d| d.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let result = match event_type {
             Some("virtualAccount.transfer") | Some("transfer.inflow") => {
                 self.handle_virtual_account_transfer(payload).await
             }
-            Some("subaccount.inflow") => self.handle_subaccount_inflow(payload).await,
+            Some("account.credit") | Some("subaccount.inflow") => {
+                self.handle_subaccount_inflow(payload).await
+            }
+            // Generic transfer: only credit inbound ("Inwards") transfers.
+            Some("transfer") if data_dir.eq_ignore_ascii_case("Inwards") => {
+                self.handle_subaccount_inflow(payload).await
+            }
             _ => {
                 tracing::info!(
-                    "SafeHaven webhook ignored (event_type={:?}): {}",
+                    "SafeHaven webhook ignored (event_type={:?}, data.type={:?})",
                     event_type,
-                    payload
+                    data_dir
                 );
                 Ok(WebhookOutcome::Ignored)
             }
@@ -421,20 +422,31 @@ impl WalletService {
         &self,
         payload: &serde_json::Value,
     ) -> Result<WebhookOutcome, WalletServiceError> {
-        let data = payload
-            .get("data")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-        let dest_account = data
-            .get("creditAccountNumber")
-            .or_else(|| data.get("destinationAccountNumber"))
+        // Only credit on a successful/completed transfer.
+        let status = nested_or_top(payload, &["status"])
             .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let amount_naira = data.get("amount").and_then(|v| v.as_i64()).unwrap_or(0);
-        if amount_naira <= 0 || dest_account.is_none() {
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(status.as_str(), "completed" | "success" | "successful") {
+            return Ok(WebhookOutcome::Ignored);
+        }
+
+        let dest_account = nested_or_top(
+            payload,
+            &["creditAccountNumber", "destinationAccountNumber", "accountNumber"],
+        )
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+        let amount_kobo = nested_or_top(payload, &["amount"])
+            .map(amount_to_kobo)
+            .unwrap_or(0);
+
+        if amount_kobo <= 0 || dest_account.is_none() {
             return Ok(WebhookOutcome::Ignored);
         }
         let dest_account = dest_account.unwrap();
+
         let hospital_id: Option<Uuid> = sqlx::query_scalar(
             r#"SELECT hospital_id FROM hospital_wallets
                WHERE safehaven_account_number = $1 LIMIT 1"#,
@@ -448,13 +460,15 @@ impl WalletService {
             None => return Ok(WebhookOutcome::Ignored),
         };
 
-        let amount_kobo = amount_naira * 100;
-        let provider_reference = data
-            .get("paymentReference")
-            .or_else(|| data.get("reference"))
-            .and_then(|v| v.as_str());
+        let provider_reference =
+            nested_or_top(payload, &["paymentReference", "reference", "sessionId"])
+                .and_then(|v| v.as_str());
+        let sender_name =
+            nested_or_top(payload, &["debitAccountName", "senderName", "originatorName"])
+                .and_then(|v| v.as_str());
 
         let mut tx = self.pool.begin().await?;
+
         sqlx::query(
             r#"
             INSERT INTO hospital_wallets (hospital_id, balance_kobo)
@@ -468,6 +482,7 @@ impl WalletService {
         .bind(amount_kobo)
         .execute(&mut *tx)
         .await?;
+
         self.repo
             .insert_ledger_entry_in_tx(
                 &mut tx,
@@ -477,13 +492,39 @@ impl WalletService {
                 0,
                 None,
                 provider_reference,
-                Some("direct sub-account inflow"),
+                Some("sub-account inflow"),
             )
             .await?;
+
+        // Record a deposit-history row so GET /wallet/deposits shows top-ups.
+        // External reference must be unique; use the provider ref (fallback uuid).
+        let external_reference = provider_reference
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("inflow_{}", Uuid::new_v4()));
+        let deposit_id = self
+            .repo
+            .insert_received_deposit(
+                &mut tx,
+                hospital_id,
+                amount_kobo,
+                &dest_account,
+                sender_name,
+                &external_reference,
+                payload,
+            )
+            .await?;
+
         tx.commit().await?;
 
+        tracing::info!(
+            "Wallet credited: hospital {} <- ₦{} (sub-account inflow {})",
+            hospital_id,
+            amount_kobo / 100,
+            external_reference
+        );
+
         Ok(WebhookOutcome::DepositCredited {
-            deposit_id: Uuid::nil(),
+            deposit_id,
             hospital_id,
             amount_kobo,
         })
@@ -499,4 +540,52 @@ pub enum WebhookOutcome {
         hospital_id: Uuid,
         amount_kobo: i64,
     },
+}
+
+/// Return the first present, non-empty string among `keys` on a JSON object.
+fn first_str<'a>(v: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    for &k in keys {
+        if let Some(s) = v.get(k).and_then(|x| x.as_str()) {
+            if !s.trim().is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// Look up a field on the payload, checking `data.<key>` first then top level.
+fn nested_or_top<'a>(
+    payload: &'a serde_json::Value,
+    keys: &[&str],
+) -> Option<&'a serde_json::Value> {
+    if let Some(data) = payload.get("data") {
+        for &k in keys {
+            if let Some(val) = data.get(k) {
+                if !val.is_null() {
+                    return Some(val);
+                }
+            }
+        }
+    }
+    for &k in keys {
+        if let Some(val) = payload.get(k) {
+            if !val.is_null() {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+/// Convert a SafeHaven amount to kobo. SafeHaven sends transfer amounts in
+/// naira (possibly a decimal like `50` or `50.00`), so multiply by 100. Accepts
+/// numeric or string JSON.
+fn amount_to_kobo(v: &serde_json::Value) -> i64 {
+    let naira = match v {
+        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    };
+    (naira * 100.0).round() as i64
 }

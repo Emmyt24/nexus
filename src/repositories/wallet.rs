@@ -368,6 +368,42 @@ impl WalletRepository {
         Ok(row)
     }
 
+    /// Record an already-received deposit (e.g. a direct sub-account inflow that
+    /// has no pre-created request). Inserted as `received` in the given tx.
+    /// Idempotent on `external_reference`; returns the row id (existing or new).
+    pub async fn insert_received_deposit(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        hospital_id: Uuid,
+        amount_kobo: i64,
+        account_number: &str,
+        account_name: Option<&str>,
+        external_reference: &str,
+        payload: &serde_json::Value,
+    ) -> Result<Uuid, WalletRepoError> {
+        let id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO wallet_deposit_requests
+                (hospital_id, amount_kobo, virtual_account_number,
+                 virtual_account_name, valid_until, external_reference,
+                 status, received_at, received_amount_kobo, safehaven_payload)
+            VALUES ($1, $2, $3, $4, NOW(), $5, 'received', NOW(), $2, $6)
+            ON CONFLICT (external_reference) DO UPDATE
+              SET external_reference = wallet_deposit_requests.external_reference
+            RETURNING id
+            "#,
+        )
+        .bind(hospital_id)
+        .bind(amount_kobo)
+        .bind(account_number)
+        .bind(account_name)
+        .bind(external_reference)
+        .bind(payload)
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(id)
+    }
+
     pub async fn list_deposit_requests(
         &self,
         hospital_id: Uuid,
