@@ -246,6 +246,7 @@ pub struct AppState {
             crate::models::wallet::WalletDepositRequest,
             crate::models::wallet::CreateDepositRequest,
             crate::models::wallet::DepositResponse,
+            crate::models::wallet::DepositInstructions,
             crate::handlers::wallet::LedgerPage,
             crate::handlers::wallet::PayoutPage,
             crate::handlers::wallet::PayoutStatusResponse,
