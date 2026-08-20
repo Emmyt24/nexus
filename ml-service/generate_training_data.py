@@ -37,6 +37,13 @@ CONDITION_MAP = {
     "MentalHealth": ["Depression", "Anxiety disorder", "Bipolar disorder", "Schizophrenia", "PTSD"],
 }
 
+# Real presentations aren't perfectly disease-specific — without noise, symptoms/
+# conditions become a 1:1 lookup table for disease_type and models just memorize
+# it (F1=1.0), which is meaningless. These rates make some patients present
+# atypically so the text features carry signal without being a perfect proxy.
+SYMPTOM_NOISE_RATE = 0.18
+CONDITION_NOISE_RATE = 0.12
+
 # Simplified drug map — fewer classes = better F1 with limited data
 DRUG_MAP = {
     "Infectious": ["Artemether-Lumefantrine", "Ciprofloxacin 500mg", "Amoxicillin 500mg"],
@@ -88,7 +95,15 @@ def generate_row(i: int) -> dict:
     smoking = True if force_high_risk else random.random() < 0.25
     alcohol = True if force_high_risk else random.random() < 0.30
     weather = random.choice(WEATHER)
-    conditions = random.choice(CONDITION_MAP[disease])
+
+    symptom_disease = disease
+    if random.random() < SYMPTOM_NOISE_RATE:
+        symptom_disease = random.choice([d for d in DISEASES if d != disease])
+
+    condition_disease = disease
+    if random.random() < CONDITION_NOISE_RATE:
+        condition_disease = random.choice([d for d in DISEASES if d != disease])
+    conditions = random.choice(CONDITION_MAP[condition_disease])
 
     row = {
         "patient_id": f"P{1000000 + i}",
@@ -100,7 +115,7 @@ def generate_row(i: int) -> dict:
         "height_cm": round(random.uniform(100, 200), 1),
         "weight_kg": round(random.uniform(30, 120), 1),
         "disease_type": disease,
-        "symptoms": random.choice(SYMPTOM_MAP[disease]),
+        "symptoms": random.choice(SYMPTOM_MAP[symptom_disease]),
         "existing_conditions": conditions,
         "severity_level": severity,
         "weather_condition": weather,

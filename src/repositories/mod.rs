@@ -18,4 +18,6 @@ pub use email_outbox::EmailOutboxRepository;
 pub use hospital::HospitalRepository;
 pub use identity_verification::{IdentityRepoError, IdentityVerificationRepository};
 pub use location::LocationRepository;
+pub use patient::{PatientRepository, RepositoryError as PatientRepoError};
+pub use patient_prediction::PatientPredictionRepository;
 pub use wallet::{WalletRepoError, WalletRepository};

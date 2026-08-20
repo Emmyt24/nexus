@@ -11,7 +11,9 @@ pub mod geocoding;
 pub mod here_maps;
 pub mod identity_verification_service;
 pub mod location_service;
+pub mod ml_client;
 pub mod notification_service;
+pub mod patient_prediction_service;
 pub mod payout_service;
 pub mod push_service;
 pub mod registration_service;
@@ -33,6 +35,9 @@ pub use identity_verification_service::{
 pub use location_service::{LocationService, LocationServiceError};
 pub use fcm::{FcmClient, FcmError, PushOutcome};
 pub use notification_service::{NotificationError, NotificationService};
+pub use patient_prediction_service::{
+    PatientPredictionError, PatientPredictionService, PatientPredictionWorker,
+};
 pub use payout_service::{PayoutService, PayoutServiceError};
 pub use push_service::{PushError, PushService};
 pub use registration_service::{

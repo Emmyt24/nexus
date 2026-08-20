@@ -21,11 +21,28 @@ from typing import Optional
 import joblib
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
 load_dotenv()
+
+# Comma-separated list of origins allowed to call this API from a browser, e.g.
+# "https://admin.nexuscare.example.com". Server-to-server calls (the Rust
+# backend) aren't browsers and are unaffected by CORS either way — this only
+# gates JS running in someone else's page. Leave unset to block all browser
+# origins by default rather than the previous wildcard "*".
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+
+# Shared secret required to trigger retraining / data export. These endpoints
+# shell out to trusted subprocesses and touch the DB, so they shouldn't be
+# reachable by anyone who can just curl the service.
+RETRAIN_API_KEY = os.getenv("ML_RETRAIN_API_KEY")
+
+
+def require_retrain_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
+    if RETRAIN_API_KEY and x_api_key != RETRAIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key")
 
 # ─── Model registry ───────────────────────────────────────────────────────────
 
@@ -58,6 +75,10 @@ class ModelRegistry:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ModelRegistry.load()
+    if not ALLOWED_ORIGINS:
+        print("⚠ ALLOWED_ORIGINS not set — no browser origins are permitted (server-to-server calls are unaffected).")
+    if not RETRAIN_API_KEY:
+        print("⚠ ML_RETRAIN_API_KEY not set — /retrain and /export-training-data are UNAUTHENTICATED. Set it before deploying publicly.")
     yield
 
 
@@ -70,8 +91,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -358,7 +379,7 @@ def predict_full(data: PatientFeatures):
     }
 
 
-@app.post("/export-training-data")
+@app.post("/export-training-data", dependencies=[Depends(require_retrain_key)])
 async def export_training_data(background_tasks: BackgroundTasks):
     """Export patient_training_data table to data/patients_export.csv."""
     def _run_export():
@@ -376,7 +397,7 @@ async def export_training_data(background_tasks: BackgroundTasks):
     return {"status": "export started", "output": "data/patients_export.csv"}
 
 
-@app.post("/retrain")
+@app.post("/retrain", dependencies=[Depends(require_retrain_key)])
 async def retrain(background_tasks: BackgroundTasks):
     """
     Trigger model retraining in the background.

@@ -232,6 +232,14 @@ pub struct AppState {
             crate::models::shift::ClockinApprovalRequest,
             crate::models::shift::ClockinApprovalDecisionRequest,
             crate::models::shift::ClockinApprovalRecord,
+            // Patients / ML pipeline
+            crate::models::patient::NewPatientRequest,
+            crate::models::patient::PatientResponse,
+            crate::models::patient_prediction::PredictionResponse,
+            crate::handlers::patients::IngestPatientResponse,
+            crate::handlers::patients::PatientDetailResponse,
+            crate::handlers::patients::ErrorResponse,
+            crate::handlers::patients::ErrorDetail,
             // Wallet
             crate::models::wallet::WalletSummary,
             crate::models::wallet::WalletLedgerEntry,
@@ -449,6 +457,8 @@ pub fn create_router(
     let audit_repo = Arc::new(AuditRepository::new(pool.clone()));
     let clinician_repo = Arc::new(ClinicianRepository::new(pool.clone()));
     let shift_repo = Arc::new(ShiftRepository::new(pool.clone()));
+    let patient_repo = Arc::new(PatientRepository::new(pool.clone()));
+    let patient_prediction_repo = Arc::new(PatientPredictionRepository::new(pool.clone()));
 
     let geocoding_client = Arc::new(GeocodingClient::new(std::env::var("GEOCODING_API_URL").ok()));
 
