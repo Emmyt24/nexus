@@ -34,6 +34,7 @@ pub use identity_verification_service::{
 };
 pub use location_service::{LocationService, LocationServiceError};
 pub use fcm::{FcmClient, FcmError, PushOutcome};
+pub use ml_client::MlClient;
 pub use notification_service::{NotificationError, NotificationService};
 pub use patient_prediction_service::{
     PatientPredictionError, PatientPredictionService, PatientPredictionWorker,

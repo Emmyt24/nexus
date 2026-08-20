@@ -7,6 +7,8 @@ pub mod hospital;
 pub mod identity_verification;
 pub mod location;
 pub mod notification;
+pub mod patient;
+pub mod patient_prediction;
 pub mod shift;
 pub mod wallet;
 
