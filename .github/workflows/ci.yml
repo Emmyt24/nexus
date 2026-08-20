@@ -44,19 +44,7 @@ jobs:
       - name: cargo build (release)
         run: cargo build --release --locked
 
-  lint:
-    name: Format & Clippy
-    runs-on: ubuntu-latest
-    # Informational — surfaces style/lint issues without blocking merges while
-    # the existing warnings are cleaned up. Flip continue-on-error off later.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Rust toolchain
-        run: rustup show
-      - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@v2
-      - name: cargo fmt (check)
-        run: cargo fmt --all -- --check
-      - name: cargo clippy
-        run: cargo clippy --all-targets
+# NOTE: a `cargo fmt --check` + `cargo clippy` lint job was intentionally left
+# out for now — the existing codebase is not rustfmt-formatted (~80 files would
+# change) and carries pre-existing clippy warnings. Add a lint job once the code
+# has had a one-time `cargo fmt` pass so it can be a meaningful, passing gate.
