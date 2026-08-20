@@ -12,7 +12,9 @@ use nexuscare_backend::routes;
 use nexuscare_backend::schedulers::{
     BroadcastScheduler, HandoverAutoApprovalScheduler, OfferExpiryScheduler, PayoutScheduler,
 };
-use nexuscare_backend::services::{EmailOutboxService, EmailOutboxWorker, NotificationService};
+use nexuscare_backend::services::{
+    EmailOutboxService, EmailOutboxWorker, NotificationService, PatientPredictionWorker,
+};
 use nexuscare_backend::utils::AppConfig;
 
 #[tokio::main]
@@ -97,6 +99,12 @@ async fn main() -> anyhow::Result<()> {
     // SafeHaven payout pipeline: pays out approved handovers every minute
     let payout_scheduler = PayoutScheduler::new(state.payout_service.clone());
     tokio::spawn(payout_scheduler.run());
+
+    // Patient ML pipeline: polls patient_predictions for pending rows, calls
+    // ml-service, and broadcasts results over SSE (GET /api/v1/pipeline/events).
+    let patient_prediction_worker =
+        PatientPredictionWorker::new(state.patient_prediction_service.clone());
+    tokio::spawn(patient_prediction_worker.run());
 
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port)
         .parse()
