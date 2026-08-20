@@ -21,14 +21,16 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     admin, auth, clinician_registration, distance, earnings, emails, health, here_maps, hospitals,
-    identity, location, notifications, registration, shifts, wallet, webhooks,
+    identity, location, notifications, patients, registration, shifts, wallet, webhooks,
 };
+use crate::models::patient_prediction::PipelineEvent;
 use crate::repositories::{
     admin::AdminRepository, audit::AuditRepository, billing::BillingRepository,
     clinician::ClinicianRepository,
     hospital::HospitalRepository, identity_verification::IdentityVerificationRepository,
-    location::LocationRepository, notification::NotificationRepository, shift::ShiftRepository,
-    wallet::WalletRepository,
+    location::LocationRepository, notification::NotificationRepository,
+    patient::PatientRepository, patient_prediction::PatientPredictionRepository,
+    shift::ShiftRepository, wallet::WalletRepository,
 };
 use crate::services::{
     admin_service::AdminService, audit_service::AuditService, auth_service::AuthService,
@@ -36,11 +38,14 @@ use crate::services::{
     distance_service::DistanceService, email_outbox_service::EmailOutboxService,
     encryption::EncryptionService, fcm::FcmClient, geocoding::GeocodingClient,
     here_maps::HereMapsClient, identity_verification_service::IdentityVerificationService,
-    location_service::LocationService, notification_service::NotificationService,
+    location_service::LocationService, ml_client::MlClient,
+    notification_service::NotificationService,
+    patient_prediction_service::{PatientPredictionService, PatientPredictionWorker},
     payout_service::PayoutService, push_service::PushService,
     registration_service::RegistrationService, safehaven::SafeHavenClient,
     shift_service::ShiftService, wallet_service::WalletService,
 };
+use tokio::sync::broadcast;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -59,6 +64,8 @@ pub struct AppState {
     pub distance_service: Arc<DistanceService>,
     pub push_service: Arc<PushService>,
     pub email_outbox: Arc<EmailOutboxService>,
+    pub patient_repo: Arc<PatientRepository>,
+    pub patient_prediction_service: Arc<PatientPredictionService>,
 }
 
 #[derive(OpenApi)]
@@ -177,6 +184,9 @@ pub struct AppState {
         crate::handlers::wallet::get_payout_status,
         crate::handlers::wallet::get_statement,
         crate::handlers::wallet::retry_payout,
+        // Patients / ML pipeline
+        crate::handlers::patients::ingest_patient,
+        crate::handlers::patients::get_patient,
         // Webhooks
         crate::handlers::webhooks::safehaven_webhook,
         // Earnings
@@ -548,6 +558,22 @@ pub fn create_router(
     let admin_repo = Arc::new(AdminRepository::new(pool.clone()));
     let admin_service = Arc::new(AdminService::new(admin_repo, email_outbox_service.clone()));
 
+    // Patient ML prediction pipeline: ingest queues a row; the worker polls and
+    // calls the ML service, broadcasting pipeline events to any SSE subscribers.
+    let ml_client = Arc::new(MlClient::from_env());
+    let (patient_event_tx, _patient_event_rx) = broadcast::channel::<PipelineEvent>(256);
+    let patient_event_tx = Arc::new(patient_event_tx);
+    let patient_prediction_service = Arc::new(PatientPredictionService::new(
+        pool.clone(),
+        patient_repo.clone(),
+        patient_prediction_repo.clone(),
+        ml_client,
+        patient_event_tx,
+    ));
+    let patient_prediction_worker =
+        PatientPredictionWorker::new(patient_prediction_service.clone());
+    tokio::spawn(patient_prediction_worker.run());
+
     let state = AppState {
         pool: pool.clone(),
         registration_service,
@@ -564,6 +590,8 @@ pub fn create_router(
         distance_service,
         push_service,
         email_outbox: email_outbox_service.clone(),
+        patient_repo: patient_repo.clone(),
+        patient_prediction_service,
     };
 
     let api_router = Router::new()
@@ -905,6 +933,9 @@ pub fn create_router(
             post(wallet::retry_payout)
                 .route_layer(from_fn(require_permission(Permission::ProcessPayouts))),
         )
+        // ---- Patients / ML pipeline — authenticated (claims checked in-handler).
+        .route("/api/v1/ingest/patient", post(patients::ingest_patient))
+        .route("/api/v1/patients/{id}", get(patients::get_patient))
         // ---- Webhooks — authenticated by HMAC signature, not JWT.
         .route(
             "/api/v1/webhooks/safehaven",

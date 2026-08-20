@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
