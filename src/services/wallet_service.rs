@@ -6,9 +6,12 @@ use chrono::Duration;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::models::wallet::{DepositInstructions, Wallet, WalletDepositRequest, WalletLedgerEntry};
+use crate::models::wallet::{
+    DepositInstructions, Wallet, WalletDepositRequest, WalletLedgerEntry, WithdrawResponse,
+    WithdrawalRow,
+};
 use crate::repositories::wallet::{WalletRepoError, WalletRepository};
-use crate::services::safehaven::{SafeHavenClient, SafeHavenError};
+use crate::services::safehaven::{SafeHavenClient, SafeHavenError, TransferStatus};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WalletServiceError {
@@ -224,6 +227,354 @@ impl WalletService {
                  Your balance updates automatically once the transfer is received."
                     .to_string(),
         })
+    }
+
+    /// Withdraw available wallet funds to an external bank account. Validates the
+    /// destination via name-enquiry, atomically debits `balance_kobo` and records
+    /// a pending `withdrawal` billing row + ledger entry, then instructs SafeHaven
+    /// to transfer OUT OF the hospital's own sub-account (where its deposits sit).
+    /// A synchronous transfer rejection fully refunds the debit.
+    pub async fn withdraw(
+        &self,
+        hospital_id: Uuid,
+        amount_kobo: i64,
+        bank_code: &str,
+        account_number: &str,
+        narration: Option<&str>,
+    ) -> Result<WithdrawResponse, WalletServiceError> {
+        if amount_kobo < 10_000 {
+            return Err(WalletServiceError::Validation(
+                "Minimum withdrawal is ₦100".to_string(),
+            ));
+        }
+
+        self.repo.ensure_wallet_row(hospital_id).await?;
+        let wallet = self
+            .repo
+            .find_wallet(hospital_id)
+            .await?
+            .ok_or(WalletServiceError::WalletNotFound(hospital_id))?;
+
+        // Funds are physically held in the hospital's SafeHaven sub-account; a
+        // withdrawal debits that account. No sub-account => nothing to withdraw.
+        let debit_source = wallet
+            .safehaven_account_number
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                WalletServiceError::Validation(
+                    "No wallet account yet. Create your wallet first.".to_string(),
+                )
+            })?;
+
+        if wallet.balance_kobo < amount_kobo {
+            return Err(WalletServiceError::Repo(
+                WalletRepoError::InsufficientBalance {
+                    required: amount_kobo,
+                    available: wallet.balance_kobo,
+                },
+            ));
+        }
+
+        // Validate the destination up front (also yields the account holder name).
+        let resolved = self.safehaven.name_enquiry(bank_code, account_number).await?;
+
+        // Atomically debit available balance + record the pending withdrawal. The
+        // guarded UPDATE also protects against a concurrent debit racing this one.
+        let mut tx = self.pool.begin().await?;
+        let debited = sqlx::query(
+            r#"
+            UPDATE hospital_wallets
+               SET balance_kobo = balance_kobo - $2,
+                   updated_at   = NOW()
+             WHERE hospital_id = $1 AND balance_kobo >= $2
+            "#,
+        )
+        .bind(hospital_id)
+        .bind(amount_kobo)
+        .execute(&mut *tx)
+        .await?;
+        if debited.rows_affected() != 1 {
+            tx.rollback().await.ok();
+            return Err(WalletServiceError::Repo(
+                WalletRepoError::InsufficientBalance {
+                    required: amount_kobo,
+                    available: wallet.balance_kobo,
+                },
+            ));
+        }
+
+        let description = format!("Wallet withdrawal to {bank_code}/{account_number}");
+        let withdrawal_id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO billing_transactions (
+                hospital_id, event_type, amount_kobo, currency, status,
+                provider, description
+            )
+            VALUES ($1, 'withdrawal', $2, 'NGN', 'pending', 'safehaven', $3)
+            RETURNING id
+            "#,
+        )
+        .bind(hospital_id)
+        .bind(amount_kobo)
+        .bind(&description)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        self.repo
+            .insert_ledger_entry_in_tx(
+                &mut tx,
+                hospital_id,
+                "withdrawal_debit",
+                -amount_kobo,
+                0,
+                None,
+                Some(&withdrawal_id.to_string()),
+                Some("wallet withdrawal to bank"),
+            )
+            .await?;
+        tx.commit().await?;
+
+        // Instruct SafeHaven to pay out FROM the hospital's sub-account.
+        let payment_reference = withdrawal_id.to_string();
+        let narr = narration.unwrap_or("NexusCare wallet withdrawal");
+
+        match self
+            .safehaven
+            .transfer(
+                bank_code,
+                account_number,
+                amount_kobo / 100,
+                narr,
+                &payment_reference,
+                Some(&debit_source),
+            )
+            .await
+        {
+            Ok(receipt) => {
+                let raw_status = receipt
+                    .raw
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let completed =
+                    matches!(raw_status.as_str(), "completed" | "success" | "successful");
+                let status = if completed { "success" } else { "pending" };
+
+                sqlx::query(
+                    r#"
+                    UPDATE billing_transactions
+                       SET status                  = $2,
+                           provider_reference      = $3,
+                           provider_transaction_id = $4,
+                           completed_at            = CASE WHEN $2 = 'success' THEN NOW() ELSE completed_at END,
+                           updated_at              = NOW()
+                     WHERE id = $1
+                    "#,
+                )
+                .bind(withdrawal_id)
+                .bind(status)
+                .bind(&receipt.payment_reference)
+                .bind(&receipt.session_id)
+                .execute(&self.pool)
+                .await?;
+
+                tracing::info!(
+                    "Withdrawal {} for hospital {} -> ₦{} to {}/{} ({})",
+                    withdrawal_id,
+                    hospital_id,
+                    amount_kobo / 100,
+                    bank_code,
+                    account_number,
+                    status
+                );
+
+                Ok(WithdrawResponse {
+                    withdrawal_id,
+                    amount_kobo,
+                    account_number: account_number.to_string(),
+                    account_name: resolved.account_name,
+                    bank_code: bank_code.to_string(),
+                    status: status.to_string(),
+                    reference: receipt.payment_reference,
+                    message: if completed {
+                        "Withdrawal completed.".to_string()
+                    } else {
+                        "Withdrawal is processing; funds will arrive shortly.".to_string()
+                    },
+                })
+            }
+            Err(e) => {
+                // Synchronous rejection — refund the debit so the balance is restored.
+                self.refund_withdrawal(hospital_id, withdrawal_id, amount_kobo, &e.to_string())
+                    .await?;
+                tracing::error!(
+                    "Withdrawal {} for hospital {} failed at SafeHaven (refunded): {}",
+                    withdrawal_id,
+                    hospital_id,
+                    e
+                );
+                Err(WalletServiceError::SafeHaven(e))
+            }
+        }
+    }
+
+    /// Reverse a committed withdrawal debit and mark the billing row failed, in
+    /// one tx: re-credit `balance_kobo` and write a `withdrawal_reversal` ledger
+    /// entry.
+    async fn refund_withdrawal(
+        &self,
+        hospital_id: Uuid,
+        withdrawal_id: Uuid,
+        amount_kobo: i64,
+        error: &str,
+    ) -> Result<(), WalletServiceError> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(
+            r#"
+            UPDATE billing_transactions
+               SET status      = 'failed',
+                   description = COALESCE(description, '') || E'\nError: ' || $2,
+                   updated_at  = NOW()
+             WHERE id = $1
+            "#,
+        )
+        .bind(withdrawal_id)
+        .bind(error)
+        .execute(&mut *tx)
+        .await?;
+
+        self.repo
+            .insert_ledger_entry_in_tx(
+                &mut tx,
+                hospital_id,
+                "withdrawal_reversal",
+                amount_kobo,
+                0,
+                None,
+                Some(&withdrawal_id.to_string()),
+                Some("withdrawal re-credited after failed transfer"),
+            )
+            .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE hospital_wallets
+               SET balance_kobo = balance_kobo + $2,
+                   updated_at   = NOW()
+             WHERE hospital_id = $1
+            "#,
+        )
+        .bind(hospital_id)
+        .bind(amount_kobo)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// List a hospital's withdrawals (newest first).
+    pub async fn list_withdrawals(
+        &self,
+        hospital_id: Uuid,
+        page: i64,
+        page_size: i64,
+    ) -> Result<(Vec<WithdrawalRow>, i64), WalletServiceError> {
+        let page = page.max(1);
+        let page_size = page_size.clamp(1, 200);
+        let offset = (page - 1) * page_size;
+
+        let rows = sqlx::query_as::<_, WithdrawalRow>(
+            r#"
+            SELECT id, amount_kobo, status, provider_reference,
+                   provider_transaction_id, description, created_at, completed_at
+            FROM billing_transactions
+            WHERE hospital_id = $1 AND event_type = 'withdrawal'
+            ORDER BY created_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(hospital_id)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM billing_transactions WHERE hospital_id = $1 AND event_type = 'withdrawal'",
+        )
+        .bind(hospital_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok((rows, total))
+    }
+
+    /// Refresh a pending withdrawal's status from SafeHaven, settling it
+    /// (success, or failed + refund) as appropriate. Scoped to the caller's
+    /// hospital. Returns the current stored status string.
+    pub async fn refresh_withdrawal_status(
+        &self,
+        hospital_id: Uuid,
+        withdrawal_id: Uuid,
+    ) -> Result<String, WalletServiceError> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            r#"SELECT status, provider_reference
+               FROM billing_transactions
+               WHERE id = $1 AND hospital_id = $2 AND event_type = 'withdrawal'"#,
+        )
+        .bind(withdrawal_id)
+        .bind(hospital_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let (status, provider_reference) = match row {
+            Some(r) => r,
+            None => return Ok("not_found".to_string()),
+        };
+        if status != "pending" {
+            return Ok(status);
+        }
+        let reference = match provider_reference {
+            Some(r) if !r.trim().is_empty() => r,
+            _ => return Ok(status),
+        };
+
+        match self.safehaven.transfer_status(&reference).await? {
+            TransferStatus::Completed => {
+                sqlx::query(
+                    r#"UPDATE billing_transactions
+                          SET status = 'success', completed_at = NOW(), updated_at = NOW()
+                        WHERE id = $1 AND status = 'pending'"#,
+                )
+                .bind(withdrawal_id)
+                .execute(&self.pool)
+                .await?;
+                Ok("success".to_string())
+            }
+            TransferStatus::Failed | TransferStatus::Cancelled => {
+                let amount_kobo: i64 = sqlx::query_scalar(
+                    "SELECT amount_kobo FROM billing_transactions WHERE id = $1",
+                )
+                .bind(withdrawal_id)
+                .fetch_one(&self.pool)
+                .await?;
+                self.refund_withdrawal(
+                    hospital_id,
+                    withdrawal_id,
+                    amount_kobo,
+                    "transfer reported failed by SafeHaven",
+                )
+                .await?;
+                Ok("failed".to_string())
+            }
+            // Created/Initiated/Processing/Unknown → still in flight.
+            _ => Ok("pending".to_string()),
+        }
     }
 
     pub async fn try_hold_in_tx(
