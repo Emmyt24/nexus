@@ -1,0 +1,50 @@
+name: CI
+
+# Guards against production build failures: every PR to main and every push to
+# main must compile (all targets) and produce a release build, the same build
+# Render runs on deploy.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Compile-only CI: sqlx uses runtime queries (no compile-time DB macros), so
+  # no database is needed to build.
+  SQLX_OFFLINE: "true"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the toolchain pinned in rust-toolchain.toml (1.88.0 + rustfmt,
+      # clippy).
+      - name: Set up Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      # The core gate — compiles the library, binaries, tests, and benches.
+      # This is what catches missing `pub mod` declarations, unresolved imports,
+      # and broken test files before they reach Render.
+      - name: cargo check (all targets)
+        run: cargo check --all-targets --locked
+
+      # Mirrors the Render deploy build.
+      - name: cargo build (release)
+        run: cargo build --release --locked
+
+# NOTE: a `cargo fmt --check` + `cargo clippy` lint job was intentionally left
+# out for now — the existing codebase is not rustfmt-formatted (~80 files would
+# change) and carries pre-existing clippy warnings. Add a lint job once the code
+# has had a one-time `cargo fmt` pass so it can be a meaningful, passing gate.
