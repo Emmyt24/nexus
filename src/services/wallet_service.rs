@@ -366,7 +366,7 @@ impl WalletService {
                 sqlx::query(
                     r#"
                     UPDATE billing_transactions
-                       SET status                  = $2,
+                       SET status                  = $2::transaction_status,
                            provider_reference      = $3,
                            provider_transaction_id = $4,
                            completed_at            = CASE WHEN $2 = 'success' THEN NOW() ELSE completed_at END,
@@ -490,7 +490,7 @@ impl WalletService {
 
         let rows = sqlx::query_as::<_, WithdrawalRow>(
             r#"
-            SELECT id, amount_kobo, status, provider_reference,
+            SELECT id, amount_kobo, status::text AS status, provider_reference,
                    provider_transaction_id, description, created_at, completed_at
             FROM billing_transactions
             WHERE hospital_id = $1 AND event_type = 'withdrawal'
@@ -523,7 +523,7 @@ impl WalletService {
         withdrawal_id: Uuid,
     ) -> Result<String, WalletServiceError> {
         let row: Option<(String, Option<String>)> = sqlx::query_as(
-            r#"SELECT status, provider_reference
+            r#"SELECT status::text, provider_reference
                FROM billing_transactions
                WHERE id = $1 AND hospital_id = $2 AND event_type = 'withdrawal'"#,
         )
@@ -539,10 +539,11 @@ impl WalletService {
         if status != "pending" {
             return Ok(status);
         }
-        let reference = match provider_reference {
-            Some(r) if !r.trim().is_empty() => r,
-            _ => return Ok(status),
-        };
+        // We always send the withdrawal id as SafeHaven's paymentReference, so
+        // fall back to it if provider_reference wasn't persisted.
+        let reference = provider_reference
+            .filter(|r| !r.trim().is_empty())
+            .unwrap_or_else(|| withdrawal_id.to_string());
 
         match self.safehaven.transfer_status(&reference).await? {
             TransferStatus::Completed => {
