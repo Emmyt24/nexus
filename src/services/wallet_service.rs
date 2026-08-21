@@ -234,6 +234,25 @@ impl WalletService {
     /// a pending `withdrawal` billing row + ledger entry, then instructs SafeHaven
     /// to transfer OUT OF the hospital's own sub-account (where its deposits sit).
     /// A synchronous transfer rejection fully refunds the debit.
+    /// Estimated SafeHaven outbound transfer fee (kobo) reserved on a withdrawal
+    /// of `amount_kobo`. Set `SAFEHAVEN_TRANSFER_FEE_KOBO` to pin a flat fee;
+    /// otherwise NIP-style tiers are used. Reserve conservatively so the transfer
+    /// has fee headroom — any small over-estimate simply stays in the sub-account.
+    fn withdrawal_fee_kobo(amount_kobo: i64) -> i64 {
+        if let Ok(v) = std::env::var("SAFEHAVEN_TRANSFER_FEE_KOBO") {
+            if let Ok(n) = v.trim().parse::<i64>() {
+                if n >= 0 {
+                    return n;
+                }
+            }
+        }
+        match amount_kobo {
+            x if x <= 500_000 => 1_000,   // ≤ ₦5,000    → ₦10
+            x if x <= 5_000_000 => 2_500, // ₦5,001–₦50,000 → ₦25
+            _ => 5_000,                   // > ₦50,000   → ₦50
+        }
+    }
+
     pub async fn withdraw(
         &self,
         hospital_id: Uuid,
@@ -268,20 +287,29 @@ impl WalletService {
                 )
             })?;
 
-        if wallet.balance_kobo < amount_kobo {
-            return Err(WalletServiceError::Repo(
-                WalletRepoError::InsufficientBalance {
-                    required: amount_kobo,
-                    available: wallet.balance_kobo,
-                },
-            ));
+        // The hospital bears SafeHaven's outbound transfer fee, which SafeHaven
+        // debits from the same sub-account. Reserve it on top of the amount so the
+        // transfer has headroom and the wallet ledger stays consistent with the
+        // sub-account.
+        let fee_kobo = Self::withdrawal_fee_kobo(amount_kobo);
+        let total_debit = amount_kobo + fee_kobo;
+
+        if wallet.balance_kobo < total_debit {
+            return Err(WalletServiceError::Validation(format!(
+                "Insufficient balance: withdrawing ₦{} costs ₦{} including a ₦{} transfer fee, \
+                 but your available balance is ₦{}.",
+                amount_kobo / 100,
+                total_debit / 100,
+                fee_kobo / 100,
+                wallet.balance_kobo / 100
+            )));
         }
 
         // Validate the destination up front (also yields the account holder name).
         let resolved = self.safehaven.name_enquiry(bank_code, account_number).await?;
 
-        // Atomically debit available balance + record the pending withdrawal. The
-        // guarded UPDATE also protects against a concurrent debit racing this one.
+        // Atomically debit available balance (amount + fee) + record the pending
+        // withdrawal. The guarded UPDATE also protects against a concurrent debit.
         let mut tx = self.pool.begin().await?;
         let debited = sqlx::query(
             r#"
@@ -292,20 +320,23 @@ impl WalletService {
             "#,
         )
         .bind(hospital_id)
-        .bind(amount_kobo)
+        .bind(total_debit)
         .execute(&mut *tx)
         .await?;
         if debited.rows_affected() != 1 {
             tx.rollback().await.ok();
             return Err(WalletServiceError::Repo(
                 WalletRepoError::InsufficientBalance {
-                    required: amount_kobo,
+                    required: total_debit,
                     available: wallet.balance_kobo,
                 },
             ));
         }
 
-        let description = format!("Wallet withdrawal to {bank_code}/{account_number}");
+        let description = format!(
+            "Wallet withdrawal to {bank_code}/{account_number} (fee ₦{})",
+            fee_kobo / 100
+        );
         let withdrawal_id: Uuid = sqlx::query_scalar(
             r#"
             INSERT INTO billing_transactions (
@@ -334,6 +365,20 @@ impl WalletService {
                 Some("wallet withdrawal to bank"),
             )
             .await?;
+        if fee_kobo > 0 {
+            self.repo
+                .insert_ledger_entry_in_tx(
+                    &mut tx,
+                    hospital_id,
+                    "withdrawal_fee",
+                    -fee_kobo,
+                    0,
+                    None,
+                    Some(&withdrawal_id.to_string()),
+                    Some("SafeHaven transfer fee"),
+                )
+                .await?;
+        }
         tx.commit().await?;
 
         // Instruct SafeHaven to pay out FROM the hospital's sub-account.
@@ -394,6 +439,7 @@ impl WalletService {
                 Ok(WithdrawResponse {
                     withdrawal_id,
                     amount_kobo,
+                    fee_kobo,
                     account_number: account_number.to_string(),
                     account_name: resolved.account_name,
                     bank_code: bank_code.to_string(),
@@ -407,8 +453,9 @@ impl WalletService {
                 })
             }
             Err(e) => {
-                // Synchronous rejection — refund the debit so the balance is restored.
-                self.refund_withdrawal(hospital_id, withdrawal_id, amount_kobo, &e.to_string())
+                // Synchronous rejection — refund the full debit (amount + fee) so
+                // the balance is restored.
+                self.refund_withdrawal(hospital_id, withdrawal_id, total_debit, &e.to_string())
                     .await?;
                 tracing::error!(
                     "Withdrawal {} for hospital {} failed at SafeHaven (refunded): {}",
