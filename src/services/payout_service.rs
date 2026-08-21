@@ -176,6 +176,30 @@ impl PayoutService {
             .decrypt_token(&bank.account_number)
             .map_err(|e| PayoutServiceError::Encryption(e.to_string()))?;
 
+        // Pay the worker FROM the hospital's own funding sub-account (where its
+        // deposits sit), not the platform account — the wallet funds the payout.
+        let debit_account: Option<String> = sqlx::query_scalar(
+            "SELECT safehaven_account_number FROM hospital_wallets WHERE hospital_id = $1",
+        )
+        .bind(p.hospital_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        let debit_account = match debit_account.filter(|s| !s.trim().is_empty()) {
+            Some(a) => a,
+            None => {
+                self.record_failed_payout(
+                    p,
+                    gross,
+                    fee,
+                    net,
+                    "hospital wallet has no funding sub-account",
+                )
+                .await?;
+                return Ok(false);
+            }
+        };
+
         let mut tx = self.pool.begin().await?;
         let payout_id: Uuid = sqlx::query_scalar(
             r#"
@@ -253,7 +277,7 @@ impl PayoutService {
                 net / 100,
                 &format!("NexusCare shift {}", p.shift_id),
                 &payout_id.to_string(),
-                None,
+                Some(&debit_account),
             )
             .await
         {
