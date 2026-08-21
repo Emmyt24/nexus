@@ -152,6 +152,14 @@ pub struct UpdateHospitalRequest {
     pub phone_number: Option<String>,
 
     pub logo_url: Option<String>,
+
+    /// Optional exact coordinates (map/GPS picker). When both are provided the
+    /// hospital's stored location is updated.
+    #[validate(range(min = -90.0, max = 90.0))]
+    pub latitude: Option<f64>,
+
+    #[validate(range(min = -180.0, max = 180.0))]
+    pub longitude: Option<f64>,
 }
 
 /// Response shape returned to clients.

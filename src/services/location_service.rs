@@ -42,8 +42,14 @@ impl LocationService {
         hospital_id: Uuid,
         address: Address,
     ) -> Result<HospitalLocation, LocationServiceError> {
-        // Step 1: Geocode the address to coordinates
-        let coordinates = match self.geocoding_client.geocode_address(&address).await {
+        // Step 1: exact coordinates from a map/GPS picker take precedence;
+        // otherwise geocode the address.
+        let coordinates = match (address.latitude, address.longitude) {
+            (Some(latitude), Some(longitude)) => Coordinates {
+                latitude,
+                longitude,
+            },
+            _ => match self.geocoding_client.geocode_address(&address).await {
             Ok(coords) => coords,
             Err(e) => {
                 // Log the error
@@ -59,6 +65,7 @@ impl LocationService {
                     longitude: 3.3792,
                 }
             }
+            },
         };
 
         // Step 2: Validate coordinates (already done in geocoding_client, but double-check)
