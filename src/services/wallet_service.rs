@@ -416,6 +416,17 @@ impl WalletService {
                     hospital_id,
                     e
                 );
+                // SafeHaven debits its transfer fee from the same account, so a
+                // withdrawal of the full balance fails for lack of fee headroom.
+                // Surface a clear, actionable message instead of the raw provider
+                // error (balance is already refunded above).
+                if e.to_string().to_lowercase().contains("sufficient fund") {
+                    return Err(WalletServiceError::Validation(format!(
+                        "Withdrawal declined: ₦{} plus SafeHaven's transfer fee exceeds your \
+                         available balance. Try a slightly lower amount.",
+                        amount_kobo / 100
+                    )));
+                }
                 Err(WalletServiceError::SafeHaven(e))
             }
         }
