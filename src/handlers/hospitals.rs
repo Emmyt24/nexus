@@ -45,7 +45,10 @@ pub async fn create_hospital(
                                verification_status, registration_step)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING id, name, registration_number, email, address, phone_number,
-                  verification_status, registration_step, logo_url, created_at, updated_at
+                  verification_status, registration_step, admin_registration_status,
+                  approved_by, approved_at, rejection_reason, admin_user_id,
+                  legal_submitted_at, setup_progress_percent, logo_url,
+                  created_at, updated_at
         "#,
     )
     .bind(Uuid::new_v4())
@@ -169,7 +172,10 @@ pub async fn update_hospital(
             updated_at   = NOW()
         WHERE id = $1
         RETURNING id, name, registration_number, email, address, phone_number,
-                  verification_status, registration_step, logo_url, created_at, updated_at
+                  verification_status, registration_step, admin_registration_status,
+                  approved_by, approved_at, rejection_reason, admin_user_id,
+                  legal_submitted_at, setup_progress_percent, logo_url,
+                  created_at, updated_at
         "#,
     )
     .bind(id)
@@ -219,7 +225,10 @@ pub async fn advance_registration_step(
         SET registration_step = $2, updated_at = NOW()
         WHERE id = $1
         RETURNING id, name, registration_number, email, address, phone_number,
-                  verification_status, registration_step, logo_url, created_at, updated_at
+                  verification_status, registration_step, admin_registration_status,
+                  approved_by, approved_at, rejection_reason, admin_user_id,
+                  legal_submitted_at, setup_progress_percent, logo_url,
+                  created_at, updated_at
         "#,
     )
     .bind(id)
