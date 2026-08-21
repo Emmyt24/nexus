@@ -13,8 +13,18 @@ use crate::services::safehaven::{SafeHavenClient, SafeHavenError, TransferStatus
 pub const PLATFORM_FEE_NUMERATOR: i64 = 1;
 pub const PLATFORM_FEE_DENOMINATOR: i64 = 10;
 
-/// Minimum ₦5,000 net payout.
-pub const MIN_PAYOUT_KOBO: i64 = 500_000;
+/// Default minimum net payout (₦5,000). Overridable at runtime with the
+/// `MIN_PAYOUT_KOBO` env var (kobo) — e.g. to lower the threshold in test/staging.
+pub const DEFAULT_MIN_PAYOUT_KOBO: i64 = 500_000;
+
+/// Minimum net payout in kobo — `MIN_PAYOUT_KOBO` env if set (and >= 0), else default.
+pub fn min_payout_kobo() -> i64 {
+    std::env::var("MIN_PAYOUT_KOBO")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n >= 0)
+        .unwrap_or(DEFAULT_MIN_PAYOUT_KOBO)
+}
 
 /// `(gross, fee, net)` such that `gross == fee + net`
 
@@ -126,13 +136,17 @@ impl PayoutService {
         let gross = p.grand_total_kobo.unwrap_or(0);
         let (gross, fee, net) = split_payout(gross);
 
-        if net < MIN_PAYOUT_KOBO {
+        let min_payout = min_payout_kobo();
+        if net < min_payout {
             self.record_failed_payout(
                 p,
                 gross,
                 fee,
                 net,
-                "below minimum payout threshold (₦5,000)",
+                &format!(
+                    "below minimum payout threshold (₦{})",
+                    min_payout / 100
+                ),
             )
             .await?;
             return Ok(false);
