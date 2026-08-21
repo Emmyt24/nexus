@@ -201,6 +201,11 @@ $('btn-connect').onclick = async () => {
     room.on(LK.RoomEvent.TrackSubscribed, (track, pub, participant) => {
       attach(track, participant.identity, participant.name);
     });
+    // Attaching on the event avoids racing the publish, which reaching for the
+    // publication straight after enableCameraAndMicrophone() does.
+    room.on(LK.RoomEvent.LocalTrackPublished, (pub) => {
+      if (pub.track) attach(pub.track, room.localParticipant.identity, 'You', true);
+    });
     room.on(LK.RoomEvent.TrackUnsubscribed, (track) => track.detach().forEach(el => el.remove()));
     room.on(LK.RoomEvent.ParticipantConnected, (p) => log(`${p.identity} joined`, 'ok'));
     room.on(LK.RoomEvent.ParticipantDisconnected, (p) => {
@@ -222,8 +227,6 @@ $('btn-connect').onclick = async () => {
 
     if (lastToken.can_publish) {
       await room.localParticipant.enableCameraAndMicrophone();
-      const cam = room.localParticipant.getTrackPublication(LK.Track.Source.Camera);
-      if (cam?.track) attach(cam.track, room.localParticipant.identity, 'You', true);
     } else {
       log('observer mode — subscribing only, not publishing');
     }
@@ -292,18 +295,30 @@ $('poll').onchange = (e) => {
   if (e.target.checked) pollTimer = setInterval(refreshState, 5000);
 };
 
+// sendBeacon cannot carry an Authorization header, so it would always 401 here.
+// fetch({ keepalive: true }) can, and still survives the page going away.
 window.addEventListener('beforeunload', () => {
   if (!room) return;
   const id = $('shift').value.trim();
-  navigator.sendBeacon?.(
-    $('api').value.replace(/\/$/, '') + `/api/v1/shifts/${id}/consult/leave`);
+  fetch($('api').value.replace(/\/$/, '') + `/api/v1/shifts/${id}/consult/leave`, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + $('jwt').value.trim() },
+    keepalive: true,
+  }).catch(() => { /* the page is going away; nothing to report to */ });
 });
 
-// Remember the last setup so a page reload does not mean retyping everything.
+// Prefill order: query string wins (so a seeded fixture can be handed over as a
+// link), then whatever was last used here.
+const params = new URLSearchParams(location.search);
 for (const id of ['api', 'shift', 'jwt', 'mode']) {
-  const saved = localStorage.getItem('nx.' + id);
+  const saved = params.get(id) ?? localStorage.getItem('nx.' + id);
   if (saved) $(id).value = saved;
   $(id).addEventListener('change', () => localStorage.setItem('nx.' + id, $(id).value));
+}
+if (params.has('jwt')) {
+  // Keep the token out of the address bar and the browser history.
+  for (const id of ['api', 'shift', 'jwt', 'mode']) localStorage.setItem('nx.' + id, $(id).value);
+  history.replaceState(null, '', location.pathname);
 }
 
 if (!LK) log('livekit-client failed to load from the CDN — check your network', 'err');
