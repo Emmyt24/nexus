@@ -21,7 +21,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     admin, auth, clinician_registration, distance, earnings, emails, health, here_maps, hospitals,
-    identity, location, notifications, patients, registration, shifts, wallet, webhooks,
+    identity, location, notifications, patients, registration, shifts, uploads, wallet, webhooks,
 };
 use crate::models::patient_prediction::PipelineEvent;
 use crate::repositories::{
@@ -78,7 +78,10 @@ pub struct AppState {
         crate::handlers::auth::email_otp_verify,
         crate::handlers::auth::admin_login,
         crate::handlers::hospitals::get_hospital,
+        crate::handlers::hospitals::get_hospital_location,
         crate::handlers::clinician_registration::get_worker_public,
+        crate::handlers::clinician_registration::set_avatar,
+        crate::handlers::uploads::upload_signature,
         crate::handlers::auth::me,
         crate::handlers::auth::refresh_token,
         crate::handlers::auth::logout,
@@ -365,6 +368,9 @@ pub struct AppState {
             crate::models::clinician_registration::ProfileResponse,
             crate::models::clinician_registration::AddBankAccountRequest,
             crate::models::clinician_registration::BankAccountResponse,
+            crate::models::clinician_registration::SetAvatarRequest,
+            crate::handlers::hospitals::HospitalLocationResponse,
+            crate::services::cloudinary::SignedUpload,
             crate::models::clinician::ClinicianAdminSummary,
             // Identity verification
             crate::handlers::identity::InitiateIdentityRequest,
@@ -634,6 +640,10 @@ pub fn create_router(
         .route("/api/v1/hospitals/{id}", get(hospitals::get_hospital))
         .route("/api/v1/hospitals/{id}", patch(hospitals::update_hospital))
         .route(
+            "/api/v1/hospitals/{id}/location",
+            get(hospitals::get_hospital_location),
+        )
+        .route(
             "/api/v1/hospitals/{id}/advance-step",
             patch(hospitals::advance_registration_step),
         )
@@ -658,6 +668,15 @@ pub fn create_router(
         .route(
             "/api/v1/clinicians/{clinician_id}/bank-account",
             post(clinician_registration::add_bank_account),
+        )
+        .route(
+            "/api/v1/clinicians/{clinician_id}/avatar",
+            patch(clinician_registration::set_avatar),
+        )
+        // Cloudinary signed-upload signature (any authenticated user)
+        .route(
+            "/api/v1/uploads/signature",
+            get(uploads::upload_signature),
         )
         // Identity verification (BVN/NIN) + bank list
         .route(
