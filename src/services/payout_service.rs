@@ -13,8 +13,18 @@ use crate::services::safehaven::{SafeHavenClient, SafeHavenError, TransferStatus
 pub const PLATFORM_FEE_NUMERATOR: i64 = 1;
 pub const PLATFORM_FEE_DENOMINATOR: i64 = 10;
 
-/// Minimum ₦5,000 net payout.
-pub const MIN_PAYOUT_KOBO: i64 = 500_000;
+/// Default minimum net payout (₦5,000). Overridable at runtime with the
+/// `MIN_PAYOUT_KOBO` env var (kobo) — e.g. to lower the threshold in test/staging.
+pub const DEFAULT_MIN_PAYOUT_KOBO: i64 = 500_000;
+
+/// Minimum net payout in kobo — `MIN_PAYOUT_KOBO` env if set (and >= 0), else default.
+pub fn min_payout_kobo() -> i64 {
+    std::env::var("MIN_PAYOUT_KOBO")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n >= 0)
+        .unwrap_or(DEFAULT_MIN_PAYOUT_KOBO)
+}
 
 /// `(gross, fee, net)` such that `gross == fee + net`
 
@@ -126,13 +136,17 @@ impl PayoutService {
         let gross = p.grand_total_kobo.unwrap_or(0);
         let (gross, fee, net) = split_payout(gross);
 
-        if net < MIN_PAYOUT_KOBO {
+        let min_payout = min_payout_kobo();
+        if net < min_payout {
             self.record_failed_payout(
                 p,
                 gross,
                 fee,
                 net,
-                "below minimum payout threshold (₦5,000)",
+                &format!(
+                    "below minimum payout threshold (₦{})",
+                    min_payout / 100
+                ),
             )
             .await?;
             return Ok(false);
@@ -161,6 +175,30 @@ impl PayoutService {
             .encryption
             .decrypt_token(&bank.account_number)
             .map_err(|e| PayoutServiceError::Encryption(e.to_string()))?;
+
+        // Pay the worker FROM the hospital's own funding sub-account (where its
+        // deposits sit), not the platform account — the wallet funds the payout.
+        let debit_account: Option<String> = sqlx::query_scalar(
+            "SELECT safehaven_account_number FROM hospital_wallets WHERE hospital_id = $1",
+        )
+        .bind(p.hospital_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        let debit_account = match debit_account.filter(|s| !s.trim().is_empty()) {
+            Some(a) => a,
+            None => {
+                self.record_failed_payout(
+                    p,
+                    gross,
+                    fee,
+                    net,
+                    "hospital wallet has no funding sub-account",
+                )
+                .await?;
+                return Ok(false);
+            }
+        };
 
         let mut tx = self.pool.begin().await?;
         let payout_id: Uuid = sqlx::query_scalar(
@@ -239,7 +277,7 @@ impl PayoutService {
                 net / 100,
                 &format!("NexusCare shift {}", p.shift_id),
                 &payout_id.to_string(),
-                None,
+                Some(&debit_account),
             )
             .await
         {
@@ -463,7 +501,7 @@ impl PayoutService {
 
         let rows = sqlx::query_as::<_, PayoutRow>(
             r#"
-            SELECT id, shift_id, amount_kobo, status,
+            SELECT id, shift_id, amount_kobo, status::text AS status,
                    provider_reference, provider_transaction_id,
                    description, created_at, completed_at
             FROM billing_transactions
@@ -515,7 +553,7 @@ impl PayoutService {
         let Some(reference) = r.provider_reference.clone() else {
             // No transfer was ever sent (e.g. failed pre-flight). Return stored status.
             let st: String =
-                sqlx::query_scalar("SELECT status FROM billing_transactions WHERE id = $1")
+                sqlx::query_scalar("SELECT status::text FROM billing_transactions WHERE id = $1")
                     .bind(payout_id)
                     .fetch_one(&self.pool)
                     .await?;

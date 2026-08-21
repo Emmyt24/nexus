@@ -129,7 +129,10 @@ pub struct WithdrawRequest {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct WithdrawResponse {
     pub withdrawal_id: Uuid,
+    /// Net amount sent to the beneficiary account.
     pub amount_kobo: i64,
+    /// SafeHaven transfer fee charged on top of `amount_kobo` (also debited).
+    pub fee_kobo: i64,
     pub account_number: String,
     /// Resolved account holder name (from name-enquiry).
     pub account_name: String,
