@@ -1194,3 +1194,207 @@ async fn platform_admins_can_read_but_never_join() {
     // Silence the unused-field warning for fixtures that only assert on ids.
     let _ = fixture.clinician_id;
 }
+
+// The reconciler's sweep queries. The LiveKit-facing branches need a real
+// server and are covered by hand; these cover the SQL that decides what gets
+// swept at all.
+
+/// A token minted long enough ago with no join is exactly what branch 1 looks
+/// for — but only while the consultation could still be recovered.
+#[tokio::test]
+async fn the_join_sweep_picks_up_a_token_that_never_produced_a_join() {
+    let Some(pool) = test_pool().await else { return };
+    let service = video_service(&pool, false);
+    let fixture = seed_fixture(&pool).await;
+    let repo = VideoSessionRepository::new(pool.clone());
+
+    service
+        .issue_join_token(
+            fixture.shift_id,
+            &fixture.worker_claims(),
+            JoinConsultRequest::default(),
+        )
+        .await
+        .unwrap();
+
+    // Nothing is due yet — the grace period has not elapsed.
+    let due = repo
+        .sessions_awaiting_join(Utc::now() - Duration::minutes(5))
+        .await
+        .unwrap();
+    assert!(
+        !due.iter().any(|s| s.shift_id == Some(fixture.shift_id)),
+        "a token issued seconds ago is not yet overdue"
+    );
+
+    // Age the token past the grace period.
+    sqlx::query(
+        "UPDATE video_session_participants SET token_issued_at = NOW() - INTERVAL '10 minutes'
+          WHERE session_id IN (SELECT id FROM video_sessions WHERE shift_id = $1)",
+    )
+    .bind(fixture.shift_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let due = repo
+        .sessions_awaiting_join(Utc::now() - Duration::minutes(5))
+        .await
+        .unwrap();
+    assert!(
+        due.iter().any(|s| s.shift_id == Some(fixture.shift_id)),
+        "an overdue join should be swept"
+    );
+}
+
+/// Once the consultation window has closed, recovering the join could not clock
+/// anyone in — so the row stops being swept rather than costing a LiveKit call
+/// every tick forever.
+#[tokio::test]
+async fn the_join_sweep_drops_sessions_past_their_window() {
+    let Some(pool) = test_pool().await else { return };
+    let service = video_service(&pool, false);
+    let fixture = seed_fixture(&pool).await;
+    let repo = VideoSessionRepository::new(pool.clone());
+
+    service
+        .issue_join_token(
+            fixture.shift_id,
+            &fixture.worker_claims(),
+            JoinConsultRequest::default(),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE video_session_participants SET token_issued_at = NOW() - INTERVAL '10 minutes'
+          WHERE session_id IN (SELECT id FROM video_sessions WHERE shift_id = $1)",
+    )
+    .bind(fixture.shift_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Move the whole shift into the past, well beyond scheduled_end + 1 hour.
+    sqlx::query(
+        "UPDATE shifts SET scheduled_start = NOW() - INTERVAL '10 hours',
+                           scheduled_end   = NOW() - INTERVAL '6 hours' WHERE id = $1",
+    )
+    .bind(fixture.shift_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let due = repo
+        .sessions_awaiting_join(Utc::now() - Duration::minutes(5))
+        .await
+        .unwrap();
+    assert!(
+        !due.iter().any(|s| s.shift_id == Some(fixture.shift_id)),
+        "a session past its consultation window should no longer be swept"
+    );
+}
+
+/// Branch 2 only ever considers sessions someone actually joined.
+///
+/// The rows are inserted rather than updated on purpose: `video_sessions` has a
+/// `BEFORE UPDATE` trigger that rewrites `updated_at` to NOW(), so an UPDATE
+/// cannot backdate it. That trigger is also what makes the production query
+/// correct — a session anything touches stops looking stale.
+#[tokio::test]
+async fn the_stale_sweep_only_considers_active_sessions() {
+    let Some(pool) = test_pool().await else { return };
+    let repo = VideoSessionRepository::new(pool.clone());
+    let fixture = seed_fixture(&pool).await;
+
+    let insert_aged_session = |status: &'static str| {
+        let pool = pool.clone();
+        let hospital_id = fixture.hospital_id;
+        async move {
+            sqlx::query_scalar::<_, Uuid>(
+                r#"
+                INSERT INTO video_sessions
+                    (hospital_id, room_name, status, started_at, updated_at, created_at)
+                VALUES ($1, $2, $3, NOW() - INTERVAL '3 hours',
+                        NOW() - INTERVAL '2 hours', NOW() - INTERVAL '3 hours')
+                RETURNING id
+                "#,
+            )
+            .bind(hospital_id)
+            .bind(format!("shift-{}", Uuid::new_v4()))
+            .bind(status)
+            .fetch_one(&pool)
+            .await
+        }
+    };
+
+    let pending_id = insert_aged_session("pending").await.unwrap();
+    let active_id = insert_aged_session("active").await.unwrap();
+
+    let stale = repo
+        .stale_active_sessions(Utc::now() - Duration::minutes(30))
+        .await
+        .unwrap();
+    let ids: Vec<Uuid> = stale.iter().map(|s| s.id).collect();
+
+    assert!(
+        ids.contains(&active_id),
+        "an active session nothing has touched for hours is a candidate"
+    );
+    assert!(
+        !ids.contains(&pending_id),
+        "a pending session means nobody ever joined — there is no room to close"
+    );
+}
+
+/// An ended session whose worker is still clocked in is what branch 3 chases.
+#[tokio::test]
+async fn the_clockout_sweep_finds_an_ended_session_with_an_open_attendance() {
+    let Some(pool) = test_pool().await else { return };
+    let service = video_service(&pool, true);
+    let fixture = seed_fixture(&pool).await;
+    let repo = VideoSessionRepository::new(pool.clone());
+
+    service
+        .issue_join_token(
+            fixture.shift_id,
+            &fixture.worker_claims(),
+            JoinConsultRequest::default(),
+        )
+        .await
+        .unwrap();
+    deliver(
+        &service,
+        "participant_joined",
+        &Uuid::new_v4().to_string(),
+        &fixture.room_name(),
+        Some(&fixture.clinician_identity()),
+    )
+    .await;
+    deliver(
+        &service,
+        "room_finished",
+        &Uuid::new_v4().to_string(),
+        &fixture.room_name(),
+        None,
+    )
+    .await;
+
+    sqlx::query(
+        "UPDATE video_sessions SET ended_at = NOW() - INTERVAL '30 minutes' WHERE shift_id = $1",
+    )
+    .bind(fixture.shift_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let pending = repo
+        .ended_sessions_pending_clockout(Utc::now() - Duration::minutes(10))
+        .await
+        .unwrap();
+    let row = pending
+        .iter()
+        .find(|p| p.shift_id == fixture.shift_id)
+        .expect("the ended session should be chased for clock-out");
+    assert_eq!(row.clinician_id, fixture.clinician_id);
+    assert_eq!(row.room_name, fixture.room_name());
+}

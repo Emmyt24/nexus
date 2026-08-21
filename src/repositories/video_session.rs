@@ -485,6 +485,11 @@ impl VideoSessionRepository {
 
     /// Branch 1: a token was minted long enough ago that the
     /// `participant_joined` webhook should have arrived, and it did not.
+    ///
+    /// Bounded to sessions whose consultation window is still open. Past that a
+    /// join could not clock anyone in even if we recovered it, so an abandoned
+    /// pre-join screen stops being swept instead of costing a LiveKit call
+    /// every tick for the life of the row.
     pub async fn sessions_awaiting_join(
         &self,
         token_issued_before: DateTime<Utc>,
@@ -501,6 +506,16 @@ impl VideoSessionRepository {
                       AND p.joined_at       IS NULL
                       AND p.token_issued_at < $1
                )
+               AND CASE
+                     WHEN s.shift_id IS NULL
+                       -- Ad-hoc seam: no shift to bound against, so bound on age.
+                       THEN s.created_at > NOW() - INTERVAL '6 hours'
+                       ELSE EXISTS (
+                           SELECT 1 FROM shifts sh
+                            WHERE sh.id = s.shift_id
+                              AND NOW() <= sh.scheduled_end + INTERVAL '1 hour'
+                       )
+                   END
             "#
         ))
         .bind(token_issued_before)

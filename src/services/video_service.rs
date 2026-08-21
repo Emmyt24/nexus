@@ -756,6 +756,10 @@ impl VideoService {
         for session in self.repo.sessions_awaiting_join(token_issued_before).await? {
             let live = match self.livekit.list_participants(&session.room_name).await {
                 Ok(live) => live,
+                // The room was never brought up, so there is no join to
+                // recover. Expected for an abandoned pre-join screen, and not
+                // worth a warning.
+                Err(LiveKitError::RoomNotFound) => continue,
                 Err(e) => {
                     tracing::warn!(
                         "Reconciler could not list participants for {}: {e}",
@@ -819,9 +823,17 @@ impl VideoService {
             match self.livekit.list_participants(&session.room_name).await {
                 // Still occupied — the room is fine, the webhook was just quiet.
                 Ok(participants) if !participants.is_empty() => continue,
-                Ok(_) => {}
+                // Empty, or gone entirely. Either way the consult is over and
+                // the `room_finished` webhook never reached us. `RoomNotFound`
+                // is the common case: LiveKit tears an empty room down after
+                // `empty_timeout`, so by the time we sweep it has usually
+                // stopped existing rather than merely emptied.
+                Ok(_) | Err(LiveKitError::RoomNotFound) => {}
                 Err(e) => {
-                    tracing::warn!("Reconciler could not reach LiveKit for {}: {e}", session.room_name);
+                    tracing::warn!(
+                        "Reconciler could not reach LiveKit for {}: {e}",
+                        session.room_name
+                    );
                     continue;
                 }
             }
@@ -1056,7 +1068,12 @@ impl VideoService {
                 ),
                 true,
             ),
+            // Mock mode has nothing to reconcile against, so fall back to the
+            // webhook-fed state and say so.
             Ok(_) => (None, false),
+            // A room that does not exist is an authoritative empty room, so
+            // this list *is* reconciled — everyone is disconnected.
+            Err(LiveKitError::RoomNotFound) => (Some(HashMap::new()), true),
             Err(e) => {
                 tracing::warn!("LiveKit list_participants failed for {}: {e}", session.room_name);
                 (None, false)

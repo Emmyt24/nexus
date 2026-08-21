@@ -12,6 +12,7 @@ use std::time::Duration;
 use chrono::{DateTime, TimeZone, Utc};
 use livekit_api::access_token::{AccessToken, TokenVerifier, VideoGrants};
 use livekit_api::services::room::{CreateRoomOptions, RoomClient};
+use livekit_api::services::{ServerError, ServerErrorCode, ServiceError};
 use livekit_api::webhooks::WebhookReceiver;
 use livekit_protocol as proto;
 
@@ -33,6 +34,13 @@ pub enum LiveKitError {
 
     #[error("LiveKit room API call failed: {0}")]
     Service(String),
+
+    /// LiveKit answered, and the answer was that the room is gone. A negative
+    /// fact, not a failure — the reconciler needs to tell it apart from an
+    /// unreachable server, because "the room vanished" is precisely the signal
+    /// that a `room_finished` webhook was lost.
+    #[error("LiveKit room does not exist")]
+    RoomNotFound,
 
     #[error("LiveKit webhook verification failed: {0}")]
     WebhookVerification(String),
@@ -333,7 +341,7 @@ impl LiveKitClient {
         let participants = room
             .list_participants(room_name)
             .await
-            .map_err(|e| LiveKitError::Service(e.to_string()))?;
+            .map_err(classify_service_error)?;
 
         Ok(participants
             .into_iter()
@@ -354,9 +362,11 @@ impl LiveKitClient {
             return Ok(());
         };
 
-        room.delete_room(room_name)
-            .await
-            .map_err(|e| LiveKitError::Service(e.to_string()))
+        match room.delete_room(room_name).await.map_err(classify_service_error) {
+            // Deleting a room that is already gone is the outcome we wanted.
+            Err(LiveKitError::RoomNotFound) | Ok(()) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Verify a webhook delivery. `body` must be the raw request bytes as
@@ -403,6 +413,20 @@ impl LiveKitClient {
             disconnect_reason: participant.map(|p| p.disconnect_reason),
             raw,
         })
+    }
+}
+
+/// Separate "the room is not there" from "we could not ask". LiveKit answers a
+/// missing room with a Twirp `not_found`, which is a definitive negative rather
+/// than a transport failure, and the two lead to opposite decisions upstream.
+fn classify_service_error(error: ServiceError) -> LiveKitError {
+    match &error {
+        ServiceError::Twirp(ServerError::Twirp(code))
+            if code.code == ServerErrorCode::NOT_FOUND =>
+        {
+            LiveKitError::RoomNotFound
+        }
+        _ => LiveKitError::Service(error.to_string()),
     }
 }
 
