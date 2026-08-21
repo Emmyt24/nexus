@@ -52,8 +52,10 @@ Returns a preview of the shift with:
 
 #### Virtual Meeting Links
 - Auto-generated for virtual shifts
-- Format: `https://meet.nexuscare.com/shift/{shift_id}`
-- Stored in shift notes
+- Format: `{APP_PUBLIC_BASE_URL}/consults/{shift_id}` — a deep link into the app,
+  which then requests a LiveKit join token from
+  `POST /api/v1/shifts/{shift_id}/consult/token`
+- Stored in `shifts.virtual_link`
 
 #### Distance-Based Matching
 - In-person shifts: 5km radius (48 matches)

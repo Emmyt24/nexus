@@ -53,8 +53,10 @@ As a hospital administrator, I want to create a new shift request so that I can 
 
 **Implementation:**
 - Location: `src/services/shift_service.rs` - `create_shift()` method
-- Generates virtual meeting link: `https://meet.nexuscare.com/shift/{shift_id}`
-- Stores link in shift notes via `update_virtual_link()` repository method
+- Generates an app deep link: `{APP_PUBLIC_BASE_URL}/consults/{shift_id}` (via `consult_deep_link()`)
+- The link resolves into the app, which calls `POST /api/v1/shifts/{shift_id}/consult/token`
+  to obtain a short-lived LiveKit join token — a static URL can never be a join link
+- Stores the link via `update_virtual_link()` repository method
 - No distance restriction applied in `calculate_matched_clinicians()` (returns 85 matches vs 48 for in-person)
 
 **Test Coverage:** `test_virtual_shift_no_distance_restriction()`
