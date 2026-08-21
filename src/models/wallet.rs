@@ -109,6 +109,51 @@ pub struct DepositInstructions {
     pub instructions: String,
 }
 
+/// Body for `POST /api/v1/wallet/withdraw`.
+#[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
+pub struct WithdrawRequest {
+    /// Amount in kobo to withdraw (e.g. 10_000 = ₦100). Minimum ₦100.
+    #[validate(range(min = 10_000, message = "Minimum withdrawal is ₦100"))]
+    pub amount_kobo: i64,
+    /// Destination NUBAN account number (10 digits).
+    #[validate(length(min = 10, max = 10, message = "account_number must be 10 digits"))]
+    pub account_number: String,
+    /// Destination bank code (from the SafeHaven bank list).
+    #[validate(length(min = 3, message = "bank_code is required"))]
+    pub bank_code: String,
+    /// Optional narration shown on the transfer.
+    pub narration: Option<String>,
+}
+
+/// Response for `POST /api/v1/wallet/withdraw`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct WithdrawResponse {
+    pub withdrawal_id: Uuid,
+    pub amount_kobo: i64,
+    pub account_number: String,
+    /// Resolved account holder name (from name-enquiry).
+    pub account_name: String,
+    pub bank_code: String,
+    /// "success" | "pending" | "failed".
+    pub status: String,
+    /// Provider payment reference (equals the withdrawal id).
+    pub reference: String,
+    pub message: String,
+}
+
+/// A withdrawal (`billing_transactions` row, `event_type = 'withdrawal'`).
+#[derive(Debug, Clone, FromRow, Serialize, ToSchema)]
+pub struct WithdrawalRow {
+    pub id: Uuid,
+    pub amount_kobo: i64,
+    pub status: String,
+    pub provider_reference: Option<String>,
+    pub provider_transaction_id: Option<String>,
+    pub description: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
 /// Response for `GET /api/v1/wallet`.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct WalletSummary {
