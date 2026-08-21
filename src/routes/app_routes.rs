@@ -178,6 +178,10 @@ pub struct AppState {
         crate::handlers::wallet::get_ledger,
         crate::handlers::wallet::create_deposit,
         crate::handlers::wallet::list_deposits,
+        crate::handlers::wallet::reconcile_deposits,
+        crate::handlers::wallet::withdraw,
+        crate::handlers::wallet::list_withdrawals,
+        crate::handlers::wallet::get_withdrawal_status,
         crate::handlers::wallet::initiate_sub_account,
         crate::handlers::wallet::provision_sub_account,
         crate::handlers::wallet::list_payouts,
@@ -257,6 +261,12 @@ pub struct AppState {
             crate::models::wallet::CreateDepositRequest,
             crate::models::wallet::DepositResponse,
             crate::models::wallet::DepositInstructions,
+            crate::models::wallet::WithdrawRequest,
+            crate::models::wallet::WithdrawResponse,
+            crate::models::wallet::WithdrawalRow,
+            crate::handlers::wallet::WithdrawalPage,
+            crate::handlers::wallet::WithdrawalStatusResponse,
+            crate::services::wallet_service::ReconcileResult,
             crate::handlers::wallet::LedgerPage,
             crate::handlers::wallet::PayoutPage,
             crate::handlers::wallet::PayoutStatusResponse,
@@ -896,6 +906,34 @@ pub fn create_router(
                     UserRole::HospitalAdmin,
                     UserRole::SuperAdmin,
                 ]))),
+        )
+        .route(
+            "/api/v1/wallet/reconcile",
+            post(wallet::reconcile_deposits).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/wallet/withdraw",
+            post(wallet::withdraw).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/wallet/withdrawals",
+            get(wallet::list_withdrawals).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/wallet/withdrawals/{withdrawal_id}/status",
+            get(wallet::get_withdrawal_status).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+            ]))),
         )
         .route(
             "/api/v1/wallet/sub-account/initiate",
