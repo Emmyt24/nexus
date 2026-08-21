@@ -189,7 +189,66 @@ pub async fn update_hospital(
 
     let hospital =
         hospital.ok_or_else(|| AppError::NotFound(format!("Hospital {} not found", id)))?;
+
+    // If exact coordinates were supplied, update the hospital's stored location.
+    if let (Some(lat), Some(lng)) = (payload.latitude, payload.longitude) {
+        sqlx::query(
+            r#"
+            UPDATE hospital_locations
+               SET latitude = $2, longitude = $3, location_confirmed = TRUE, updated_at = NOW()
+             WHERE hospital_id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(lat)
+        .bind(lng)
+        .execute(&state.pool)
+        .await?;
+    }
+
     Ok(Json(HospitalResponse::from(hospital)))
+}
+
+/// Coordinates + geofence for a hospital (from `hospital_locations`).
+#[derive(Debug, serde::Serialize, utoipa::ToSchema, sqlx::FromRow)]
+pub struct HospitalLocationResponse {
+    pub hospital_id: Uuid,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub place_label: Option<String>,
+    pub clock_in_radius_meters: Option<i32>,
+    pub location_confirmed: Option<bool>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/hospitals/{id}/location",
+    params(("id" = Uuid, Path, description = "Hospital id")),
+    responses(
+        (status = 200, description = "Hospital location/coordinates", body = HospitalLocationResponse),
+        (status = 404, description = "No location for this hospital")
+    ),
+    tag = "hospitals",
+    summary = "Get a hospital's coordinates"
+)]
+pub async fn get_hospital_location(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<HospitalLocationResponse>> {
+    let row: Option<HospitalLocationResponse> = sqlx::query_as(
+        r#"
+        SELECT hospital_id, latitude, longitude, place_label,
+               clock_in_radius_meters, location_confirmed
+        FROM hospital_locations
+        WHERE hospital_id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    row.map(Json)
+        .ok_or_else(|| AppError::NotFound(format!("Location for hospital {id} not found")))
 }
 
 /// PATCH /api/v1/hospitals/:id/advance-step

@@ -179,6 +179,8 @@ mod tests {
             state: "Lagos State".to_string(),
             postal_code: "100001".to_string(),
             country: "Nigeria".to_string(),
+            latitude: None,
+            longitude: None,
         };
 
         let formatted = client.format_address(&address);
@@ -274,6 +276,8 @@ mod property_tests {
             state: "".to_string(),
             postal_code: "".to_string(),
             country: "".to_string(),
+            latitude: None,
+            longitude: None,
         };
 
         let formatted = client.format_address(&empty_address);
