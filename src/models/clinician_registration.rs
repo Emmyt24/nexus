@@ -76,6 +76,14 @@ pub struct CompleteProfileRequest {
     pub specialty: crate::models::clinician::ClinicalSpecialty,
 }
 
+/// Set the clinician's profile image (Cloudinary secure URL, uploaded by the
+/// frontend after obtaining a signature from `GET /api/v1/uploads/signature`).
+#[derive(Debug, Deserialize, Validate, ToSchema)]
+pub struct SetAvatarRequest {
+    #[validate(url(message = "avatar_url must be a valid URL"))]
+    pub avatar_url: String,
+}
+
 /// Add bank account
 #[derive(Debug, Deserialize, Validate, ToSchema)]
 pub struct AddBankAccountRequest {

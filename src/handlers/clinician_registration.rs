@@ -9,7 +9,7 @@ use validator::Validate;
 use crate::models::clinician::WorkerPublicDetail;
 use crate::models::clinician_registration::{
     AddBankAccountRequest, BankAccountResponse, CompleteProfileRequest, ProfileResponse,
-    SendOtpRequest, SendOtpResponse, VerifyOtpRequest, VerifyOtpResponse,
+    SendOtpRequest, SendOtpResponse, SetAvatarRequest, VerifyOtpRequest, VerifyOtpResponse,
 };
 use crate::routes::AppState;
 use crate::services::clinician_registration_service::ClinicianRegistrationError;
@@ -189,6 +189,41 @@ pub async fn add_bank_account(
         .await
         .map(Json)
         .map_err(map_err)
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/clinicians/{clinician_id}/avatar",
+    request_body = SetAvatarRequest,
+    params(("clinician_id" = Uuid, Path, description = "Clinician unique identifier")),
+    responses(
+        (status = 200, description = "Profile image updated"),
+        (status = 404, description = "Clinician not found"),
+        (status = 422, description = "Invalid avatar_url")
+    ),
+    tag = "clinicians",
+    summary = "Set clinician profile image (Cloudinary URL)"
+)]
+pub async fn set_avatar(
+    State(state): State<AppState>,
+    Path(clinician_id): Path<Uuid>,
+    Json(req): Json<SetAvatarRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    req.validate()
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+
+    state
+        .clinician_repo
+        .set_avatar_url(clinician_id, &req.avatar_url)
+        .await
+        .map_err(|e| match e {
+            crate::repositories::clinician::ClinicianRepoError::NotFound => {
+                AppError::NotFound(format!("Clinician {clinician_id} not found"))
+            }
+            other => AppError::Internal(anyhow::anyhow!("{other}")),
+        })?;
+
+    Ok(Json(serde_json::json!({ "avatar_url": req.avatar_url })))
 }
 
 fn map_err(e: ClinicianRegistrationError) -> AppError {

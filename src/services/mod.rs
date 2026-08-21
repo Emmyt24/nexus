@@ -1,6 +1,7 @@
 pub mod admin_service;
 pub mod audit_service;
 pub mod auth_service;
+pub mod cloudinary;
 pub mod clinician_registration_service;
 pub mod distance_service;
 pub mod email_outbox_service;

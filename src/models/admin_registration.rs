@@ -30,6 +30,15 @@ pub struct Address {
 
     #[validate(length(min = 2, max = 100))]
     pub country: String,
+
+    /// Optional exact coordinates from a map/GPS picker. When both are provided
+    /// they are stored as-is (overriding address geocoding); otherwise the
+    /// backend geocodes `line1/city/state/country`.
+    #[validate(range(min = -90.0, max = 90.0, message = "latitude must be between -90 and 90"))]
+    pub latitude: Option<f64>,
+
+    #[validate(range(min = -180.0, max = 180.0, message = "longitude must be between -180 and 180"))]
+    pub longitude: Option<f64>,
 }
 
 /// Geographic coordinates
@@ -238,7 +247,7 @@ mod tests {
                 admin_first_name: "Admin".to_string(), admin_last_name: "User".to_string(), email: "admin@hospital.com".to_string(), phone: "+2348012345678".to_string(), registration_number,
                 address: Address {
                     line1: "123 Test Street".to_string(), line2: None,
-                    city: "Lagos".to_string(), state: "Lagos".to_string(), postal_code: "100001".to_string(), country: "Nigeria".to_string(), },
+                    city: "Lagos".to_string(), state: "Lagos".to_string(), postal_code: "100001".to_string(), country: "Nigeria".to_string(), latitude: None, longitude: None, },
             };
 
             prop_assert!(request.validate(). is_ok());
