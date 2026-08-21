@@ -99,6 +99,19 @@ pub enum WebhookOutcome {
     UnknownRoom,
 }
 
+impl WebhookOutcome {
+    /// Echoed back to LiveKit and read in logs, so it is spelled out rather
+    /// than derived from the variant name.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WebhookOutcome::Processed => "processed",
+            WebhookOutcome::AlreadySeen => "already_seen",
+            WebhookOutcome::Ignored => "ignored",
+            WebhookOutcome::UnknownRoom => "unknown_room",
+        }
+    }
+}
+
 /// One reconciler tick, for the log line.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcileReport {

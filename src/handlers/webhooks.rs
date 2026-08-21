@@ -158,10 +158,7 @@ pub async fn livekit_webhook(
     // A processing failure is still a 200: LiveKit retries on non-2xx and a
     // poison event must not hammer us. Same contract as safehaven_webhook.
     let body = match state.video_service.process_webhook_event(event).await {
-        Ok(outcome) => serde_json::json!({
-            "status": "ok",
-            "outcome": format!("{outcome:?}").to_lowercase()
-        }),
+        Ok(outcome) => serde_json::json!({ "status": "ok", "outcome": outcome.as_str() }),
         Err(e) => {
             tracing::error!("LiveKit webhook processing failed: {e}");
             serde_json::json!({ "status": "error", "message": e.to_string() })
