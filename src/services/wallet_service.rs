@@ -577,6 +577,117 @@ impl WalletService {
         }
     }
 
+    /// Reconcile the hospital's wallet against SafeHaven: pull the sub-account's
+    /// transaction history and credit any inbound transfer that was never
+    /// received via webhook (e.g. a webhook posted to a stale callback URL).
+    /// Idempotent — transfers already credited (matched by reference, or by the
+    /// webhook-event dedup inside `process_webhook`) are skipped.
+    pub async fn reconcile_deposits(
+        &self,
+        hospital_id: Uuid,
+    ) -> Result<ReconcileResult, WalletServiceError> {
+        self.repo.ensure_wallet_row(hospital_id).await?;
+        let wallet = self
+            .repo
+            .find_wallet(hospital_id)
+            .await?
+            .ok_or(WalletServiceError::WalletNotFound(hospital_id))?;
+
+        let account_id = wallet
+            .safehaven_account_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                WalletServiceError::Validation(
+                    "No wallet account yet. Create your wallet first.".to_string(),
+                )
+            })?
+            .to_string();
+        let sub_account_number = wallet.safehaven_account_number.clone().unwrap_or_default();
+
+        let body = self
+            .safehaven
+            .list_transfers(&account_id, 0, 100, None)
+            .await?;
+        let txns = body
+            .get("data")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut scanned = 0i64;
+        let mut credited = 0i64;
+        let mut credited_kobo = 0i64;
+
+        for tx in txns {
+            // Only inbound (credit) transfers.
+            let dir = tx.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if !dir.eq_ignore_ascii_case("Inwards") {
+                continue;
+            }
+            scanned += 1;
+
+            // Skip transfers already credited (matched on any known reference).
+            let refs: Vec<String> = ["paymentReference", "sessionId", "_id", "reference"]
+                .iter()
+                .filter_map(|k| tx.get(*k).and_then(|v| v.as_str()))
+                .map(str::to_string)
+                .collect();
+            if !refs.is_empty() {
+                let exists: Option<i32> = sqlx::query_scalar(
+                    "SELECT 1 FROM wallet_deposit_requests WHERE external_reference = ANY($1) LIMIT 1",
+                )
+                .bind(&refs)
+                .fetch_optional(&self.pool)
+                .await?;
+                if exists.is_some() {
+                    continue;
+                }
+            }
+
+            // Replay through the webhook pipeline (idempotent via webhook_events).
+            // Inject the credited account so the inflow maps back to this hospital.
+            let mut data_obj = tx.clone();
+            if let Some(obj) = data_obj.as_object_mut() {
+                obj.insert(
+                    "creditAccountNumber".to_string(),
+                    serde_json::Value::String(sub_account_number.clone()),
+                );
+            }
+            let payload = serde_json::json!({ "type": "transfer", "data": data_obj });
+            match self.process_webhook(&payload).await {
+                Ok(WebhookOutcome::DepositCredited { amount_kobo, .. }) => {
+                    credited += 1;
+                    credited_kobo += amount_kobo;
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("reconcile: failed to credit a transfer: {e}"),
+            }
+        }
+
+        let balance_kobo = self
+            .repo
+            .find_wallet(hospital_id)
+            .await?
+            .map(|w| w.balance_kobo)
+            .unwrap_or(0);
+
+        tracing::info!(
+            "Reconcile hospital {}: scanned {} inbound, credited {} (₦{})",
+            hospital_id,
+            scanned,
+            credited,
+            credited_kobo / 100
+        );
+
+        Ok(ReconcileResult {
+            transactions_scanned: scanned,
+            deposits_credited: credited,
+            amount_credited_kobo: credited_kobo,
+            balance_kobo,
+        })
+    }
+
     pub async fn try_hold_in_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -880,6 +991,19 @@ impl WalletService {
             amount_kobo,
         })
     }
+}
+
+/// Result of a deposit reconcile against SafeHaven's transaction history.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct ReconcileResult {
+    /// Inbound transactions examined.
+    pub transactions_scanned: i64,
+    /// Previously-missed deposits credited during this run.
+    pub deposits_credited: i64,
+    /// Total kobo credited during this run.
+    pub amount_credited_kobo: i64,
+    /// Wallet balance after reconciling.
+    pub balance_kobo: i64,
 }
 
 #[derive(Debug, Clone)]

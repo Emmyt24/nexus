@@ -15,7 +15,7 @@ use crate::models::wallet::{
     WithdrawRequest, WithdrawResponse, WithdrawalRow,
 };
 use crate::routes::AppState;
-use crate::services::wallet_service::WalletServiceError;
+use crate::services::wallet_service::{ReconcileResult, WalletServiceError};
 use crate::utils::{
     errors::{AppError, AppResult},
     extract_claims,
@@ -155,6 +155,32 @@ pub async fn create_deposit(
         .await
         .map_err(map_wallet_error)?;
     Ok((StatusCode::OK, Json(instructions)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/wallet/reconcile",
+    responses(
+        (status = 200, description = "Reconcile result", body = ReconcileResult),
+        (status = 401, body = ErrorResponse),
+        (status = 403, body = ErrorResponse),
+        (status = 422, description = "No wallet yet", body = ErrorResponse)
+    ),
+    tag = "wallet",
+    summary = "Reconcile wallet deposits against SafeHaven",
+    description = "Pulls the hospital sub-account's transaction history from SafeHaven and credits any inbound transfer missed by a webhook (e.g. delivered to a stale callback). Idempotent."
+)]
+pub async fn reconcile_deposits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<ReconcileResult>> {
+    let hospital_id = hospital_id_from_claims(&headers)?;
+    let result = state
+        .wallet_service
+        .reconcile_deposits(hospital_id)
+        .await
+        .map_err(map_wallet_error)?;
+    Ok(Json(result))
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
