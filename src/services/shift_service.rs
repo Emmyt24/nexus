@@ -9,6 +9,16 @@ use crate::services::email_outbox_service::EmailOutboxService;
 use crate::services::email_templates;
 use crate::services::notification_service::NotificationService;
 
+/// Read a kobo amount from an env var, falling back to `default` when unset or
+/// invalid. Used for the test/staging-tunable minimum-rate thresholds.
+fn env_kobo(var: &str, default: i64) -> i64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n >= 0)
+        .unwrap_or(default)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ShiftServiceError {
     #[error("Validation failed: {0}")]
@@ -2066,9 +2076,11 @@ impl ShiftService {
             ));
         }
 
-        // Validate pay type requirements + F1-F08/F1-F09 minimum rates.
-        const MIN_HOURLY_KOBO: i64 = 200_000; // ₦2,000
-        const MIN_FIXED_KOBO: i64 = 1_000_000; // ₦10,000
+        // Validate pay type requirements + F1-F08/F1-F09 minimum rates. Defaults
+        // are ₦2,000/hr and ₦10,000 fixed; overridable at runtime via
+        // MIN_HOURLY_KOBO / MIN_FIXED_KOBO (kobo) for test/staging.
+        let min_hourly = env_kobo("MIN_HOURLY_KOBO", 200_000);
+        let min_fixed = env_kobo("MIN_FIXED_KOBO", 1_000_000);
         match request.pay_type {
             crate::models::shift::PayType::HourlyRate => {
                 let rate = request.rate_kobo_per_hour.ok_or_else(|| {
@@ -2076,10 +2088,11 @@ impl ShiftService {
                         "Hourly rate is required for hourly pay type".to_string(),
                     )
                 })?;
-                if rate < MIN_HOURLY_KOBO {
-                    return Err(ShiftServiceError::ValidationError(
-                        "Hourly rate must be at least ₦2,000".to_string(),
-                    ));
+                if rate < min_hourly {
+                    return Err(ShiftServiceError::ValidationError(format!(
+                        "Hourly rate must be at least ₦{}",
+                        min_hourly / 100
+                    )));
                 }
             }
             crate::models::shift::PayType::FixedRate => {
@@ -2088,10 +2101,11 @@ impl ShiftService {
                         "Fixed rate is required for fixed pay type".to_string(),
                     )
                 })?;
-                if rate < MIN_FIXED_KOBO {
-                    return Err(ShiftServiceError::ValidationError(
-                        "Fixed rate must be at least ₦10,000".to_string(),
-                    ));
+                if rate < min_fixed {
+                    return Err(ShiftServiceError::ValidationError(format!(
+                        "Fixed rate must be at least ₦{}",
+                        min_fixed / 100
+                    )));
                 }
             }
         }
