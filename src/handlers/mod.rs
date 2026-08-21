@@ -13,5 +13,6 @@ pub mod notifications;
 pub mod patients;
 pub mod registration;
 pub mod shifts;
+pub mod video;
 pub mod wallet;
 pub mod webhooks;

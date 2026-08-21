@@ -74,6 +74,10 @@ livekit-api = { version = "0.6.3", default-features = false, features = [
     "services-tokio",
     "rustls-tls-webpki-roots",
 ] }
+# The generated protobuf types `livekit-api` speaks in. Already in the tree as
+# a transitive dependency of livekit-api; named here because we deserialize
+# `WebhookEvent` and read `DisconnectReason` directly.
+livekit-protocol = { version = "0.7.12" }
 
 # SSE / async streams
 tokio-stream = { version = "0.1", features = ["sync"] }

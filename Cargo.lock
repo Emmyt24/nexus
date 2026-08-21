@@ -1732,6 +1732,7 @@ dependencies = [
  "jsonwebtoken 9.3.1",
  "lettre",
  "livekit-api",
+ "livekit-protocol",
  "proptest",
  "rand 0.8.5",
  "regex",
