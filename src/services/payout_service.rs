@@ -463,7 +463,7 @@ impl PayoutService {
 
         let rows = sqlx::query_as::<_, PayoutRow>(
             r#"
-            SELECT id, shift_id, amount_kobo, status,
+            SELECT id, shift_id, amount_kobo, status::text AS status,
                    provider_reference, provider_transaction_id,
                    description, created_at, completed_at
             FROM billing_transactions
@@ -515,7 +515,7 @@ impl PayoutService {
         let Some(reference) = r.provider_reference.clone() else {
             // No transfer was ever sent (e.g. failed pre-flight). Return stored status.
             let st: String =
-                sqlx::query_scalar("SELECT status FROM billing_transactions WHERE id = $1")
+                sqlx::query_scalar("SELECT status::text FROM billing_transactions WHERE id = $1")
                     .bind(payout_id)
                     .fetch_one(&self.pool)
                     .await?;
