@@ -2067,8 +2067,10 @@ impl ShiftService {
         }
 
         // Validate pay type requirements + F1-F08/F1-F09 minimum rates.
-        const MIN_HOURLY_KOBO: i64 = 200_000; // ₦2,000
-        const MIN_FIXED_KOBO: i64 = 1_000_000; // ₦10,000
+        // TEMPORARY: lowered to ₦100 for live testing. Revert to
+        // 200_000 (₦2,000) / 1_000_000 (₦10,000) after testing.
+        const MIN_HOURLY_KOBO: i64 = 10_000; // ₦100
+        const MIN_FIXED_KOBO: i64 = 10_000; // ₦100
         match request.pay_type {
             crate::models::shift::PayType::HourlyRate => {
                 let rate = request.rate_kobo_per_hour.ok_or_else(|| {
@@ -2078,7 +2080,7 @@ impl ShiftService {
                 })?;
                 if rate < MIN_HOURLY_KOBO {
                     return Err(ShiftServiceError::ValidationError(
-                        "Hourly rate must be at least ₦2,000".to_string(),
+                        "Hourly rate must be at least ₦100".to_string(),
                     ));
                 }
             }
@@ -2090,7 +2092,7 @@ impl ShiftService {
                 })?;
                 if rate < MIN_FIXED_KOBO {
                     return Err(ShiftServiceError::ValidationError(
-                        "Fixed rate must be at least ₦10,000".to_string(),
+                        "Fixed rate must be at least ₦100".to_string(),
                     ));
                 }
             }
