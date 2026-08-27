@@ -967,6 +967,16 @@ pub struct NearbyShiftCard {
     pub interest_expressed: bool,
 }
 
+/// Response body for `GET /api/v1/worker/shifts/nearby`.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NearbyShiftsResponse {
+    /// `true` when the worker supplied no GPS and has no location on file. The
+    /// client should prompt for location access; `shifts` then carries only
+    /// entries that need no distance (virtual, and hospitals with no coords).
+    pub location_required: bool,
+    pub shifts: Vec<NearbyShiftCard>,
+}
+
 /// One row in `GET /api/v1/worker/shifts/my-applications`.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MyApplicationEntry {

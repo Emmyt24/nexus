@@ -12,7 +12,7 @@ use crate::{
         AcceptShiftRequest, ClockinApprovalDecisionRequest, ClockinApprovalRequest, ClockinRequest,
         ClockinResponse, ClockoutResponse, CreateShiftRequest, DeclineShiftRequest,
         EditRatingRequest, HandoverResponse, HandoverRevisionRequest, MyApplicationEntry,
-        NearbyShiftCard, RankedInterestedClinician, RateHospitalRequest, RateWorkerRequest,
+        NearbyShiftsResponse, RankedInterestedClinician, RateHospitalRequest, RateWorkerRequest,
         RatingResponse, Shift, ShiftApplication, ShiftApplicationRequest, ShiftApplicationsQuery,
         ShiftDetailResponse,
         ShiftAssignRequest, ShiftCancelRequest, ShiftInterestRequest, ShiftListQuery,
@@ -905,11 +905,10 @@ impl NearbyShiftsQuery {
         ("offset" = Option<i64>, Query, description = "Rows to skip (default 0)")
     ),
     responses(
-        (status = 200, description = "Open shifts within the radius, ranked by urgency then distance", body = Vec<NearbyShiftCard>),
+        (status = 200, description = "Open shifts within the radius, ranked by urgency then distance", body = NearbyShiftsResponse),
         (status = 400, description = "Invalid coordinates or paging parameters", body = ErrorResponse),
         (status = 401, body = ErrorResponse),
-        (status = 403, description = "Caller has no clinician profile", body = ErrorResponse),
-        (status = 409, description = "No location supplied and none on file", body = ErrorResponse)
+        (status = 403, description = "Caller has no clinician profile", body = ErrorResponse)
     ),
     tag = "shifts",
     summary = "Shifts Near You (worker discovery)",
@@ -919,19 +918,22 @@ pub async fn list_nearby_shifts(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<NearbyShiftsQuery>,
-) -> AppResult<Json<Vec<NearbyShiftCard>>> {
+) -> AppResult<Json<NearbyShiftsResponse>> {
     let claims = extract_claims(&headers)?;
     let worker_user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| AppError::Unauthorized("Invalid user ID in token".to_string()))?;
 
     let (origin, radius_km, limit, offset) = query.resolve().map_err(AppError::BadRequest)?;
 
-    let cards = state
+    let result = state
         .shift_service
         .list_nearby_shifts_for_worker(worker_user_id, origin, radius_km, limit, offset)
         .await
         .map_err(map_shift_error)?;
-    Ok(Json(cards))
+    Ok(Json(NearbyShiftsResponse {
+        location_required: result.location_required,
+        shifts: result.shifts,
+    }))
 }
 
 /// GET /api/v1/worker/shifts/my-applications
