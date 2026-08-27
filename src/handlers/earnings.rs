@@ -91,12 +91,16 @@ pub async fn get_earnings(
         .single()
         .unwrap_or(now);
 
-    let totals_row: (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+    let totals_row: (i64, i64, i64) = sqlx::query_as(
         r#"
         SELECT
-            SUM(bt.amount_kobo) FILTER (WHERE bt.status = 'success')                    AS total_earned,
-            SUM(bt.amount_kobo) FILTER (WHERE bt.status = 'success' AND bt.completed_at >= $2) AS this_month,
-            SUM(bt.amount_kobo) FILTER (WHERE bt.status IN ('pending'))                 AS pending
+            COALESCE(SUM(bt.amount_kobo) FILTER (WHERE bt.status = 'success'), 0)::BIGINT
+                AS total_earned,
+            COALESCE(SUM(bt.amount_kobo) FILTER (WHERE bt.status = 'success'
+                                                   AND bt.completed_at >= $2), 0)::BIGINT
+                AS this_month,
+            COALESCE(SUM(bt.amount_kobo) FILTER (WHERE bt.status = 'pending'), 0)::BIGINT
+                AS pending
         FROM billing_transactions bt
         JOIN shifts s ON s.id = bt.shift_id
         WHERE bt.event_type = 'payout'
@@ -109,9 +113,9 @@ pub async fn get_earnings(
     .await
     .map_err(AppError::Database)?;
 
-    let total_earned_kobo = totals_row.0.unwrap_or(0);
-    let this_month_kobo = totals_row.1.unwrap_or(0);
-    let pending_kobo = totals_row.2.unwrap_or(0);
+    let total_earned_kobo = totals_row.0;
+    let this_month_kobo = totals_row.1;
+    let pending_kobo = totals_row.2;
 
     // Transaction history (newest first).
     let transactions = sqlx::query_as::<_, EarningsTransaction>(
@@ -126,8 +130,8 @@ pub async fn get_earnings(
                bt.completed_at,
                bt.created_at
         FROM billing_transactions bt
-        JOIN shifts s    ON s.id = bt.shift_id
-        JOIN hospitals h ON h.id = s.hospital_id
+        LEFT JOIN shifts s    ON s.id = bt.shift_id
+        LEFT JOIN hospitals h ON h.id = s.hospital_id
         WHERE bt.event_type = 'payout'
           AND s.assigned_clinician_id = $1
         ORDER BY bt.created_at DESC
@@ -145,7 +149,7 @@ pub async fn get_earnings(
         r#"
         SELECT COUNT(*)
         FROM billing_transactions bt
-        JOIN shifts s ON s.id = bt.shift_id
+        LEFT JOIN shifts s ON s.id = bt.shift_id
         WHERE bt.event_type = 'payout'
           AND s.assigned_clinician_id = $1
         "#,

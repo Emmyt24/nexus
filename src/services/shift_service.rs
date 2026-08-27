@@ -138,6 +138,13 @@ pub struct WorkerOrigin {
     pub accuracy_meters: Option<f32>,
 }
 
+/// Service-layer result for the nearby-shifts query: the ranked shift cards
+/// plus whether the worker had no usable origin (live GPS or stored).
+pub struct NearbyShiftsResult {
+    pub location_required: bool,
+    pub shifts: Vec<crate::models::shift::NearbyShiftCard>,
+}
+
 /// Pair each shift requirement with whether it is satisfied by the clinician's
 /// qualifications (SCRUM-25 / US-09 AC-04). Matching is case-insensitive and
 /// whitespace-trimmed so "ACLS Certified" matches "acls certified".
@@ -1636,7 +1643,7 @@ impl ShiftService {
         radius_km: f64,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<crate::models::shift::NearbyShiftCard>, ShiftServiceError> {
+    ) -> Result<NearbyShiftsResult, ShiftServiceError> {
         use crate::models::shift::NearbyShiftCard;
 
         let clinician_id = self
@@ -1646,24 +1653,22 @@ impl ShiftService {
             .ok_or(ShiftServiceError::NoClinicianProfile)?;
 
         // Resolve the origin: live GPS wins and is persisted; otherwise fall
-        // back to the last-known location; otherwise ask the caller for one.
-        let (origin_lat, origin_lng) = match origin {
+        // back to the last-known location; otherwise proceed without one and
+        // flag that the client should prompt for location access.
+        let origin_coords: Option<(f64, f64)> = match origin {
             Some(o) => {
                 self.shift_repo
                     .upsert_clinician_location(clinician_id, o.lat, o.lng, o.accuracy_meters)
                     .await?;
-                (o.lat, o.lng)
+                Some((o.lat, o.lng))
             }
-            None => self
-                .shift_repo
-                .get_clinician_location(clinician_id)
-                .await?
-                .ok_or(ShiftServiceError::LocationRequired)?,
+            None => self.shift_repo.get_clinician_location(clinician_id).await?,
         };
+        let location_required = origin_coords.is_none();
 
         let rows = self
             .shift_repo
-            .list_nearby_shifts(clinician_id, origin_lat, origin_lng, radius_km, limit, offset)
+            .list_nearby_shifts(clinician_id, origin_coords, radius_km, limit, offset)
             .await?;
 
         // Rows arrive already filtered, ranked and paged; map them 1:1.
@@ -1688,7 +1693,10 @@ impl ShiftService {
             })
             .collect();
 
-        Ok(cards)
+        Ok(NearbyShiftsResult {
+            location_required,
+            shifts: cards,
+        })
     }
 
     /// "My Applications" tab. Combines expressed interests and
