@@ -192,7 +192,8 @@ impl ShiftRepository {
                 c.id                                                  AS clinician_id,
                 c.first_name,
                 c.last_name,
-                c.rating,
+                -- `clinicians.rating` is NUMERIC(3,1); the row decodes it as f32.
+                c.rating::REAL                                        AS rating,
                 c.rating_count,
                 (SELECT COUNT(*) FROM shifts s2
                     WHERE s2.assigned_clinician_id = c.id AND s2.status = 'completed') AS completed_shifts,
@@ -937,11 +938,14 @@ impl ShiftRepository {
                 h.name            AS hospital_name,
                 s.role_title,
                 s.specialty,
-                s.shift_type      AS "shift_type: _",
-                s.priority        AS "priority: _",
+                -- Plain columns: `AS "col: _"` is sqlx *macro* syntax, and this
+                -- is a runtime `query_as`, so it would name the column
+                -- literally `shift_type: _` and `FromRow` would not find it.
+                s.shift_type,
+                s.priority,
                 s.scheduled_start,
                 s.duration_hours,
-                s.pay_type        AS "pay_type: _",
+                s.pay_type,
                 s.rate_kobo_per_hour,
                 s.fixed_rate_kobo,
                 s.stat_bonus_kobo,
@@ -1959,6 +1963,30 @@ impl ShiftRepository {
         .await?;
 
         Ok(result.rows_affected())
+    }
+
+    /// Record interest inside an existing transaction, ignoring a clinician who
+    /// is already interested. Used by the apply flow; `add_interest` keeps its
+    /// unique-violation error so `express_interest` can report a duplicate.
+    pub async fn add_interest_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        shift_id: Uuid,
+        clinician_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO shift_interests (shift_id, clinician_id)
+            VALUES ($1, $2)
+            ON CONFLICT (shift_id, clinician_id) DO NOTHING
+            "#,
+        )
+        .bind(shift_id)
+        .bind(clinician_id)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
     }
 
     pub async fn add_interest(

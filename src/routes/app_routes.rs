@@ -367,7 +367,6 @@ pub struct AppState {
             crate::models::shift::ShiftApplicationStatus,
             crate::models::shift::ShiftApplicationsQuery,
             crate::models::shift::ShiftListQuery,
-            crate::models::shift::ShiftInterestRequest,
             crate::models::shift::ShiftAssignRequest,
             crate::models::shift::ShiftCancelRequest,
             crate::models::shift::ShiftRescheduleRequest,
@@ -702,17 +701,22 @@ pub fn create_router(
             "/api/v1/workers/{id}",
             get(clinician_registration::get_worker_public),
         )
+        // Own-profile onboarding: role-gated here, ownership checked in the
+        // handlers (the clinician id comes from the path).
         .route(
             "/api/v1/clinicians/{clinician_id}/profile",
-            axum::routing::put(clinician_registration::complete_profile),
+            axum::routing::put(clinician_registration::complete_profile)
+                .route_layer(from_fn(require_role(&[UserRole::HealthWorker]))),
         )
         .route(
             "/api/v1/clinicians/{clinician_id}/bank-account",
-            post(clinician_registration::add_bank_account),
+            post(clinician_registration::add_bank_account)
+                .route_layer(from_fn(require_role(&[UserRole::HealthWorker]))),
         )
         .route(
             "/api/v1/clinicians/{clinician_id}/avatar",
-            patch(clinician_registration::set_avatar),
+            patch(clinician_registration::set_avatar)
+                .route_layer(from_fn(require_role(&[UserRole::HealthWorker]))),
         )
         // Cloudinary signed-upload signature (any authenticated user)
         .route(

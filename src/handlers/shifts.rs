@@ -15,7 +15,7 @@ use crate::{
         NearbyShiftCard, RankedInterestedClinician, RateHospitalRequest, RateWorkerRequest,
         RatingResponse, Shift, ShiftApplication, ShiftApplicationRequest, ShiftApplicationsQuery,
         ShiftDetailResponse,
-        ShiftAssignRequest, ShiftCancelRequest, ShiftInterestRequest, ShiftListQuery,
+        ShiftAssignRequest, ShiftCancelRequest, ShiftListQuery,
         ShiftOfferRequest, ShiftOfferResponse, ShiftRescheduleRequest, SubmitHandoverRequest,
     },
     routes::AppState,
@@ -244,32 +244,32 @@ pub async fn get_shift(
 #[utoipa::path(
     post,
     path = "/api/v1/shifts/{shift_id}/interest",
-    request_body = ShiftInterestRequest,
     params(
         ("shift_id" = Uuid, Path, description = "Shift unique identifier")
     ),
     responses(
         (status = 201, description = "Interest recorded"),
+        (status = 401, description = "Missing or invalid token", body = ErrorResponse),
+        (status = 403, description = "Caller has no clinician profile", body = ErrorResponse),
         (status = 404, description = "Shift not found", body = ErrorResponse),
-        (status = 409, description = "Interest already exists, or shift is no longer available", body = ErrorResponse),
-        (status = 422, description = "Validation error", body = ErrorResponse)
+        (status = 409, description = "Interest already exists, or shift is no longer available", body = ErrorResponse)
     ),
     tag = "shifts",
     summary = "Express interest in a shift",
-    description = "Clinician expresses interest in an open shift. The hospital admin is notified. Rejected with 409 if the shift is no longer open (BR: no longer available)."
+    description = "Clinician expresses interest in an open shift. The clinician is taken from the bearer token \u{2014} the request takes no body. The hospital admin is notified. Rejected with 409 if the shift is no longer open (BR: no longer available)."
 )]
 pub async fn express_interest(
     State(state): State<AppState>,
     Path(shift_id): Path<Uuid>,
-    Json(payload): Json<ShiftInterestRequest>,
+    headers: HeaderMap,
 ) -> AppResult<StatusCode> {
-    payload
-        .validate()
-        .map_err(|e| AppError::Validation(e.to_string()))?;
+    let claims = extract_claims(&headers)?;
+    let worker_user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| AppError::Unauthorized("Invalid user ID in token".to_string()))?;
 
     state
         .shift_service
-        .express_interest(shift_id, payload.clinician_id)
+        .express_interest(shift_id, worker_user_id)
         .await
         .map(|_| StatusCode::CREATED)
         .map_err(map_shift_error)
@@ -285,27 +285,33 @@ pub async fn express_interest(
     ),
     responses(
         (status = 201, description = "Application submitted"),
-        (status = 403, description = "Profile incomplete or not allowed", body = ErrorResponse),
+        (status = 401, description = "Missing or invalid token", body = ErrorResponse),
+        (status = 403, description = "Profile incomplete, or caller has no clinician profile", body = ErrorResponse),
         (status = 404, description = "Shift not found", body = ErrorResponse),
         (status = 409, description = "Already applied or busy", body = ErrorResponse),
         (status = 422, description = "Validation error", body = ErrorResponse)
     ),
     tag = "shifts",
     summary = "Apply for a shift",
-    description = "Submit a shift application with profile details and experience"
+    description = "Submit a shift application. The clinician is taken from the bearer token; profile details are read from the stored clinician profile. Also records shift interest, so the hospital can offer the shift."
 )]
 pub async fn apply_for_shift(
     State(state): State<AppState>,
     Path(shift_id): Path<Uuid>,
+    headers: HeaderMap,
     Json(payload): Json<ShiftApplicationRequest>,
 ) -> AppResult<StatusCode> {
+    let claims = extract_claims(&headers)?;
+    let worker_user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| AppError::Unauthorized("Invalid user ID in token".to_string()))?;
+
     payload
         .validate()
         .map_err(|e| AppError::Validation(e.to_string()))?;
 
     state
         .shift_service
-        .apply_for_shift(shift_id, payload)
+        .apply_for_shift(shift_id, worker_user_id, payload)
         .await
         .map(|_| StatusCode::CREATED)
         .map_err(map_shift_error)

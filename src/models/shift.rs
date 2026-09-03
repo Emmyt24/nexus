@@ -470,11 +470,6 @@ pub struct ShiftWizardDraft {
 // Shift action requests
 
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
-pub struct ShiftInterestRequest {
-    pub clinician_id: Uuid,
-}
-
-#[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct ShiftAssignRequest {
     pub clinician_id: Uuid,
 }
@@ -521,7 +516,6 @@ pub struct ShiftApplication {
 
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct ShiftApplicationRequest {
-    pub clinician_id: Uuid,
     #[validate(range(min = 0, max = 60))]
     pub years_experience: i32,
     #[validate(length(max = 2000))]

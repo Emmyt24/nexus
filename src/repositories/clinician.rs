@@ -23,6 +23,19 @@ impl ClinicianRepository {
         Self { pool }
     }
 
+    /// Resolve `clinicians.id` from the authenticated user's `users.id`.
+    /// `clinicians.user_id` is `NOT NULL UNIQUE`, so at most one row matches.
+    pub async fn find_id_by_user_id(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<Uuid>, ClinicianRepoError> {
+        let id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM clinicians WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(id)
+    }
+
     /// Check if email is already registered
     pub async fn email_exists(&self, email: &str) -> Result<bool, ClinicianRepoError> {
         let row: Option<(i64,)> = sqlx::query_as("SELECT COUNT(*) FROM users WHERE email = $1")

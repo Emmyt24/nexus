@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
-use jsonwebtoken::{encode, EncodingKey, Header};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::models::user::{Claims, LoginResponse, User, UserResponse, UserRole};
+use crate::models::user::{LoginResponse, User, UserResponse, UserRole};
 use crate::services::email_outbox_service::{EmailOutboxError, EmailOutboxService};
 use crate::services::email_templates;
 
@@ -346,30 +345,12 @@ fn sha256_hex(input: &str) -> String {
 }
 
 fn issue_access_token(user: &User) -> Result<(String, u64), String> {
-    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_default();
-    let expiry_hours: u64 = std::env::var("JWT_EXPIRY_HOURS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(24);
-
-    let now = Utc::now().timestamp() as usize;
-    let claims = Claims {
-        sub: user.id.to_string(),
-        email: user.email.clone(),
-        role: user.role.clone(),
-        hospital_id: user.hospital_id.map(|id| id.to_string()),
-        exp: now + (expiry_hours as usize * 3600),
-        iat: now,
-    };
-
-    let token = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(jwt_secret.as_bytes()),
+    crate::utils::jwt::issue_access_token(
+        user.id,
+        &user.email,
+        user.role.clone(),
+        user.hospital_id.map(|id| id.to_string()),
     )
-    .map_err(|e| e.to_string())?;
-
-    Ok((token, expiry_hours * 3600))
 }
 
 pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
