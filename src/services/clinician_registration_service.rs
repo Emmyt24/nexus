@@ -37,6 +37,8 @@ pub enum ClinicianRegistrationError {
     NotFound,
     #[error("BVN or NIN must be verified before adding a bank account")]
     IdentityNotVerified,
+    #[error("Token issuance failed: {0}")]
+    TokenIssue(String),
 }
 
 pub struct ClinicianRegistrationService {
@@ -139,7 +141,13 @@ impl ClinicianRegistrationService {
         let (clinician_id, user_id) = self.repo.create_clinician(&mut tx, email).await?;
         tx.commit().await?;
 
-        let token = issue_jwt(user_id);
+        let (token, _expires_in) = crate::utils::jwt::issue_access_token(
+            user_id,
+            email,
+            crate::models::user::UserRole::HealthWorker,
+            None,
+        )
+        .map_err(ClinicianRegistrationError::TokenIssue)?;
 
         let content = email_templates::clinician_welcome(None);
         self.email_outbox.enqueue_email(email, &content).await?;
@@ -261,38 +269,6 @@ fn mask_account(account: &str) -> String {
         return "*".repeat(account.len());
     }
     format!("{}****{}", &account[..3], &account[account.len() - 3..])
-}
-
-/// Minimal JWT issuance — reuses the same secret as the rest of the app.
-/// `sub` is the users.id (not clinicians.id) to match extract_claims across the app.
-fn issue_jwt(user_id: Uuid) -> String {
-    use chrono::Utc;
-    use jsonwebtoken::{encode, EncodingKey, Header};
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Serialize, Deserialize)]
-    struct Claims {
-        sub: String,
-        role: String,
-        exp: usize,
-        iat: usize,
-    }
-
-    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "dev_secret".to_string());
-    let now = Utc::now().timestamp() as usize;
-    let claims = Claims {
-        sub: user_id.to_string(),
-        role: "health_worker".to_string(),
-        exp: now + 86400,
-        iat: now,
-    };
-
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )
-    .unwrap_or_else(|_| "token_error".to_string())
 }
 
 // Extend ClinicianRepository with a reverse lookup helper is in repositories/clinician.rs

@@ -192,7 +192,8 @@ impl ShiftRepository {
                 c.id                                                  AS clinician_id,
                 c.first_name,
                 c.last_name,
-                c.rating,
+                -- `clinicians.rating` is NUMERIC(3,1); the row decodes it as f32.
+                c.rating::REAL                                        AS rating,
                 c.rating_count,
                 (SELECT COUNT(*) FROM shifts s2
                     WHERE s2.assigned_clinician_id = c.id AND s2.status = 'completed') AS completed_shifts,
@@ -1964,6 +1965,30 @@ impl ShiftRepository {
         .await?;
 
         Ok(result.rows_affected())
+    }
+
+    /// Record interest inside an existing transaction, ignoring a clinician who
+    /// is already interested. Used by the apply flow; `add_interest` keeps its
+    /// unique-violation error so `express_interest` can report a duplicate.
+    pub async fn add_interest_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        shift_id: Uuid,
+        clinician_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO shift_interests (shift_id, clinician_id)
+            VALUES ($1, $2)
+            ON CONFLICT (shift_id, clinician_id) DO NOTHING
+            "#,
+        )
+        .bind(shift_id)
+        .bind(clinician_id)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
     }
 
     pub async fn add_interest(

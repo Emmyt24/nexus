@@ -257,7 +257,8 @@ pub async fn me(
         SELECT id,
                specialty::text AS specialty,
                role_title,
-               rating,
+               -- `clinicians.rating` is NUMERIC(3,1); the row decodes it as f32.
+               rating::REAL    AS rating,
                rating_count,
                is_verified
         FROM clinicians

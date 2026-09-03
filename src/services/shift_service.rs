@@ -511,8 +511,16 @@ impl ShiftService {
     pub async fn express_interest(
         &self,
         shift_id: Uuid,
-        clinician_id: Uuid,
+        worker_user_id: Uuid,
     ) -> Result<(), ShiftServiceError> {
+        // The clinician is always the caller: `shift_interests.clinician_id`
+        // references `clinicians (id)`, never `users (id)`.
+        let clinician_id = self
+            .shift_repo
+            .find_clinician_id_for_user(worker_user_id)
+            .await?
+            .ok_or(ShiftServiceError::NoClinicianProfile)?;
+
         let shift = self
             .shift_repo
             .get_by_id(shift_id)
@@ -564,8 +572,15 @@ impl ShiftService {
     pub async fn apply_for_shift(
         &self,
         shift_id: Uuid,
+        worker_user_id: Uuid,
         request: crate::models::shift::ShiftApplicationRequest,
     ) -> Result<(), ShiftServiceError> {
+        let clinician_id = self
+            .shift_repo
+            .find_clinician_id_for_user(worker_user_id)
+            .await?
+            .ok_or(ShiftServiceError::NoClinicianProfile)?;
+
         let shift = self
             .shift_repo
             .get_by_id(shift_id)
@@ -580,7 +595,7 @@ impl ShiftService {
 
         let profile = self
             .shift_repo
-            .get_clinician_profile_snapshot(request.clinician_id)
+            .get_clinician_profile_snapshot(clinician_id)
             .await?
             .ok_or(ShiftServiceError::ProfileIncomplete)?;
 
@@ -599,7 +614,7 @@ impl ShiftService {
 
         if self
             .shift_repo
-            .clinician_has_active_assignment(request.clinician_id)
+            .clinician_has_active_assignment(clinician_id)
             .await?
         {
             return Err(ShiftServiceError::ClinicianBusy);
@@ -617,7 +632,7 @@ impl ShiftService {
             .create_application(
                 &mut tx,
                 shift_id,
-                request.clinician_id,
+                clinician_id,
                 &verified_applicant_name,
                 &verified_license_number,
                 &verified_role,
@@ -628,6 +643,12 @@ impl ShiftService {
 
         match result {
             Ok(_) => {
+                // `offer_shift` will only offer to a clinician who has expressed
+                // interest, so applying has to record interest too — otherwise
+                // an application is a dead end for the hospital.
+                self.shift_repo
+                    .add_interest_tx(&mut tx, shift_id, clinician_id)
+                    .await?;
                 tx.commit().await?;
                 Ok(())
             }
