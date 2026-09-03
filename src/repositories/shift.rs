@@ -920,12 +920,17 @@ impl ShiftRepository {
     pub async fn list_nearby_shifts(
         &self,
         clinician_id: Uuid,
-        origin_lat: f64,
-        origin_lng: f64,
+        origin: Option<(f64, f64)>,
         radius_km: f64,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<NearbyShiftRow>, sqlx::Error> {
+        // Split the optional origin into nullable binds; the `$2::double
+        // precision` casts in the CTE handle NULL binds correctly.
+        let (origin_lat, origin_lng) = match origin {
+            Some((lat, lng)) => (Some(lat), Some(lng)),
+            None => (None, None),
+        };
         sqlx::query_as::<_, NearbyShiftRow>(
             r#"
             WITH origin AS (
@@ -938,9 +943,6 @@ impl ShiftRepository {
                 h.name            AS hospital_name,
                 s.role_title,
                 s.specialty,
-                -- Plain columns: `AS "col: _"` is sqlx *macro* syntax, and this
-                -- is a runtime `query_as`, so it would name the column
-                -- literally `shift_type: _` and `FromRow` would not find it.
                 s.shift_type,
                 s.priority,
                 s.scheduled_start,
@@ -1042,7 +1044,7 @@ impl ShiftRepository {
         .bind(latitude)
         .bind(longitude)
         .bind(accuracy_meters)
-        .fetch_optional(&self.pool)
+        .execute(&self.pool)
         .await
         .map(|_| ())
     }
@@ -1084,7 +1086,7 @@ impl ShiftRepository {
         >(
             r#"
             SELECT s.id, s.hospital_id, s.role_title, s.scheduled_start,
-                   s.status AS "status: _", si.expressed_at AS created_at
+                   s.status, si.expressed_at AS created_at
             FROM shift_interests si
             JOIN shifts s ON s.id = si.shift_id
             WHERE si.clinician_id = $1
@@ -1108,8 +1110,8 @@ impl ShiftRepository {
         >(
             r#"
             SELECT s.id, s.hospital_id, s.role_title, s.scheduled_start,
-                   s.status AS "status: _",
-                   a.status AS "app_status: _",
+                   s.status,
+                   a.status,
                    a.created_at
             FROM shift_applications a
             JOIN shifts s ON s.id = a.shift_id

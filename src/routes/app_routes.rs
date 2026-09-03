@@ -249,6 +249,7 @@ pub struct AppState {
             crate::models::shift::EditRatingRequest,
             crate::models::shift::RatingResponse,
             crate::models::shift::NearbyShiftCard,
+            crate::models::shift::NearbyShiftsResponse,
             crate::models::shift::ShiftDetailResponse,
             crate::models::shift::HospitalRatingSummary,
             crate::models::shift::QualificationMatch,
