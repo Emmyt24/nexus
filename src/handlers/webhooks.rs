@@ -113,3 +113,57 @@ pub async fn safehaven_webhook(
 
     Ok(Json(body))
 }
+
+/// POST /api/v1/webhooks/livekit
+#[utoipa::path(
+    post,
+    path = "/api/v1/webhooks/livekit",
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Acknowledged"),
+        (status = 400, description = "Body is not UTF-8"),
+        (status = 401, description = "Invalid signature")
+    ),
+    tag = "webhooks",
+    summary = "LiveKit room lifecycle webhook receiver",
+    description = "Receives room_started / participant_joined / participant_left / room_finished. Authenticated by LiveKit's own signed JWT, whose `sha256` claim digests the raw body. Idempotent: re-deliveries are recognised by `WebhookEvent.id`."
+)]
+pub async fn livekit_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    // MUST be the raw bytes: verification hashes exactly what was sent, so
+    // `Json<T>` would re-serialize the body and the digest could never match.
+    body: Bytes,
+) -> Result<impl IntoResponse, (StatusCode, &'static str)> {
+    let raw = std::str::from_utf8(&body).map_err(|_| {
+        tracing::warn!("LiveKit webhook body was not UTF-8");
+        (StatusCode::BAD_REQUEST, "body is not utf-8")
+    })?;
+
+    // LiveKit sends the JWT bare; tolerate a "Bearer " prefix anyway.
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.strip_prefix("Bearer ").unwrap_or(v).trim())
+        .unwrap_or_default();
+
+    let event = match state.video_service.verify_webhook(raw, auth) {
+        Ok(event) => event,
+        Err(e) => {
+            tracing::warn!("LiveKit webhook rejected: {e}");
+            return Err((StatusCode::UNAUTHORIZED, "invalid signature"));
+        }
+    };
+
+    // A processing failure is still a 200: LiveKit retries on non-2xx and a
+    // poison event must not hammer us. Same contract as safehaven_webhook.
+    let body = match state.video_service.process_webhook_event(event).await {
+        Ok(outcome) => serde_json::json!({ "status": "ok", "outcome": outcome.as_str() }),
+        Err(e) => {
+            tracing::error!("LiveKit webhook processing failed: {e}");
+            serde_json::json!({ "status": "error", "message": e.to_string() })
+        }
+    };
+
+    Ok(Json(body))
+}

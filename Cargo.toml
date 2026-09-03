@@ -62,6 +62,23 @@ jsonwebtoken = { version = "9.3.1" }
 # HTTP client (for CAC verification calls)
 reqwest = { version = "0.12.15", features = ["json", "rustls-tls"], default-features = false }
 
+# LiveKit server SDK — access-token minting, Room Service API, webhook
+# verification. Server-side only: this crate is pure Rust/HTTP. The `livekit`
+# client crate is deliberately NOT used — it builds libwebrtc and needs a C++
+# toolchain. `default-features = false` drops the signal-client and
+# services-async paths we never touch and pins a single TLS backend; webpki
+# roots are compiled in so the deploy container needs no OS trust store.
+livekit-api = { version = "0.6.3", default-features = false, features = [
+    "access-token",
+    "webhooks",
+    "services-tokio",
+    "rustls-tls-webpki-roots",
+] }
+# The generated protobuf types `livekit-api` speaks in. Already in the tree as
+# a transitive dependency of livekit-api; named here because we deserialize
+# `WebhookEvent` and read `DisconnectReason` directly.
+livekit-protocol = { version = "0.7.12" }
+
 # SSE / async streams
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = { version = "0.3" }

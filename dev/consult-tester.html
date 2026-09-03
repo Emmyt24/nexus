@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NexusCare consult tester</title>
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2.7.2/dist/livekit-client.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b35; --fg: #e6e9ef;
+    --muted: #8b93a3; --accent: #4f8cff; --ok: #37d67a; --warn: #f5a524; --err: #f04438;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font-size: 14px; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--line); display: flex;
+           align-items: baseline; gap: 12px; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header span { color: var(--muted); font-size: 12px; }
+  main { display: grid; grid-template-columns: 340px 1fr; gap: 0; min-height: calc(100vh - 51px); }
+  #side { border-right: 1px solid var(--line); padding: 16px; overflow-y: auto; }
+  #stage { padding: 16px; display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 0 0 14px; }
+  legend { color: var(--muted); font-size: 11px; text-transform: uppercase;
+           letter-spacing: .07em; padding: 0 6px; }
+  label { display: block; color: var(--muted); font-size: 12px; margin: 8px 0 4px; }
+  input, select { width: 100%; padding: 7px 9px; background: var(--panel); color: var(--fg);
+                  border: 1px solid var(--line); border-radius: 6px; font: inherit; font-size: 13px; }
+  button { padding: 8px 12px; border-radius: 6px; border: 1px solid var(--line);
+           background: var(--panel); color: var(--fg); font: inherit; font-size: 13px;
+           cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.danger:hover:not(:disabled) { border-color: var(--err); color: var(--err); }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .row > button { flex: 1 1 auto; }
+  #videos { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 12px; }
+  .tile { background: #000; border: 1px solid var(--line); border-radius: 8px;
+          overflow: hidden; position: relative; aspect-ratio: 4/3; }
+  .tile video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .tile .name { position: absolute; left: 8px; bottom: 8px; background: rgba(0,0,0,.65);
+                padding: 3px 8px; border-radius: 4px; font-size: 12px; }
+  .tile .placeholder { display: grid; place-items: center; height: 100%; color: var(--muted);
+                       font-size: 12px; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+        padding: 12px; overflow: auto; max-height: 34vh; font-size: 12px; line-height: 1.5;
+        margin: 0; white-space: pre-wrap; word-break: break-word; }
+  #log { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #log .t { color: var(--muted); }
+  #log .ok { color: var(--ok); } #log .warn { color: var(--warn); } #log .err { color: var(--err); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px;
+           border: 1px solid var(--line); color: var(--muted); }
+  .badge.on { border-color: var(--ok); color: var(--ok); }
+  .badge.off { border-color: var(--warn); color: var(--warn); }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .07em;
+       color: var(--muted); margin: 0 0 6px; font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>NexusCare consult tester</h1>
+  <span>POST /consult/token → room.connect() → GET /consult</span>
+  <span id="state" class="badge">idle</span>
+</header>
+
+<main>
+  <div id="side">
+    <fieldset>
+      <legend>Connection</legend>
+      <label>API base URL</label>
+      <input id="api" value="http://localhost:8080">
+      <label>Shift ID (a virtual shift, assigned &amp; accepted)</label>
+      <input id="shift" placeholder="3b2a…">
+      <label>JWT — worker or hospital admin</label>
+      <input id="jwt" placeholder="eyJhbGciOiJIUzI1NiJ9…">
+      <label>Mode</label>
+      <select id="mode">
+        <option value="participant">participant</option>
+        <option value="observer">observer (hospital admin only)</option>
+      </select>
+      <div class="row">
+        <button id="btn-token" class="primary">Get token</button>
+        <button id="btn-connect" disabled>Connect</button>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Session</legend>
+      <div class="row">
+        <button id="btn-state">Refresh state</button>
+        <button id="btn-leave">Leave</button>
+      </div>
+      <div class="row">
+        <button id="btn-disconnect" disabled>Disconnect</button>
+        <button id="btn-end" class="danger">End for everyone</button>
+      </div>
+      <label style="margin-top:12px">
+        <input type="checkbox" id="poll" style="width:auto;margin-right:6px">
+        Poll GET /consult every 5s
+      </label>
+    </fieldset>
+
+    <h2>Log</h2>
+    <pre id="log"></pre>
+  </div>
+
+  <div id="stage">
+    <div>
+      <h2>Participants</h2>
+      <div id="videos"></div>
+    </div>
+    <div>
+      <h2>Last token response</h2>
+      <pre id="token-out">—</pre>
+    </div>
+    <div>
+      <h2>GET /consult</h2>
+      <pre id="state-out">—</pre>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const LK = window.LivekitClient;
+
+let room = null;
+let lastToken = null;
+let pollTimer = null;
+
+function log(msg, cls = '') {
+  const t = new Date().toLocaleTimeString();
+  $('log').insertAdjacentHTML('afterbegin',
+    `<div><span class="t">${t}</span> <span class="${cls}">${escapeHtml(msg)}</span></div>`);
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function setState(text, cls = '') {
+  $('state').textContent = text;
+  $('state').className = 'badge ' + cls;
+}
+
+/** Every call goes out with the operator's JWT; the LiveKit key never reaches the browser. */
+async function api(method, path, body) {
+  const res = await fetch($('api').value.replace(/\/$/, '') + path, {
+    method,
+    headers: {
+      'Authorization': 'Bearer ' + $('jwt').value.trim(),
+      ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+  const text = await res.text();
+  let parsed;
+  try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
+  if (!res.ok) {
+    const msg = parsed?.error?.message ?? parsed?.error ?? text;
+    throw new Error(`HTTP ${res.status} — ${msg}`);
+  }
+  return parsed;
+}
+
+function shiftPath(suffix = '') {
+  const id = $('shift').value.trim();
+  if (!id) throw new Error('Set a shift ID first');
+  return `/api/v1/shifts/${id}/consult${suffix}`;
+}
+
+$('btn-token').onclick = async () => {
+  try {
+    const payload = { mode: $('mode').value };
+    lastToken = await api('POST', shiftPath('/token'), payload);
+    $('token-out').textContent = JSON.stringify(lastToken, null, 2);
+    log(`token issued — role=${lastToken.participant_role}, room=${lastToken.room_name}`, 'ok');
+
+    if (lastToken.mock) {
+      $('btn-connect').disabled = true;
+      setState('mock mode', 'off');
+      log('mock: true — the backend has no LiveKit credentials, so this token is fake. ' +
+          'Set LIVEKIT_API_KEY/SECRET (or run livekit-server --dev) to connect.', 'warn');
+    } else {
+      $('btn-connect').disabled = false;
+      setState('token ready', 'on');
+    }
+    await refreshState();
+  } catch (e) {
+    log(e.message, 'err');
+    setState('error', 'off');
+  }
+};
+
+$('btn-connect').onclick = async () => {
+  if (!lastToken) return;
+  try {
+    room = new LK.Room({ adaptiveStream: true, dynacast: true });
+
+    room.on(LK.RoomEvent.TrackSubscribed, (track, pub, participant) => {
+      attach(track, participant.identity, participant.name);
+    });
+    // Attaching on the event avoids racing the publish, which reaching for the
+    // publication straight after enableCameraAndMicrophone() does.
+    room.on(LK.RoomEvent.LocalTrackPublished, (pub) => {
+      if (pub.track) attach(pub.track, room.localParticipant.identity, 'You', true);
+    });
+    room.on(LK.RoomEvent.TrackUnsubscribed, (track) => track.detach().forEach(el => el.remove()));
+    room.on(LK.RoomEvent.ParticipantConnected, (p) => log(`${p.identity} joined`, 'ok'));
+    room.on(LK.RoomEvent.ParticipantDisconnected, (p) => {
+      log(`${p.identity} left`, 'warn');
+      document.querySelectorAll(`[data-identity="${CSS.escape(p.identity)}"]`).forEach(el => el.remove());
+    });
+    room.on(LK.RoomEvent.Disconnected, (reason) => {
+      log('disconnected: ' + (reason ?? 'unknown'), 'warn');
+      setState('disconnected', 'off');
+      $('btn-disconnect').disabled = true;
+      $('videos').innerHTML = '';
+    });
+
+    // The whole contract: hand `url` and `token` straight to the SDK.
+    await room.connect(lastToken.url, lastToken.token);
+    log('connected to ' + lastToken.room_name, 'ok');
+    setState('connected', 'on');
+    $('btn-disconnect').disabled = false;
+
+    if (lastToken.can_publish) {
+      await room.localParticipant.enableCameraAndMicrophone();
+    } else {
+      log('observer mode — subscribing only, not publishing');
+    }
+
+    // Clock-in is driven by the participant_joined webhook, so it lands a beat
+    // after connect() resolves. This is the poll the real client should do.
+    setTimeout(refreshState, 5000);
+  } catch (e) {
+    log('connect failed: ' + e.message, 'err');
+    setState('error', 'off');
+  }
+};
+
+function attach(track, identity, name, muted = false) {
+  if (track.kind !== 'video' && track.kind !== 'audio') return;
+  let tile = document.querySelector(`[data-identity="${CSS.escape(identity)}"]`);
+  if (!tile) {
+    tile = document.createElement('div');
+    tile.className = 'tile';
+    tile.dataset.identity = identity;
+    tile.innerHTML = `<div class="name">${escapeHtml(name || identity)}</div>`;
+    $('videos').appendChild(tile);
+  }
+  const el = track.attach();
+  if (muted) el.muted = true;          // never hear yourself
+  if (track.kind === 'video') tile.prepend(el); else tile.appendChild(el);
+}
+
+async function refreshState() {
+  try {
+    const view = await api('GET', shiftPath());
+    $('state-out').textContent = JSON.stringify(view, null, 2);
+    if (view.clock_in_recorded) setState('clocked in', 'on');
+  } catch (e) {
+    $('state-out').textContent = e.message;
+  }
+}
+$('btn-state').onclick = refreshState;
+
+$('btn-leave').onclick = async () => {
+  try {
+    const r = await api('POST', shiftPath('/leave'));
+    log(`leave recorded — ${r.remaining_participants} participant(s) still connected`, 'ok');
+    await refreshState();
+  } catch (e) { log(e.message, 'err'); }
+};
+
+$('btn-disconnect').onclick = async () => {
+  await room?.disconnect();
+  // Belt and braces: the real client fires this from beforeunload too.
+  try { await api('POST', shiftPath('/leave')); } catch { /* best effort */ }
+};
+
+$('btn-end').onclick = async () => {
+  if (!confirm('End the call for everyone?')) return;
+  try {
+    const r = await api('POST', shiftPath('/end'), { reason: 'Ended from the tester' });
+    log(`session ended at ${r.ended_at} (${r.ended_reason})`, 'warn');
+    log(r.clock_out_hint);
+    await refreshState();
+  } catch (e) { log(e.message, 'err'); }
+};
+
+$('poll').onchange = (e) => {
+  clearInterval(pollTimer);
+  if (e.target.checked) pollTimer = setInterval(refreshState, 5000);
+};
+
+// sendBeacon cannot carry an Authorization header, so it would always 401 here.
+// fetch({ keepalive: true }) can, and still survives the page going away.
+window.addEventListener('beforeunload', () => {
+  if (!room) return;
+  const id = $('shift').value.trim();
+  fetch($('api').value.replace(/\/$/, '') + `/api/v1/shifts/${id}/consult/leave`, {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + $('jwt').value.trim() },
+    keepalive: true,
+  }).catch(() => { /* the page is going away; nothing to report to */ });
+});
+
+// Prefill order: query string wins (so a seeded fixture can be handed over as a
+// link), then whatever was last used here.
+const params = new URLSearchParams(location.search);
+for (const id of ['api', 'shift', 'jwt', 'mode']) {
+  const saved = params.get(id) ?? localStorage.getItem('nx.' + id);
+  if (saved) $(id).value = saved;
+  $(id).addEventListener('change', () => localStorage.setItem('nx.' + id, $(id).value));
+}
+if (params.has('jwt')) {
+  // Keep the token out of the address bar and the browser history.
+  for (const id of ['api', 'shift', 'jwt', 'mode']) localStorage.setItem('nx.' + id, $(id).value);
+  history.replaceState(null, '', location.pathname);
+}
+
+if (!LK) log('livekit-client failed to load from the CDN — check your network', 'err');
+else log('ready. Fill in the shift ID and a JWT, then Get token.');
+</script>
+</body>
+</html>

@@ -21,7 +21,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     admin, auth, clinician_registration, distance, earnings, emails, health, here_maps, hospitals,
-    identity, location, notifications, patients, registration, shifts, uploads, wallet, webhooks,
+    identity, location, notifications, patients, registration, shifts, uploads, video, wallet,
+    webhooks,
 };
 use crate::models::patient_prediction::PipelineEvent;
 use crate::repositories::{
@@ -30,7 +31,7 @@ use crate::repositories::{
     hospital::HospitalRepository, identity_verification::IdentityVerificationRepository,
     location::LocationRepository, notification::NotificationRepository,
     patient::PatientRepository, patient_prediction::PatientPredictionRepository,
-    shift::ShiftRepository, wallet::WalletRepository,
+    shift::ShiftRepository, video_session::VideoSessionRepository, wallet::WalletRepository,
 };
 use crate::services::{
     admin_service::AdminService, audit_service::AuditService, auth_service::AuthService,
@@ -38,12 +39,12 @@ use crate::services::{
     distance_service::DistanceService, email_outbox_service::EmailOutboxService,
     encryption::EncryptionService, fcm::FcmClient, geocoding::GeocodingClient,
     here_maps::HereMapsClient, identity_verification_service::IdentityVerificationService,
-    location_service::LocationService, ml_client::MlClient,
+    livekit::LiveKitClient, location_service::LocationService, ml_client::MlClient,
     notification_service::NotificationService,
     patient_prediction_service::{PatientPredictionService, PatientPredictionWorker},
     payout_service::PayoutService, push_service::PushService,
     registration_service::RegistrationService, safehaven::SafeHavenClient,
-    shift_service::ShiftService, wallet_service::WalletService,
+    shift_service::ShiftService, video_service::VideoService, wallet_service::WalletService,
 };
 use tokio::sync::broadcast;
 
@@ -66,6 +67,7 @@ pub struct AppState {
     pub email_outbox: Arc<EmailOutboxService>,
     pub patient_repo: Arc<PatientRepository>,
     pub patient_prediction_service: Arc<PatientPredictionService>,
+    pub video_service: Arc<VideoService>,
 }
 
 #[derive(OpenApi)]
@@ -194,8 +196,14 @@ pub struct AppState {
         // Patients / ML pipeline
         crate::handlers::patients::ingest_patient,
         crate::handlers::patients::get_patient,
+        // Virtual consultations (LiveKit)
+        crate::handlers::video::issue_join_token,
+        crate::handlers::video::get_session,
+        crate::handlers::video::leave_session,
+        crate::handlers::video::end_session,
         // Webhooks
         crate::handlers::webhooks::safehaven_webhook,
+        crate::handlers::webhooks::livekit_webhook,
         // Earnings
         crate::handlers::earnings::get_earnings,
         // Notifications & devices
@@ -250,6 +258,21 @@ pub struct AppState {
             crate::models::shift::ClockinApprovalRequest,
             crate::models::shift::ClockinApprovalDecisionRequest,
             crate::models::shift::ClockinApprovalRecord,
+            // Virtual consultations (LiveKit). No ErrorResponse here on
+            // purpose — video.rs reuses the shifts one.
+            crate::models::video_session::JoinConsultRequest,
+            crate::models::video_session::JoinConsultResponse,
+            crate::models::video_session::ConsultSessionView,
+            crate::models::video_session::ConsultParticipantView,
+            crate::models::video_session::ConsultShiftSummary,
+            crate::models::video_session::ConsultClockInView,
+            crate::models::video_session::ConsultRecordingView,
+            crate::models::video_session::EndConsultRequest,
+            crate::models::video_session::EndConsultResponse,
+            crate::models::video_session::LeaveConsultResponse,
+            crate::models::video_session::ParticipantRole,
+            crate::models::video_session::JoinMode,
+            crate::models::video_session::VideoSessionStatus,
             // Patients / ML pipeline
             crate::models::patient::NewPatientRequest,
             crate::models::patient::PatientResponse,
@@ -433,7 +456,8 @@ pub struct AppState {
         (name = "location", description = "Location services — nearby facilities, address autocomplete, HERE Maps integration"),
         (name = "admin", description = "Admin-only endpoints"),
         (name = "wallet", description = "Hospital wallet — balance, deposits, ledger (Tier 2)"),
-        (name = "webhooks", description = "Inbound webhooks from external providers (SafeHaven)"),
+        (name = "video", description = "Virtual consultations — LiveKit rooms, join tokens, and session state"),
+        (name = "webhooks", description = "Inbound webhooks from external providers (SafeHaven, LiveKit)"),
         (name = "earnings", description = "Worker earnings — totals + transaction history"),
         (name = "identity", description = "BVN/NIN identity verification and bank list"),
         (name = "notifications", description = "Device push-token registration and the in-app notification center"),
@@ -555,7 +579,7 @@ pub fn create_router(
 
     // Initialize shift service
     let shift_service = Arc::new(ShiftService::new(
-        shift_repo,
+        shift_repo.clone(),
         pool.clone(),
         notification_service.clone(),
         email_outbox_service.clone(),
@@ -570,6 +594,22 @@ pub fn create_router(
         clinician_repo.clone(),
         safehaven_client.clone(),
         encryption_service.clone(),
+    ));
+
+    // LiveKit video consultations. Mock unless LIVEKIT_API_KEY/SECRET are set,
+    // so local dev and CI need no credentials. VideoService depends on
+    // ShiftService and never the reverse, which is why there is no Arc cycle.
+    let livekit_client = Arc::new(LiveKitClient::from_env());
+    if livekit_client.is_mock() {
+        tracing::warn!("LiveKit running in MOCK mode — join tokens are fake");
+    }
+    let video_repo = Arc::new(VideoSessionRepository::new(pool.clone()));
+    let video_service = Arc::new(VideoService::new(
+        video_repo,
+        shift_repo.clone(),
+        shift_service.clone(),
+        livekit_client,
+        push_service.clone(),
     ));
 
     let admin_repo = Arc::new(AdminRepository::new(pool.clone()));
@@ -609,6 +649,7 @@ pub fn create_router(
         email_outbox: email_outbox_service.clone(),
         patient_repo: patient_repo.clone(),
         patient_prediction_service,
+        video_service,
     };
 
     let api_router = Router::new()
@@ -903,6 +944,41 @@ pub fn create_router(
                 UserRole::SuperAdmin,
             ]))),
         )
+        // ---- Virtual consultations (LiveKit). The role guard is coarse on
+        // purpose: VideoService does the fine-grained check against
+        // shifts.assigned_clinician_id / claims.hospital_id, which is the only
+        // place that knows which hospital owns the shift.
+        .route(
+            "/api/v1/shifts/{shift_id}/consult/token",
+            post(video::issue_join_token).route_layer(from_fn(require_role(&[
+                UserRole::HealthWorker,
+                UserRole::HospitalAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/shifts/{shift_id}/consult/leave",
+            post(video::leave_session).route_layer(from_fn(require_role(&[
+                UserRole::HealthWorker,
+                UserRole::HospitalAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/shifts/{shift_id}/consult",
+            get(video::get_session).route_layer(from_fn(require_role(&[
+                UserRole::HealthWorker,
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+                UserRole::OperationsAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/shifts/{shift_id}/consult/end",
+            post(video::end_session).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+                UserRole::OperationsAdmin,
+            ]))),
+        )
         // ---- Wallet — HospitalAdmin/SuperAdmin only.
         .route(
             "/api/v1/wallet",
@@ -999,6 +1075,8 @@ pub fn create_router(
             "/api/v1/webhooks/safehaven",
             post(webhooks::safehaven_webhook),
         )
+        // Authenticated by LiveKit's own signed JWT, not ours.
+        .route("/api/v1/webhooks/livekit", post(webhooks::livekit_webhook))
         // ---- Worker earnings — HealthWorker only.
         .route(
             "/api/v1/worker/earnings",

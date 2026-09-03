@@ -318,11 +318,155 @@ mod integration_tests {
         // Verify error returned
     }
 
-    /// Integration test placeholder - virtual link generation
+    /// AC-04 — a virtual shift is given an app deep link; an in-person one is
+    /// not. Skips when no test database is reachable, like the rest of the
+    /// suite.
     #[tokio::test]
-    #[ignore]
     async fn test_virtual_link_generation_integration() {
-        // Create virtual shift
-        // Verify virtual link is generated and stored
+        let Some(pool) = test_pool().await else { return };
+        let service = shift_service(&pool);
+        let (hospital_id, user_id) = seed_funded_hospital(&pool).await;
+
+        let mut virtual_request = create_valid_shift_request();
+        virtual_request.shift_type = ShiftType::Virtual;
+        let virtual_shift = service
+            .create_shift(hospital_id, user_id, virtual_request)
+            .await
+            .expect("a funded, approved hospital can create a virtual shift");
+
+        let base = std::env::var("APP_PUBLIC_BASE_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "https://app.nexuscare.com".to_string());
+        let expected = format!(
+            "{}/consults/{}",
+            base.trim_end_matches('/'),
+            virtual_shift.id
+        );
+
+        assert_eq!(virtual_link(&pool, virtual_shift.id).await.as_deref(), Some(expected.as_str()));
+
+        // A distinct role title, so the duplicate-shift guard (hospital +
+        // title + start) does not reject the second create.
+        let mut in_person_request = create_valid_shift_request();
+        in_person_request.role_title = "ICU Nurse".to_string();
+        let in_person_shift = service
+            .create_shift(hospital_id, user_id, in_person_request)
+            .await
+            .expect("and an in-person one");
+
+        assert_eq!(
+            virtual_link(&pool, in_person_shift.id).await,
+            None,
+            "in-person shifts have no consultation to link to"
+        );
     }
+}
+
+// Database-backed helpers. `test_pool` skips with a notice rather than failing
+// when no Postgres is reachable, matching tests/patient_ingest_tests.rs.
+
+async fn test_pool() -> Option<PgPool> {
+    let url = std::env::var("TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://ndii@localhost:5432/nexuscare_test".to_string());
+
+    let pool = match sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("SKIPPED: no test database reachable at {url}: {e}");
+            return None;
+        }
+    };
+
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("failed to run migrations against test database");
+
+    Some(pool)
+}
+
+fn shift_service(pool: &PgPool) -> Arc<ShiftService> {
+    use nexuscare_backend::repositories::notification::NotificationRepository;
+    use nexuscare_backend::repositories::wallet::WalletRepository;
+    use nexuscare_backend::repositories::EmailOutboxRepository;
+    use nexuscare_backend::services::email_outbox_service::EmailOutboxService;
+    use nexuscare_backend::services::fcm::FcmClient;
+    use nexuscare_backend::services::push_service::PushService;
+    use nexuscare_backend::services::safehaven::SafeHavenClient;
+    use nexuscare_backend::services::wallet_service::WalletService;
+
+    let notification_service = Arc::new(NotificationService::new());
+    Arc::new(ShiftService::new(
+        Arc::new(ShiftRepository::new(pool.clone())),
+        pool.clone(),
+        notification_service.clone(),
+        Arc::new(EmailOutboxService::new(
+            Arc::new(EmailOutboxRepository::new(pool.clone())),
+            notification_service,
+        )),
+        Arc::new(WalletService::new(
+            Arc::new(WalletRepository::new(pool.clone())),
+            Arc::new(SafeHavenClient::from_env()),
+            pool.clone(),
+        )),
+        Arc::new(PushService::new(
+            Arc::new(NotificationRepository::new(pool.clone())),
+            Arc::new(FcmClient::from_env()),
+        )),
+    ))
+}
+
+/// An approved hospital with enough wallet balance to cover the shift hold,
+/// plus the admin user that creates the shift.
+async fn seed_funded_hospital(pool: &PgPool) -> (Uuid, Uuid) {
+    let hospital_id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO hospitals (name, registration_number, email, address, phone_number,
+                               admin_registration_status)
+        VALUES ($1, $2, $3, 'Test Address', '08000000000', 'approved')
+        RETURNING id
+        "#,
+    )
+    .bind(format!("Test Hospital {}", Uuid::new_v4()))
+    .bind(format!("RC-{}", &Uuid::new_v4().to_string()[..8]))
+    .bind(format!("{}@example.test", Uuid::new_v4()))
+    .fetch_one(pool)
+    .await
+    .expect("failed to seed hospital");
+
+    let user_id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO users (email, first_name, last_name, password_hash, role, hospital_id)
+        VALUES ($1, 'Test', 'Admin', 'not-a-real-hash', 'hospital_admin', $2)
+        RETURNING id
+        "#,
+    )
+    .bind(format!("{}@example.test", Uuid::new_v4()))
+    .bind(hospital_id)
+    .fetch_one(pool)
+    .await
+    .expect("failed to seed hospital admin");
+
+    sqlx::query(
+        "INSERT INTO hospital_wallets (hospital_id, balance_kobo) VALUES ($1, 100000000)",
+    )
+    .bind(hospital_id)
+    .execute(pool)
+    .await
+    .expect("failed to fund wallet");
+
+    (hospital_id, user_id)
+}
+
+async fn virtual_link(pool: &PgPool, shift_id: Uuid) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT virtual_link FROM shifts WHERE id = $1")
+        .bind(shift_id)
+        .fetch_one(pool)
+        .await
+        .expect("failed to read virtual_link")
 }

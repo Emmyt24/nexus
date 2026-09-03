@@ -10,6 +10,7 @@ pub mod notification;
 pub mod patient;
 pub mod patient_prediction;
 pub mod shift;
+pub mod video_session;
 pub mod wallet;
 
 pub use admin::AdminRepository;
@@ -22,4 +23,5 @@ pub use identity_verification::{IdentityRepoError, IdentityVerificationRepositor
 pub use location::LocationRepository;
 pub use patient::{PatientRepository, RepositoryError as PatientRepoError};
 pub use patient_prediction::PatientPredictionRepository;
+pub use video_session::VideoSessionRepository;
 pub use wallet::{WalletRepoError, WalletRepository};

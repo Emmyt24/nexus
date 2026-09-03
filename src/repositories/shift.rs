@@ -507,6 +507,67 @@ impl ShiftRepository {
         Ok(id)
     }
 
+    /// Idempotent clock-in for the LiveKit `participant_joined` path. Unlike
+    /// `record_clockin_tx`, an existing clock-in is NEVER overwritten: a rejoin
+    /// after a dropped connection must not reset `clockin_at` / `late_minutes`
+    /// and so shorten the worker's paid hours. The guard is in the same
+    /// statement as the write, because two webhook deliveries processed
+    /// concurrently would both pass a read-then-write check.
+    ///
+    /// Returns `None` when a clock-in already existed.
+    pub async fn record_clockin_if_absent_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        shift_id: Uuid,
+        clinician_id: Uuid,
+        method: &crate::models::shift::ClockinMethod,
+        late_minutes: i32,
+        late_penalty_applied: bool,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        let id: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            INSERT INTO shift_attendance
+                (shift_id, clinician_id, clockin_at, clockin_method,
+                 late_minutes, late_penalty_applied)
+            VALUES ($1, $2, NOW(), $3, $4, $5)
+            ON CONFLICT (shift_id) DO UPDATE
+               SET clockin_at           = NOW(),
+                   clockin_method       = EXCLUDED.clockin_method,
+                   late_minutes         = EXCLUDED.late_minutes,
+                   late_penalty_applied = EXCLUDED.late_penalty_applied,
+                   updated_at           = NOW()
+             WHERE shift_attendance.clockin_at IS NULL   -- first write wins, always
+            RETURNING id
+            "#,
+        )
+        .bind(shift_id)
+        .bind(clinician_id)
+        .bind(method)
+        .bind(late_minutes)
+        .bind(late_penalty_applied)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        if id.is_some() {
+            // Guarded so a stray join after clock-out can never resurrect a
+            // completed shift into 'in_progress'.
+            sqlx::query(
+                r#"
+                UPDATE shifts
+                   SET status     = 'in_progress',
+                       updated_at = NOW()
+                 WHERE id = $1
+                   AND status IN ('assigned', 'upcoming')
+                "#,
+            )
+            .bind(shift_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+
+        Ok(id)
+    }
+
     /// Upsert a handover row for the given shift.
 
     pub async fn upsert_handover(

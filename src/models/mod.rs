@@ -17,4 +17,5 @@ pub mod patient_prediction;
 pub mod registration;
 pub mod shift;
 pub mod user;
+pub mod video_session;
 pub mod wallet;
