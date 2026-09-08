@@ -14,3 +14,6 @@ ml-service/**/__pycache__/
 # ML artifacts — trained models and exports (generated, not source)
 ml-service/models/*.pkl
 ml-service/data/patients_export.csv
+
+# Frontend hand-off doc (kept local, shared with the frontend team directly)
+docs/FRONTEND_FIXES_IMPLEMENTATION.md
