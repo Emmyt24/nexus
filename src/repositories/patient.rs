@@ -75,27 +75,9 @@ impl PatientRepository {
         Ok(patient)
     }
 
-    pub async fn find_by_id(&self, id: Uuid) -> Result<Option<Patient>, RepositoryError> {
-        let patient = sqlx::query_as::<_, Patient>(
-            r#"
-            SELECT
-                id, hospital_id, created_by, full_name, age, gender, blood_group, genotype,
-                height_cm, weight_kg, symptoms, existing_conditions, disease_type,
-                severity_level, weather_condition, smoking_status, alcohol_consumption,
-                exercise_habits, diet_type, water_source, patient_category, predictive_risk_score,
-                created_at, updated_at
-            FROM patients
-            WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(patient)
-    }
-
-    pub async fn find_by_hospital(
+    /// Most recent patients for a hospital, newest first — backs the
+    /// hospital/health-worker "Patients" list page.
+    pub async fn list_by_hospital(
         &self,
         hospital_id: Uuid,
         limit: i64,
@@ -120,5 +102,25 @@ impl PatientRepository {
         .await?;
 
         Ok(patients)
+    }
+
+    pub async fn find_by_id(&self, id: Uuid) -> Result<Option<Patient>, RepositoryError> {
+        let patient = sqlx::query_as::<_, Patient>(
+            r#"
+            SELECT
+                id, hospital_id, created_by, full_name, age, gender, blood_group, genotype,
+                height_cm, weight_kg, symptoms, existing_conditions, disease_type,
+                severity_level, weather_condition, smoking_status, alcohol_consumption,
+                exercise_habits, diet_type, water_source, patient_category, predictive_risk_score,
+                created_at, updated_at
+            FROM patients
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(patient)
     }
 }

@@ -5,6 +5,7 @@ pub mod admin_registration;
 pub mod billing;
 pub mod clinician;
 pub mod clinician_registration;
+pub mod consultation_note;
 pub mod distance;
 pub mod email_outbox;
 pub mod here_maps;

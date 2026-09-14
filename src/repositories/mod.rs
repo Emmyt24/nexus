@@ -2,6 +2,7 @@ pub mod admin;
 pub mod audit;
 pub mod billing;
 pub mod clinician;
+pub mod consultation_note;
 pub mod email_outbox;
 pub mod hospital;
 pub mod identity_verification;
@@ -17,6 +18,9 @@ pub use admin::AdminRepository;
 pub use audit::AuditRepository;
 pub use billing::BillingRepository;
 pub use clinician::{ClinicianRepoError, ClinicianRepository};
+pub use consultation_note::{
+    ConsultationNoteRepository, RepositoryError as ConsultationNoteRepoError,
+};
 pub use email_outbox::EmailOutboxRepository;
 pub use hospital::HospitalRepository;
 pub use identity_verification::{IdentityRepoError, IdentityVerificationRepository};

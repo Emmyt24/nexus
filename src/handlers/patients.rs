@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -41,6 +41,12 @@ pub struct PatientDetailResponse {
     #[serde(flatten)]
     pub patient: PatientResponse,
     pub prediction: Option<PredictionResponse>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ListPatientsQuery {
+    /// Max rows to return, newest first. Defaults to 50, capped at 200.
+    pub limit: Option<i64>,
 }
 
 fn map_prediction_error(e: PatientPredictionError) -> AppError {
@@ -159,17 +165,19 @@ pub async fn get_patient(
 #[utoipa::path(
     get,
     path = "/api/v1/patients",
+    params(("limit" = Option<i64>, Query, description = "Max rows, newest first (default 50, capped 200)")),
     responses(
-        (status = 200, description = "List of patients for hospital", body = Vec<PatientDetailResponse>),
+        (status = 200, description = "Recent patients for the caller's hospital, each with its latest prediction", body = [PatientDetailResponse]),
         (status = 403, description = "No hospital associated with this account", body = ErrorResponse)
     ),
     tag = "patients",
-    summary = "List patients for the hospital",
-    description = "Returns patients belonging to the caller's hospital along with their latest prediction."
+    summary = "List recent patients for the caller's hospital",
+    description = "Newest first. Each row includes its latest prediction if one has completed (or null while still pending)."
 )]
 pub async fn list_patients(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ListPatientsQuery>,
 ) -> AppResult<Json<Vec<PatientDetailResponse>>> {
     let claims = extract_claims(&headers)?;
     let hospital_id = claims
@@ -180,25 +188,20 @@ pub async fn list_patients(
             AppError::Forbidden("No hospital associated with this account".to_string())
         })?;
 
-    let patients = state
-        .patient_repo
-        .find_by_hospital(hospital_id, 50)
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+
+    let rows = state
+        .patient_prediction_service
+        .list_for_hospital(hospital_id, limit)
         .await
-        .map_err(|e| AppError::InternalServerError(e.to_string()))?;
+        .map_err(map_prediction_error)?;
 
-    let mut result = Vec::with_capacity(patients.len());
-    for p in patients {
-        let prediction = state
-            .patient_prediction_service
-            .latest_for_patient(p.id)
-            .await
-            .map_err(map_prediction_error)?;
-        result.push(PatientDetailResponse {
-            patient: PatientResponse::from(p),
-            prediction,
-        });
-    }
-
-    Ok(Json(result))
+    Ok(Json(
+        rows.into_iter()
+            .map(|(patient, prediction)| PatientDetailResponse {
+                patient: PatientResponse::from(patient),
+                prediction,
+            })
+            .collect(),
+    ))
 }
-

@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod auth;
 pub mod clinician_registration;
+pub mod consultation_notes;
 pub mod distance;
 pub mod earnings;
 pub mod emails;

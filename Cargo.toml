@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Web framework
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "multipart"] }
 tokio = { version = "1.44.2", features = ["full"] }
 tower = { version = "0.5.2" }
 tower-http = { version = "0.6.4", features = ["cors", "trace"] }
@@ -60,7 +60,7 @@ base64 = { version = "0.22.1" }
 jsonwebtoken = { version = "9.3.1" }
 
 # HTTP client (for CAC verification calls)
-reqwest = { version = "0.12.15", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12.15", features = ["json", "rustls-tls", "multipart"], default-features = false }
 
 # LiveKit server SDK — access-token minting, Room Service API, webhook
 # verification. Server-side only: this crate is pure Rust/HTTP. The `livekit`

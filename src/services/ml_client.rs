@@ -115,6 +115,14 @@ pub struct MlHealthResponse {
     pub models_loaded: bool,
 }
 
+/// Mirrors `POST /transcribe`'s response shape.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TranscribeResponse {
+    pub text: String,
+    pub language: String,
+    pub duration_seconds: f32,
+}
+
 #[derive(Debug, Clone)]
 pub struct MlClient {
     http: Client,
@@ -172,6 +180,48 @@ impl MlClient {
 
         let url = format!("{}/predict/full", self.base_url);
         let resp = self.http.post(&url).json(req).send().await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(MlClientError::BadStatus(status, text));
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Transcribes one consultation audio chunk. In mock mode, returns a
+    /// canned response so local dev/tests don't need the Whisper model
+    /// downloaded — real transcription only happens against a live ml-service.
+    pub async fn transcribe(
+        &self,
+        audio_bytes: Vec<u8>,
+        filename: &str,
+    ) -> Result<TranscribeResponse, MlClientError> {
+        if self.is_mock() {
+            tracing::info!("[ML-CLIENT MOCK] transcribe filename={filename}");
+            return Ok(TranscribeResponse {
+                text: String::new(),
+                language: "en".to_string(),
+                duration_seconds: 0.0,
+            });
+        }
+
+        let part = reqwest::multipart::Part::bytes(audio_bytes)
+            .file_name(filename.to_string());
+        let form = reqwest::multipart::Form::new().part("audio", part);
+
+        let url = format!("{}/transcribe", self.base_url);
+        // Longer than the client's default 30s: the first call in the
+        // process lazy-loads the Whisper model (voice.py), which can take
+        // well past 30s including a first-ever model download.
+        let resp = self
+            .http
+            .post(&url)
+            .multipart(form)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();

@@ -1,6 +1,6 @@
 """
 NexusCare ML Service — FastAPI
-Serves 4 trained models for the Rust NestJS backend.
+Serves 4 trained models for the Rust Axum backend.
 
 Endpoints:
   POST /predict/diagnosis
@@ -9,11 +9,14 @@ Endpoints:
   POST /predict/routing
   POST /predict/full          ← all 4 in one call
   POST /retrain               ← triggers background retraining
+  POST /transcribe            ← speech-to-text for one consultation audio chunk
   GET  /health
   GET  /models/info
 """
 import json
+import logging
 import os
+import sys
 import asyncio
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -21,11 +24,22 @@ from typing import Optional
 import joblib
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Depends
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
+import voice
+
 load_dotenv()
+
+logger = logging.getLogger("nexuscare_ml")
+logging.basicConfig(level=logging.INFO)
+
+# Below this, a prediction is flagged `low_confidence` in the response so
+# callers (and the frontend) can surface it instead of presenting it as a
+# settled answer — most relevant to the recommendation model, whose macro F1
+# on synthetic data is materially weaker than diagnosis/risk (see README).
+LOW_CONFIDENCE_THRESHOLD = 0.5
 
 # Comma-separated list of origins allowed to call this API from a browser, e.g.
 # "https://admin.nexuscare.example.com". Server-to-server calls (the Rust
@@ -41,7 +55,11 @@ RETRAIN_API_KEY = os.getenv("ML_RETRAIN_API_KEY")
 
 
 def require_retrain_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")):
-    if RETRAIN_API_KEY and x_api_key != RETRAIN_API_KEY:
+    # No bypass when RETRAIN_API_KEY is unset — /retrain and /export-training-data
+    # shell out to trusted scripts and touch the DB, so "no key configured" must
+    # mean "nobody can call this," not "anybody can." Set ML_RETRAIN_API_KEY
+    # (see .env.example) even for local dev if you need these endpoints.
+    if not RETRAIN_API_KEY or x_api_key != RETRAIN_API_KEY:
         raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key")
 
 # ─── Model registry ───────────────────────────────────────────────────────────
@@ -78,7 +96,7 @@ async def lifespan(app: FastAPI):
     if not ALLOWED_ORIGINS:
         print("⚠ ALLOWED_ORIGINS not set — no browser origins are permitted (server-to-server calls are unaffected).")
     if not RETRAIN_API_KEY:
-        print("⚠ ML_RETRAIN_API_KEY not set — /retrain and /export-training-data are UNAUTHENTICATED. Set it before deploying publicly.")
+        print("⚠ ML_RETRAIN_API_KEY not set — /retrain and /export-training-data will reject every request until it's set (see .env.example).")
     yield
 
 
@@ -129,12 +147,27 @@ class PatientFeatures(BaseModel):
 
 # ─── Preprocessing ─────────────────────────────────────────────────────────────
 
-def safe_encode(le, value: str, fallback: int = 0) -> int:
-    """Encode a value with the LabelEncoder; return fallback if unseen."""
+def safe_encode(le, value: str, feature_name: str = "") -> int:
+    """Encode a value with the LabelEncoder.
+
+    Falls back to the trained "Unknown" class (guaranteed present as of
+    train_models.py's build_encoders) rather than a hardcoded index — index 0
+    is whatever category happened to sort first for that column (e.g. "Daily"
+    exercise), so silently defaulting to it previously biased predictions
+    toward a real, wrong category instead of an honest "don't know".
+    """
     try:
         return int(le.transform([value])[0])
     except (ValueError, KeyError):
-        return fallback
+        logger.warning(
+            "Unseen category %r for feature %r — falling back to 'Unknown'",
+            value, feature_name or "?",
+        )
+        try:
+            return int(le.transform(["Unknown"])[0])
+        except (ValueError, KeyError):
+            logger.error("'Unknown' class missing for feature %r — model needs retraining", feature_name)
+            return 0
 
 
 def preprocess(data: PatientFeatures) -> dict:
@@ -161,16 +194,16 @@ def preprocess(data: PatientFeatures) -> dict:
     age_norm, height_norm, weight_norm, risk_norm = raw_scaled[0]
 
     # Encode categoricals
-    blood_enc   = safe_encode(enc["blood_group"], data.blood_group or "O+")
-    genotype_enc = safe_encode(enc["genotype"], data.genotype or "AA")
-    gender_enc  = safe_encode(enc["gender"], data.gender or "Male")
-    disease_enc = safe_encode(enc["disease_type"], data.disease_type or "Infectious")
-    severity_enc = safe_encode(enc["severity_level"], data.severity_level or "Mild")
-    weather_enc = safe_encode(enc["weather_condition"], data.weather_condition or "Dry")
-    category_enc = safe_encode(enc["patient_category"], data.patient_category or "Adult")
-    exercise_enc = safe_encode(enc["exercise_habits"], data.exercise_habits or "Weekly")
-    diet_enc    = safe_encode(enc["diet_type"], data.diet_type or "Mixed")
-    water_enc   = safe_encode(enc["water_source"], data.water_source or "Tap")
+    blood_enc   = safe_encode(enc["blood_group"], data.blood_group or "O+", "blood_group")
+    genotype_enc = safe_encode(enc["genotype"], data.genotype or "AA", "genotype")
+    gender_enc  = safe_encode(enc["gender"], data.gender or "Male", "gender")
+    disease_enc = safe_encode(enc["disease_type"], data.disease_type or "Infectious", "disease_type")
+    severity_enc = safe_encode(enc["severity_level"], data.severity_level or "Mild", "severity_level")
+    weather_enc = safe_encode(enc["weather_condition"], data.weather_condition or "Dry", "weather_condition")
+    category_enc = safe_encode(enc["patient_category"], data.patient_category or "Adult", "patient_category")
+    exercise_enc = safe_encode(enc["exercise_habits"], data.exercise_habits or "Weekly", "exercise_habits")
+    diet_enc    = safe_encode(enc["diet_type"], data.diet_type or "Mixed", "diet_type")
+    water_enc   = safe_encode(enc["water_source"], data.water_source or "Tap", "water_source")
 
     severity_ordinal = {"Mild": 0, "Moderate": 1, "Severe": 2, "Critical": 3}.get(
         data.severity_level or "Mild", 0
@@ -224,16 +257,19 @@ def _predict_diagnosis(f: dict) -> dict:
 
         proba = ModelRegistry.diagnosis_model.predict_proba(X)[0]
         idx = int(np.argmax(proba))
+        confidence = round(float(proba[idx]), 4)
         return {
             "probable_condition": str(enc["disease_type"].classes_[idx]),
-            "confidence": round(float(proba[idx]), 4),
+            "confidence": confidence,
+            "low_confidence": confidence < LOW_CONFIDENCE_THRESHOLD,
             "all_probabilities": {
                 str(cls): round(float(p), 4)
                 for cls, p in zip(enc["disease_type"].classes_, proba)
             },
         }
 
-    # Heuristic fallback based on symptoms / severity
+    # Heuristic fallback based on symptoms / severity — used only when models
+    # aren't loaded. Not a real prediction, so always low_confidence.
     symptoms = (f.get("symptoms") or "").lower()
     if "chest" in symptoms or "shortness of breath" in symptoms or "cardiac" in symptoms:
         condition = "Cardiovascular Disease"
@@ -251,6 +287,7 @@ def _predict_diagnosis(f: dict) -> dict:
     return {
         "probable_condition": condition,
         "confidence": conf,
+        "low_confidence": True,
         "all_probabilities": {condition: conf},
     }
 
@@ -275,14 +312,17 @@ def _predict_risk(f: dict) -> dict:
             for cls, p in zip(enc["mortality_risk"].classes_, proba)
         }
         high_prob = risk_proba.get("High", 0.0)
+        risk_score = round(float(max(proba)), 4)
 
         return {
             "risk_level": risk_level,
-            "risk_score": round(float(max(proba)), 4),
+            "risk_score": risk_score,
+            "low_confidence": risk_score < LOW_CONFIDENCE_THRESHOLD,
             "deterioration_probability": round(high_prob, 4),
             "all_probabilities": risk_proba,
         }
 
+    # Heuristic fallback — used only when models aren't loaded.
     sev = (f.get("severity_level") or "Mild").lower()
     if sev in ["critical", "severe"]:
         level = "High"
@@ -297,6 +337,7 @@ def _predict_risk(f: dict) -> dict:
     return {
         "risk_level": level,
         "risk_score": score,
+        "low_confidence": True,
         "deterioration_probability": score,
         "all_probabilities": {level: score},
     }
@@ -305,7 +346,7 @@ def _predict_risk(f: dict) -> dict:
 def _predict_recommendation(f: dict, disease_type: Optional[str]) -> dict:
     if ModelRegistry.loaded and ModelRegistry.recommendation_model:
         enc = ModelRegistry.encoders
-        disease_enc = safe_encode(enc["disease_type"], disease_type or "Infectious")
+        disease_enc = safe_encode(enc["disease_type"], disease_type or "Infectious", "disease_type")
 
         X = np.array([
             disease_enc, f["risk_norm"], f["smoking"], f["alcohol"],
@@ -324,7 +365,12 @@ def _predict_recommendation(f: dict, disease_type: Optional[str]) -> dict:
             recs.append("Stop smoking — significantly reduces cardiovascular risk")
         if f["alcohol"]:
             recs.append("Reduce alcohol consumption")
-        if f["exercise_enc"] == safe_encode(enc["exercise_habits"], "None"):
+        # "Sedentary" (not "None" — see generate_training_data.py) is the actual
+        # trained category; comparing against "None" here always fell through to
+        # safe_encode's old hardcoded fallback (index 0, some *real* category —
+        # e.g. "Daily"), so this recommendation could previously fire for
+        # patients who exercise daily and never fire for genuinely sedentary ones.
+        if f["exercise_enc"] == safe_encode(enc["exercise_habits"], "Sedentary", "exercise_habits"):
             recs.append("Begin light exercise routine — 30 min walk 3x/week")
 
         risk_score_raw = f["risk_norm"]
@@ -333,10 +379,13 @@ def _predict_recommendation(f: dict, disease_type: Optional[str]) -> dict:
         return {
             "drug_recommendation": drug,
             "confidence": confidence,
+            "low_confidence": confidence < LOW_CONFIDENCE_THRESHOLD,
             "recommendations": recs,
             "urgency": urgency,
         }
 
+    # Heuristic fallback — used only when models aren't loaded. Never a
+    # substitute for the trained model's output, so always low_confidence.
     symptoms = (f.get("symptoms") or "").lower()
     if "chest" in symptoms or "cardiac" in symptoms:
         drug = "Aspirin + Nitroglycerin"
@@ -351,6 +400,7 @@ def _predict_recommendation(f: dict, disease_type: Optional[str]) -> dict:
     return {
         "drug_recommendation": drug,
         "confidence": 0.85,
+        "low_confidence": True,
         "recommendations": [f"Recommended treatment: {drug}", "Ensure adequate hydration and bed rest"],
         "urgency": urgency,
     }
@@ -417,9 +467,12 @@ def health():
 def models_info():
     _require_models()
     enc = ModelRegistry.encoders
+    # "Unknown" is safe_encode()'s internal fallback bucket (see build_encoders
+    # in train_models.py) — never a real disease/risk category, so it's
+    # dropped here rather than shown as a selectable class to API consumers.
     return {
-        "disease_classes": list(enc["disease_type"].classes_),
-        "mortality_risk_classes": list(enc["mortality_risk"].classes_),
+        "disease_classes": [c for c in enc["disease_type"].classes_ if c != "Unknown"],
+        "mortality_risk_classes": [c for c in enc["mortality_risk"].classes_ if c != "Unknown"],
         "drug_classes": list(ModelRegistry.drug_le.classes_),
         "symptoms_vocab_size": len(enc["symptoms_cols"]),
         "conditions_vocab_size": len(enc["conditions_cols"]),
@@ -467,13 +520,31 @@ def predict_full(data: PatientFeatures):
     }
 
 
+@app.post("/transcribe")
+async def transcribe(audio: UploadFile = File(...)):
+    """
+    Transcribe one consultation audio chunk (the Rust backend forwards
+    whatever the browser's MediaRecorder produced — webm/opus in practice).
+    Runs self-hosted Whisper (faster-whisper); no audio leaves this service.
+    """
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=422, detail="Empty audio upload")
+    try:
+        result = voice.transcribe_audio_bytes(audio_bytes, audio.filename or "chunk.webm")
+    except Exception as e:
+        logger.exception("Transcription failed")
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
+    return result
+
+
 @app.post("/export-training-data", dependencies=[Depends(require_retrain_key)])
 async def export_training_data(background_tasks: BackgroundTasks):
     """Export patient_training_data table to data/patients_export.csv."""
     def _run_export():
         import subprocess
         result = subprocess.run(
-            ["python", "seed_database.py", "--export"],
+            [sys.executable, "seed_database.py", "--export"],
             capture_output=True, text=True, cwd=os.getcwd(), env={**os.environ}
         )
         if result.returncode == 0:
@@ -497,7 +568,7 @@ async def retrain(background_tasks: BackgroundTasks):
         import subprocess
         env = {**os.environ}
         result = subprocess.run(
-            ["python", "train_models.py", "--from-db"],
+            [sys.executable, "train_models.py", "--from-db"],
             capture_output=True, text=True, cwd=os.getcwd(), env=env
         )
         if result.returncode == 0:

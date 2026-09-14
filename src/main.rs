@@ -14,7 +14,8 @@ use nexuscare_backend::schedulers::{
     VideoSessionReconciler,
 };
 use nexuscare_backend::services::{
-    EmailOutboxService, EmailOutboxWorker, NotificationService, PatientPredictionWorker,
+    EmailOutboxService, EmailOutboxWorker, MlServiceHandle, NotificationService,
+    PatientPredictionWorker,
 };
 use nexuscare_backend::utils::AppConfig;
 
@@ -44,7 +45,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Load configuration
     let cfg = AppConfig::from_env().context("Failed to load configuration")?;
-    // and don't pin idle connections open (so Neon can autosuspend).
+
+    // Local-dev convenience: auto-start ml-service (FastAPI/uvicorn) so
+    // `cargo run` alone brings up the whole patient-triage pipeline. No-ops
+    // when ML_SERVICE_URL isn't localhost (deployed envs run it separately)
+    // or when ML_SERVICE_AUTOSTART=false. See services/ml_service_launcher.rs.
+    let ml_service_url = std::env::var("ML_SERVICE_URL").unwrap_or_default();
+    let ml_service_handle = MlServiceHandle::maybe_spawn(&ml_service_url).await;
+
+    // Connect to database — require SSL for non-local hosts, and don't pin
+    // idle connections open (so Neon can autosuspend).
     let mut connect_opts =
         PgConnectOptions::from_str(&cfg.database.url).context("invalid DATABASE_URL")?;
     let host = connect_opts.get_host().to_string();
@@ -121,7 +131,17 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("NexusCare backend listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+
+    tokio::select! {
+        result = axum::serve(listener, app) => {
+            result?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Shutting down");
+        }
+    }
+
+    ml_service_handle.shutdown().await;
 
     Ok(())
 }

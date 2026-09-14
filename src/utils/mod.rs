@@ -9,4 +9,4 @@ pub use db::*;
 pub use errors::*;
 pub use validation::*;
 pub mod jwt;
-pub use jwt::extract_claims;
+pub use jwt::{extract_claims, extract_claims_with_query_fallback};

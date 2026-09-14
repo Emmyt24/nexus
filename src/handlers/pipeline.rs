@@ -1,33 +1,45 @@
 use std::convert::Infallible;
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::HeaderMap,
     response::sse::{Event, KeepAlive, Sse},
 };
 use futures_util::{Stream, StreamExt};
+use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
 use crate::routes::AppState;
-use crate::utils::{errors::AppError, extract_claims};
+use crate::utils::{errors::AppError, extract_claims_with_query_fallback};
+
+#[derive(Deserialize)]
+pub struct SseAuthQuery {
+    /// JWT fallback for clients that can't set an Authorization header
+    /// (e.g. the browser's native EventSource API).
+    token: Option<String>,
+}
 
 /// GET /api/v1/pipeline/events
 #[utoipa::path(
     get,
     path = "/api/v1/pipeline/events",
+    params(
+        ("token" = Option<String>, Query, description = "JWT, required only if the Authorization header can't be set (e.g. browser EventSource)")
+    ),
     responses(
         (status = 200, description = "text/event-stream of PipelineEvent — prediction_completed / prediction_failed")
     ),
     tag = "patients",
     summary = "Stream ML pipeline events for the caller's hospital",
-    description = "Server-Sent Events stream. Each connection is filtered to the caller's own hospital_id (from the JWT) so hospitals never see each other's patient events. Kept alive with periodic pings."
+    description = "Server-Sent Events stream. Each connection is filtered to the caller's own hospital_id (from the JWT) so hospitals never see each other's patient events. Kept alive with periodic pings. Accepts the JWT via Authorization header or, as a fallback for plain EventSource clients, a ?token= query param."
 )]
 pub async fn pipeline_events(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(auth): Query<SseAuthQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
-    let claims = extract_claims(&headers)?;
+    let claims = extract_claims_with_query_fallback(&headers, auth.token.as_deref())?;
     let hospital_id: Uuid = claims
         .hospital_id
         .as_deref()

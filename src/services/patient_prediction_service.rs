@@ -171,6 +171,23 @@ impl PatientPredictionService {
         let prediction = self.prediction_repo.find_by_patient_id(patient_id).await?;
         Ok(prediction.map(PredictionResponse::from))
     }
+
+    /// Backs `GET /api/v1/patients` — the hospital's recent intake list,
+    /// each paired with its latest prediction (if one exists yet).
+    pub async fn list_for_hospital(
+        &self,
+        hospital_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<(Patient, Option<PredictionResponse>)>, PatientPredictionError> {
+        let patients = self.patient_repo.list_by_hospital(hospital_id, limit).await?;
+
+        let mut out = Vec::with_capacity(patients.len());
+        for patient in patients {
+            let prediction = self.latest_for_patient(patient.id).await?;
+            out.push((patient, prediction));
+        }
+        Ok(out)
+    }
 }
 
 pub struct PatientPredictionWorker {

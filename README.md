@@ -93,7 +93,13 @@ cp .env.example .env   # fill DATABASE_URL, JWT_SECRET, ML_SERVICE_URL
 cargo run              # http://localhost:8080 — Swagger at /api/docs
 ```
 
-### 2. ML Service
+`cargo run` auto-starts ml-service for you (training synthetic models on
+first run if none exist) as long as `ML_SERVICE_URL` points at localhost —
+see `src/services/ml_service_launcher.rs`. Skip step 2 entirely unless you
+need to run ml-service yourself (e.g. under a debugger), in which case set
+`ML_SERVICE_AUTOSTART=false` first so the two don't fight over port 8001.
+
+### 2. ML Service (optional — only if not letting `cargo run` handle it)
 ```bash
 cd ml-service
 cp .env.example .env   # fill DATABASE_URL
@@ -123,8 +129,19 @@ uvicorn main:app --host 0.0.0.0 --port 8001
 | `POST` | `/export-training-data` *(ML service)* | Export training table to CSV |
 | `POST` | `/api/v1/auth/login` | Login |
 | `GET` | `/health` | Backend health |
+| `GET` | `/api/v1/patients` | List recent patients for the caller's hospital |
+| `POST` | `/api/v1/patients/{patient_id}/consultation-notes` | Start a voice-recorded consultation note |
+| `POST` | `/api/v1/consultation-notes/{id}/audio-chunk` | Upload + transcribe one audio chunk (Whisper) |
 
+Voice-recorded consultation notes: `docs/CONSULTATION_NOTES.md`.
 Full reference: `docs/COMPLETE_API_DOCUMENTATION.md` · Swagger: `/api/docs`
+
+> Note: some entries in this table (`/api/v1/patients/{id}/assessment`,
+> `/api/v1/pipeline/re-assess/{id}`, `/api/v1/ml/health`, `/api/v1/auth/login`)
+> predate the routes that actually exist in `src/routes/app_routes.rs` today
+> — this table has drifted from the code in places unrelated to this change.
+> The rows added above are accurate as of this PR; the rest could use an
+> audit against the real router.
 
 ---
 

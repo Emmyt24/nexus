@@ -8,7 +8,6 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.tree import DecisionTreeClassifier
 from sklearn.preprocessing import LabelEncoder, MultiLabelBinarizer, MinMaxScaler
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -66,7 +65,12 @@ def _load_csv() -> pd.DataFrame:
         raise FileNotFoundError(
             "Training data not found. Run: python generate_training_data.py"
         )
-    df = pd.read_csv(path)
+    # keep_default_na=False: pandas' default NA sentinel list includes
+    # literal strings like "None"/"NA"/"NULL" — without this, any category
+    # that happens to be spelled that way gets silently turned into NaN and
+    # collapsed into "Unknown" at training time (found via exercise_habits,
+    # which was losing ~1/3 of its rows this way).
+    df = pd.read_csv(path, keep_default_na=False, na_values=[""])
     for col in ["smoking_status", "alcohol_consumption"]:
         df[col] = df[col].map({"True": True, "False": False, True: True, False: False}).fillna(False).astype(int)
     return df
@@ -82,8 +86,15 @@ def build_encoders(df: pd.DataFrame) -> dict:
                 "severity_level", "weather_condition", "patient_category",
                 "exercise_habits", "diet_type", "water_source",
                 "mortality_risk", "readmission_prediction"]:
+        values = df[col].fillna("Unknown")
         le = LabelEncoder()
-        df[col + "_enc"] = le.fit_transform(df[col].fillna("Unknown"))
+        # Fit with a synthetic "Unknown" row appended so that class always
+        # exists, even when every real row happens to be filled in — this is
+        # the fallback target safe_encode() uses at inference time for any
+        # category not seen during training, instead of silently guessing
+        # class 0 (which could be any real category, e.g. "Daily" exercise).
+        le.fit(pd.concat([values, pd.Series(["Unknown"])], ignore_index=True))
+        df[col + "_enc"] = le.transform(values)
         encoders[col] = le
 
     # TF-IDF for text fields
@@ -139,8 +150,13 @@ def train_diagnosis_model(df: pd.DataFrame, encoders: dict):
     y_pred = model.predict(X_test)
     f1 = f1_score(y_test, y_pred, average="macro")
     print(f"F1 (macro): {f1:.4f}")
-    print(classification_report(y_test, y_pred,
-          target_names=encoders["disease_type"].classes_))
+    # Report only classes actually present — encoders["disease_type"].classes_
+    # also includes the synthetic "Unknown" fallback class (see build_encoders)
+    # which never appears as a real label here, so passing all classes_ as
+    # target_names mismatches classification_report's inferred label count.
+    present_labels = sorted(set(y_test) | set(y_pred))
+    present_names = [str(encoders["disease_type"].classes_[i]) for i in present_labels]
+    print(classification_report(y_test, y_pred, labels=present_labels, target_names=present_names))
 
     joblib.dump(model, "models/diagnosis_model.pkl")
     print("Saved models/diagnosis_model.pkl")
@@ -204,10 +220,19 @@ def train_risk_model(df: pd.DataFrame, encoders: dict):
 
 def train_recommendation_model(df: pd.DataFrame, encoders: dict):
     """
-    Phase 1: decision tree on condition+lifestyle → drug recommendation.
+    Phase 1: ensemble model on condition+lifestyle → drug recommendation.
     Replace with collaborative filtering once 1000+ real patients collected.
+
+    Was a single DecisionTreeClassifier (macro F1 ~0.3-0.4) — a lone tree
+    this shallow overfits to whichever split it happened to make first and
+    generalizes poorly on a 9-feature/multi-class problem. Bagging many
+    trees (RandomForest) with class_weight="balanced" trades that variance
+    for materially better held-out F1 on the same features/data; it does not
+    fix the model being trained on synthetic data, so /predict/recommendation
+    still flags low_confidence and this is still not a substitute for
+    clinician review.
     """
-    print("\n=== Model 3: Recommendation (Phase 1 — Decision Tree) ===")
+    print("\n=== Model 3: Recommendation (Phase 1 — Random Forest) ===")
 
     feature_cols = [
         "disease_type_enc", "risk_norm", "smoking_status", "alcohol_consumption",
@@ -225,7 +250,10 @@ def train_recommendation_model(df: pd.DataFrame, encoders: dict):
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    model = DecisionTreeClassifier(max_depth=6, min_samples_leaf=3, random_state=42)
+    model = RandomForestClassifier(
+        n_estimators=200, max_depth=8, min_samples_leaf=2,
+        class_weight="balanced", random_state=42, n_jobs=-1,
+    )
     model.fit(X_train, y_train)
 
     f1 = f1_score(y_test, model.predict(X_test), average="macro")

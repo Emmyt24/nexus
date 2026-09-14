@@ -17,7 +17,12 @@ GENDERS = ["Male", "Female"]
 SEVERITIES = ["Mild", "Moderate", "Severe", "Critical"]
 PATIENT_CATEGORIES = ["Child", "Teenager", "Adult", "Elderly"]
 WEATHER = ["Dry", "Rainy", "Hot", "Cold", "Humid"]
-EXERCISE = ["None", "Weekly", "Daily"]
+# "Sedentary", not "None" — pandas' default CSV reader treats the literal
+# string "None" as a null sentinel and silently turns it into NaN on read,
+# which previously collapsed ~1/3 of rows into the "Unknown" bucket at
+# training time (see keep_default_na=False in train_models.py's _load_csv,
+# added as the other half of this fix).
+EXERCISE = ["Sedentary", "Weekly", "Daily"]
 DIET = ["Mixed", "Vegetarian", "Vegan", "Pescatarian"]
 WATER = ["Borehole", "Tap", "Bottled", "River"]
 STATES = ["Lagos", "Kano", "Abuja", "Rivers", "Oyo", "Kaduna", "Enugu", "Delta"]
@@ -44,13 +49,35 @@ CONDITION_MAP = {
 SYMPTOM_NOISE_RATE = 0.18
 CONDITION_NOISE_RATE = 0.12
 
-# Simplified drug map — fewer classes = better F1 with limited data
+# Simplified drug map — fewer classes = better F1 with limited data.
+# Ordered [mild, moderate, aggressive] per disease — choose_drug() below picks
+# an index based on severity/lifestyle/genotype so the label actually
+# correlates with the features the recommendation model trains on. Earlier
+# this was `random.choice(DRUG_MAP[disease])`, uniform and independent of
+# every other column — no model, however good, can beat ~0.3 macro F1
+# against a label with zero real signal beyond disease bucket. This mapping
+# is a synthetic proxy for "the model has something learnable to find," not
+# real clinical guidance — same caveat as the rest of this generator.
 DRUG_MAP = {
-    "Infectious": ["Artemether-Lumefantrine", "Ciprofloxacin 500mg", "Amoxicillin 500mg"],
-    "Chronic":    ["Amlodipine 5mg", "Metformin 500mg", "Lisinopril 10mg"],
-    "Genetic":    ["Hydroxyurea 500mg", "Folic acid 5mg", "Pain management"],
-    "MentalHealth": ["Sertraline 50mg", "Olanzapine 5mg", "Fluoxetine 20mg"],
+    "Infectious": ["Amoxicillin 500mg", "Ciprofloxacin 500mg", "Artemether-Lumefantrine"],
+    "Chronic":    ["Lisinopril 10mg", "Metformin 500mg", "Amlodipine 5mg"],
+    "Genetic":    ["Folic acid 5mg", "Pain management", "Hydroxyurea 500mg"],
+    "MentalHealth": ["Fluoxetine 20mg", "Sertraline 50mg", "Olanzapine 5mg"],
 }
+DRUG_LABEL_NOISE_RATE = 0.15
+
+
+def choose_drug(disease: str, severity: str, smoking: bool, alcohol: bool, genotype: str) -> str:
+    options = DRUG_MAP[disease]
+    if severity in ("Severe", "Critical"):
+        aggressiveness = 2
+    elif smoking or alcohol or genotype == "SS":
+        aggressiveness = 1
+    else:
+        aggressiveness = 0
+    if random.random() < DRUG_LABEL_NOISE_RATE:
+        aggressiveness = random.randint(0, 2)
+    return options[aggressiveness]
 
 
 def age_to_category(age: int) -> str:
@@ -127,7 +154,7 @@ def generate_row(i: int) -> dict:
         "patient_category": age_to_category(age),
         "state": random.choice(STATES),
         "occupation": random.choice(OCCUPATIONS),
-        "drug_recommendation": random.choice(DRUG_MAP[disease]),
+        "drug_recommendation": choose_drug(disease, severity, smoking, alcohol, genotype),
     }
 
     row["predictive_risk_score"] = compute_risk_score(row)

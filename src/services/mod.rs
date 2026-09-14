@@ -3,6 +3,7 @@ pub mod audit_service;
 pub mod auth_service;
 pub mod cloudinary;
 pub mod clinician_registration_service;
+pub mod consultation_note_service;
 pub mod distance_service;
 pub mod email_outbox_service;
 pub mod email_templates;
@@ -14,6 +15,7 @@ pub mod identity_verification_service;
 pub mod livekit;
 pub mod location_service;
 pub mod ml_client;
+pub mod ml_service_launcher;
 pub mod notification_service;
 pub mod patient_prediction_service;
 pub mod payout_service;
@@ -29,6 +31,7 @@ pub use audit_service::{AuditService, AuditServiceError, RegistrationDetails};
 pub use clinician_registration_service::{
     ClinicianRegistrationError, ClinicianRegistrationService,
 };
+pub use consultation_note_service::{ConsultationNoteError, ConsultationNoteService};
 pub use email_outbox_service::{EmailOutboxError, EmailOutboxService, EmailOutboxWorker};
 pub use encryption::{EncryptionError, EncryptionService};
 pub use geocoding::{GeocodingClient, GeocodingError};
@@ -38,7 +41,8 @@ pub use identity_verification_service::{
 pub use livekit::{LiveKitClient, LiveKitError};
 pub use location_service::{LocationService, LocationServiceError};
 pub use fcm::{FcmClient, FcmError, PushOutcome};
-pub use ml_client::MlClient;
+pub use ml_client::{MlClient, MlClientError};
+pub use ml_service_launcher::MlServiceHandle;
 pub use notification_service::{NotificationError, NotificationService};
 pub use patient_prediction_service::{
     PatientPredictionError, PatientPredictionService, PatientPredictionWorker,

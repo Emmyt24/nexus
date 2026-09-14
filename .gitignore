@@ -14,3 +14,6 @@ ml-service/**/__pycache__/
 # ML artifacts — trained models and exports (generated, not source)
 ml-service/models/*.pkl
 ml-service/data/patients_export.csv
+
+# Consultation audio chunks (patient data — never committed)
+/uploads/

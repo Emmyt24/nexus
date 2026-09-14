@@ -7,51 +7,60 @@
     "B+",
     "B-",
     "O+",
-    "O-"
+    "O-",
+    "Unknown"
   ],
   "genotype": [
     "AA",
     "AC",
     "AS",
-    "SS"
+    "SS",
+    "Unknown"
   ],
   "gender": [
     "Female",
-    "Male"
+    "Male",
+    "Unknown"
   ],
   "disease_type": [
     "Chronic",
     "Genetic",
     "Infectious",
-    "MentalHealth"
+    "MentalHealth",
+    "Unknown"
   ],
   "severity_level": [
     "Critical",
     "Mild",
     "Moderate",
-    "Severe"
+    "Severe",
+    "Unknown"
   ],
   "weather_condition": [
     "Cold",
     "Dry",
     "Hot",
     "Humid",
-    "Rainy"
+    "Rainy",
+    "Unknown"
   ],
   "patient_category": [
     "Adult",
     "Child",
     "Elderly",
-    "Teenager"
+    "Teenager",
+    "Unknown"
   ],
   "exercise_habits": [
     "Daily",
+    "Sedentary",
     "Unknown",
     "Weekly"
   ],
   "diet_type": [
     "Mixed",
     "Pescatarian",
+    "Unknown",
     "Vegan",
     "Vegetarian"
   ],
@@ -59,15 +68,18 @@
     "Borehole",
     "Bottled",
     "River",
-    "Tap"
+    "Tap",
+    "Unknown"
   ],
   "mortality_risk": [
     "High",
     "Low",
-    "Medium"
+    "Medium",
+    "Unknown"
   ],
   "readmission_prediction": [
     "High",
-    "Low"
+    "Low",
+    "Unknown"
   ]
 }
