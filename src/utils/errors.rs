@@ -33,6 +33,10 @@ pub enum AppError {
     #[error("Unprocessable entity: {0}")]
     UnprocessableEntity(String),
 
+    /// HTTP 429 — too many requests (e.g. OTP resend cooldown).
+    #[error("Too many requests: {0}")]
+    TooManyRequests(String),
+
     #[error("Internal server error: {0}")]
     InternalServerError(String),
 
@@ -54,6 +58,7 @@ impl IntoResponse for AppError {
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             AppError::PaymentRequired(msg) => (StatusCode::PAYMENT_REQUIRED, msg.clone()),
             AppError::UnprocessableEntity(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg.clone()),
+            AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
             AppError::InternalServerError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             AppError::Database(e) => {
                 tracing::error!("Database error: {:?}", e);

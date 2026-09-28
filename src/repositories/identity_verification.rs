@@ -119,6 +119,31 @@ impl IdentityVerificationRepository {
         Ok(())
     }
 
+    /// Seconds since this identity was last (re)initiated, if a row exists.
+    /// Used to rate-limit OTP resends (re-calling `initiate`).
+    pub async fn seconds_since_last_initiate(
+        &self,
+        owner_type: &str,
+        owner_id: Uuid,
+        id_type: &str,
+    ) -> Result<Option<i64>, IdentityRepoError> {
+        let secs: Option<f64> = sqlx::query_scalar(
+            r#"
+            SELECT EXTRACT(EPOCH FROM (NOW() - updated_at))
+            FROM identity_verifications
+            WHERE owner_type = $1::identity_owner
+              AND owner_id   = $2
+              AND identity_type = $3::identity_kind
+            "#,
+        )
+        .bind(owner_type)
+        .bind(owner_id)
+        .bind(id_type)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(secs.map(|s| s as i64))
+    }
+
     pub async fn get(
         &self,
         owner_type: &str,

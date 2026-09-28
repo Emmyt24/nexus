@@ -99,6 +99,68 @@ pub async fn get_worker_public(
     Ok(Json(worker))
 }
 
+/// Body for setting a clinician's qualification tags.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct SetQualificationsRequest {
+    /// Full replacement set of qualification tags (trimmed, deduped server-side).
+    pub qualifications: Vec<String>,
+}
+
+/// A clinician's persisted qualification tags.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct QualificationsResponse {
+    pub qualifications: Vec<String>,
+}
+
+/// GET /api/v1/clinicians/{clinician_id}/qualifications
+#[utoipa::path(
+    get,
+    path = "/api/v1/clinicians/{clinician_id}/qualifications",
+    params(("clinician_id" = Uuid, Path, description = "Clinician id")),
+    responses((status = 200, description = "Qualification tags", body = QualificationsResponse)),
+    tag = "clinicians",
+    summary = "List a clinician's qualifications"
+)]
+pub async fn get_qualifications(
+    State(state): State<AppState>,
+    Path(clinician_id): Path<Uuid>,
+) -> AppResult<Json<QualificationsResponse>> {
+    let qualifications = state
+        .clinician_repo
+        .list_qualifications(clinician_id)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("{e}")))?;
+    Ok(Json(QualificationsResponse { qualifications }))
+}
+
+/// PUT /api/v1/clinicians/{clinician_id}/qualifications
+#[utoipa::path(
+    put,
+    path = "/api/v1/clinicians/{clinician_id}/qualifications",
+    params(("clinician_id" = Uuid, Path, description = "Clinician id")),
+    request_body = SetQualificationsRequest,
+    responses(
+        (status = 200, description = "Updated qualifications", body = QualificationsResponse),
+        (status = 403, description = "Not your clinician profile")
+    ),
+    tag = "clinicians",
+    summary = "Replace a clinician's qualifications (feeds shift matching)"
+)]
+pub async fn set_qualifications(
+    State(state): State<AppState>,
+    Path(clinician_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(req): Json<SetQualificationsRequest>,
+) -> AppResult<Json<QualificationsResponse>> {
+    require_own_clinician(&state, &headers, clinician_id).await?;
+    let qualifications = state
+        .clinician_repo
+        .set_qualifications(clinician_id, &req.qualifications)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("{e}")))?;
+    Ok(Json(QualificationsResponse { qualifications }))
+}
+
 /// POST /api/v1/clinicians/otp/send
 #[utoipa::path(
     post,

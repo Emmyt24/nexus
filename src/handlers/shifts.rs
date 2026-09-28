@@ -19,6 +19,7 @@ use crate::{
         ShiftAssignRequest, ShiftCancelRequest, ShiftListQuery,
         ShiftOfferRequest, ShiftOfferResponse, ShiftRescheduleRequest, SubmitHandoverRequest,
     },
+    models::user::UserRole,
     routes::AppState,
     services::shift_service::{self, ShiftServiceError},
     utils::{
@@ -150,14 +151,31 @@ pub async fn create_shift(
 )]
 pub async fn list_shifts(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<ShiftListQuery>,
 ) -> AppResult<Json<ShiftListResponse>> {
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
 
+    // Scope hospital admins to their own shifts; super admins see all. Without
+    // this, any hospital admin could read every hospital's shifts (data leak).
+    let claims = extract_claims(&headers)?;
+    let hospital_scope: Option<Uuid> = match claims.role {
+        UserRole::SuperAdmin => None,
+        _ => Some(
+            claims
+                .hospital_id
+                .as_deref()
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .ok_or_else(|| {
+                    AppError::Forbidden("No hospital associated with this account".to_string())
+                })?,
+        ),
+    };
+
     let (shifts, total) = state
         .shift_service
-        .list_shifts(query.status, page, page_size)
+        .list_shifts(query.status, hospital_scope, page, page_size)
         .await
         .map_err(map_shift_error)?;
 

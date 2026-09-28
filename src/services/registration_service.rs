@@ -118,10 +118,27 @@ impl RegistrationService {
 
         let mut tx = self.db_pool.begin().await?;
 
+        // Compose the human-readable address stored on the hospitals row from the
+        // structured address (the coordinates go to hospital_locations separately).
+        let a = &request.address;
+        let mut address_line = a.line1.trim().to_string();
+        if let Some(l2) = a.line2.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            address_line.push_str(", ");
+            address_line.push_str(l2);
+        }
+        for part in [&a.city, &a.state, &a.postal_code, &a.country] {
+            let p = part.trim();
+            if !p.is_empty() {
+                address_line.push_str(", ");
+                address_line.push_str(p);
+            }
+        }
+
         let new_hospital = NewHospital {
             name: request.hospital_name.clone(),
             email: request.email.clone(),
             phone: request.phone.clone(),
+            address: address_line,
             registration_number: request.registration_number.clone(),
             admin_user_id: None,
             admin_first_name: request.admin_first_name.clone(),
@@ -480,8 +497,8 @@ impl RegistrationService {
                 .unwrap_or(RegistrationStatus::Pending),
             created_at: hospital.created_at,
             updated_at: hospital.updated_at,
-            approved_at: None, // Will be populated from hospital.approved_at when available
-            rejection_reason: None, // Will be populated from hospital.rejection_reason when available
+            approved_at: hospital.approved_at,
+            rejection_reason: hospital.rejection_reason,
         })
     }
 

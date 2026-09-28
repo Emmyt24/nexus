@@ -281,4 +281,50 @@ impl ClinicianRepository {
 
         Ok(count)
     }
+
+    /// List a clinician's persisted qualification tags (feeds shift matching).
+    pub async fn list_qualifications(
+        &self,
+        clinician_id: Uuid,
+    ) -> Result<Vec<String>, ClinicianRepoError> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT qualification FROM clinician_qualifications \
+             WHERE clinician_id = $1 ORDER BY created_at ASC",
+        )
+        .bind(clinician_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Replace the clinician's qualification set with `quals` (trimmed, deduped,
+    /// non-empty). Returns the stored list. This is the write path that was
+    /// missing, leaving shift qualification-matching permanently empty.
+    pub async fn set_qualifications(
+        &self,
+        clinician_id: Uuid,
+        quals: &[String],
+    ) -> Result<Vec<String>, ClinicianRepoError> {
+        let mut tx: Transaction<'_, Postgres> = self.pool.begin().await?;
+        sqlx::query("DELETE FROM clinician_qualifications WHERE clinician_id = $1")
+            .bind(clinician_id)
+            .execute(&mut *tx)
+            .await?;
+        for q in quals {
+            let q = q.trim();
+            if q.is_empty() {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO clinician_qualifications (clinician_id, qualification) \
+                 VALUES ($1, $2) ON CONFLICT (clinician_id, qualification) DO NOTHING",
+            )
+            .bind(clinician_id)
+            .bind(q)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        self.list_qualifications(clinician_id).await
+    }
 }

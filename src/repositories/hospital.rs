@@ -59,7 +59,7 @@ impl HospitalRepository {
         .bind(&hospital.name)
         .bind(&hospital.registration_number)
         .bind(&hospital.email)
-        .bind(&hospital.email) // Placeholder address; overwritten by geocode_and_store.
+        .bind(&hospital.address)
         .bind(&hospital.phone)
         .bind(hospital.admin_user_id)
         .bind(&hospital.admin_first_name)

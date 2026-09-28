@@ -1798,84 +1798,56 @@ impl ShiftRepository {
         status_filter: Option<ShiftStatus>,
         limit: i64,
         offset: i64,
+        hospital_id: Option<Uuid>,
     ) -> Result<Vec<Shift>, sqlx::Error> {
-        if let Some(status) = status_filter {
-            sqlx::query_as::<_, Shift>(
-                r#"
-                SELECT
-                    s.id, s.hospital_id, h.name as hospital_name,
-                    s.role_category, s.role_title, s.specialty, s.department,
-                    s.shift_type, s.status, s.priority, s.urgency_bonus_pct,
-                    s.scheduled_start, s.duration_hours, s.scheduled_end,
-                    s.actual_start, s.actual_end, s.assigned_clinician_id,
-                    s.rate_kobo_per_hour, s.fixed_rate_kobo, s.pay_type, s.stat_bonus_kobo,
-                    s.effective_rate_kobo_per_hour, s.grand_total_kobo,
-                    s.shift_label, s.job_description, s.draft_quality_score, s.notes,
-                    s.created_by, s.broadcast_consent_confirmed, s.matched_clinicians_at_publish,
-                    s.broadcast_at, s.billing_triggered_at, s.created_at, s.updated_at
-                FROM shifts s
-                LEFT JOIN hospitals h ON s.hospital_id = h.id
-                WHERE s.status = $1
-                ORDER BY s.created_at DESC
-                LIMIT $2 OFFSET $3
-                "#,
-            )
-            .bind(status)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-        } else {
-            sqlx::query_as::<_, Shift>(
-                r#"
-                SELECT
-                    s.id, s.hospital_id, h.name as hospital_name,
-                    s.role_category, s.role_title, s.specialty, s.department,
-                    s.shift_type, s.status, s.priority, s.urgency_bonus_pct,
-                    s.scheduled_start, s.duration_hours, s.scheduled_end,
-                    s.actual_start, s.actual_end, s.assigned_clinician_id,
-                    s.rate_kobo_per_hour, s.fixed_rate_kobo, s.pay_type, s.stat_bonus_kobo,
-                    s.effective_rate_kobo_per_hour, s.grand_total_kobo,
-                    s.shift_label, s.job_description, s.draft_quality_score, s.notes,
-                    s.created_by, s.broadcast_consent_confirmed, s.matched_clinicians_at_publish,
-                    s.broadcast_at, s.billing_triggered_at, s.created_at, s.updated_at
-                FROM shifts s
-                LEFT JOIN hospitals h ON s.hospital_id = h.id
-                ORDER BY s.created_at DESC
-                LIMIT $1 OFFSET $2
-                "#,
-            )
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-        }
+        // Both filters are optional: a NULL bind matches every row. `hospital_id`
+        // scopes a hospital admin to its own shifts (super admin passes None).
+        sqlx::query_as::<_, Shift>(
+            r#"
+            SELECT
+                s.id, s.hospital_id, h.name as hospital_name,
+                s.role_category, s.role_title, s.specialty, s.department,
+                s.shift_type, s.status, s.priority, s.urgency_bonus_pct,
+                s.scheduled_start, s.duration_hours, s.scheduled_end,
+                s.actual_start, s.actual_end, s.assigned_clinician_id,
+                s.rate_kobo_per_hour, s.fixed_rate_kobo, s.pay_type, s.stat_bonus_kobo,
+                s.effective_rate_kobo_per_hour, s.grand_total_kobo,
+                s.shift_label, s.job_description, s.draft_quality_score, s.notes,
+                s.created_by, s.broadcast_consent_confirmed, s.matched_clinicians_at_publish,
+                s.broadcast_at, s.billing_triggered_at, s.created_at, s.updated_at
+            FROM shifts s
+            LEFT JOIN hospitals h ON s.hospital_id = h.id
+            WHERE ($1::shift_status IS NULL OR s.status = $1)
+              AND ($4::uuid IS NULL OR s.hospital_id = $4)
+            ORDER BY s.created_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(status_filter)
+        .bind(limit)
+        .bind(offset)
+        .bind(hospital_id)
+        .fetch_all(&self.pool)
+        .await
     }
 
     pub async fn count_shifts(
         &self,
         status_filter: Option<ShiftStatus>,
+        hospital_id: Option<Uuid>,
     ) -> Result<i64, sqlx::Error> {
-        if let Some(status) = status_filter {
-            sqlx::query_scalar::<_, i64>(
-                r#"
-                SELECT COUNT(*)
-                FROM shifts
-                WHERE status = $1
-                "#,
-            )
-            .bind(status)
-            .fetch_one(&self.pool)
-            .await
-        } else {
-            sqlx::query_scalar::<_, i64>(
-                r#"
-                SELECT COUNT(*) FROM shifts
-                "#,
-            )
-            .fetch_one(&self.pool)
-            .await
-        }
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM shifts s
+            WHERE ($1::shift_status IS NULL OR s.status = $1)
+              AND ($2::uuid IS NULL OR s.hospital_id = $2)
+            "#,
+        )
+        .bind(status_filter)
+        .bind(hospital_id)
+        .fetch_one(&self.pool)
+        .await
     }
 
     pub async fn clinician_has_active_assignment(

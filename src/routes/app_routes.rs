@@ -98,6 +98,8 @@ pub struct AppState {
         crate::handlers::clinician_registration::verify_otp,
         crate::handlers::clinician_registration::complete_profile,
         crate::handlers::clinician_registration::add_bank_account,
+        crate::handlers::clinician_registration::get_qualifications,
+        crate::handlers::clinician_registration::set_qualifications,
         // Identity verification (BVN/NIN) + bank list
         crate::handlers::identity::hospital_initiate,
         crate::handlers::identity::hospital_validate,
@@ -397,6 +399,8 @@ pub struct AppState {
             crate::models::user::LoginResponse,
             crate::models::hospital::HospitalPublicDetail,
             crate::models::clinician::WorkerPublicDetail,
+            crate::handlers::clinician_registration::SetQualificationsRequest,
+            crate::handlers::clinician_registration::QualificationsResponse,
             crate::handlers::auth::MeResponse,
             crate::handlers::auth::ClinicianProfile,
             crate::handlers::auth::HospitalProfile,
@@ -743,6 +747,14 @@ pub fn create_router(
             "/api/v1/clinicians/{clinician_id}/bank-account",
             post(clinician_registration::add_bank_account)
                 .route_layer(from_fn(require_role(&[UserRole::HealthWorker]))),
+        )
+        // Qualifications: GET is open (matching/display); PUT is worker-only and
+        // ownership-checked in the handler. Feeds shift qualification matching.
+        .route(
+            "/api/v1/clinicians/{clinician_id}/qualifications",
+            get(clinician_registration::get_qualifications).put(
+                clinician_registration::set_qualifications,
+            ),
         )
         .route(
             "/api/v1/clinicians/{clinician_id}/avatar",

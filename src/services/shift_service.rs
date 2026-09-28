@@ -537,6 +537,7 @@ impl ShiftService {
     pub async fn list_shifts(
         &self,
         status_filter: Option<ShiftStatus>,
+        hospital_id: Option<Uuid>,
         page: i64,
         page_size: i64,
     ) -> Result<(Vec<Shift>, i64), ShiftServiceError> {
@@ -546,10 +547,10 @@ impl ShiftService {
 
         let shifts = self
             .shift_repo
-            .list_shifts(status_filter.clone(), page_size, offset)
+            .list_shifts(status_filter.clone(), page_size, offset, hospital_id)
             .await?;
 
-        let total = self.shift_repo.count_shifts(status_filter).await?;
+        let total = self.shift_repo.count_shifts(status_filter, hospital_id).await?;
 
         Ok((shifts, total))
     }
