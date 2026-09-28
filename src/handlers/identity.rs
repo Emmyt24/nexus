@@ -461,6 +461,9 @@ fn map_err(e: IdentityError) -> AppError {
         IdentityError::NumberAlreadyInUse => AppError::Conflict(
             "This BVN/NIN is already verified for another account".to_string(),
         ),
+        IdentityError::RateLimited(secs) => AppError::TooManyRequests(format!(
+            "Please wait {secs} seconds before requesting another OTP"
+        )),
         IdentityError::Provider(e) => {
             AppError::Validation(format!("Identity verification failed: {e}"))
         }

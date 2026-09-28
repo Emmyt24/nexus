@@ -75,6 +75,8 @@ pub enum IdentityError {
     NotInitiated,
     #[error("This BVN/NIN has already been verified for another account")]
     NumberAlreadyInUse,
+    #[error("Please wait {0} seconds before requesting another OTP")]
+    RateLimited(i64),
     #[error("Payment provider error: {0}")]
     Provider(#[from] SafeHavenError),
     #[error("Encryption error: {0}")]
@@ -117,6 +119,19 @@ impl IdentityVerificationService {
             return Err(IdentityError::Validation(
                 "BVN/NIN must be 11 digits".to_string(),
             ));
+        }
+
+        // Rate-limit OTP resends: reject a repeat initiate within the cooldown so
+        // spam-clicking "Resend" can't hammer SafeHaven's OTP sender.
+        const RESEND_COOLDOWN_SECS: i64 = 45;
+        if let Some(age) = self
+            .repo
+            .seconds_since_last_initiate(owner.as_str(), owner_id, id_type.as_db())
+            .await?
+        {
+            if age < RESEND_COOLDOWN_SECS {
+                return Err(IdentityError::RateLimited(RESEND_COOLDOWN_SECS - age));
+            }
         }
 
         let hash = number_hash(number);

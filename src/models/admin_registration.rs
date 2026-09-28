@@ -172,6 +172,8 @@ pub struct NewHospital {
     pub name: String,
     pub email: String,
     pub phone: String,
+    /// Human-readable street address stored on the hospitals row.
+    pub address: String,
     pub registration_number: String,
     pub admin_user_id: Option<Uuid>,
     /// Stashed on the row at registration time so we can create the admin
