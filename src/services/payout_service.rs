@@ -13,9 +13,10 @@ use crate::services::safehaven::{SafeHavenClient, SafeHavenError, TransferStatus
 pub const PLATFORM_FEE_NUMERATOR: i64 = 1;
 pub const PLATFORM_FEE_DENOMINATOR: i64 = 10;
 
-/// Default minimum net payout (₦5,000). Overridable at runtime with the
-/// `MIN_PAYOUT_KOBO` env var (kobo) — e.g. to lower the threshold in test/staging.
-pub const DEFAULT_MIN_PAYOUT_KOBO: i64 = 500_000;
+/// Default minimum net payout (₦100). Overridable at runtime with the
+/// `MIN_PAYOUT_KOBO` env var (kobo). TEMPORARY: lowered from ₦5,000 to ₦100 to
+/// match the ₦100 shift-rate floor during live testing; restore to 500_000 after.
+pub const DEFAULT_MIN_PAYOUT_KOBO: i64 = 10_000;
 
 /// Minimum net payout in kobo — `MIN_PAYOUT_KOBO` env if set (and >= 0), else default.
 pub fn min_payout_kobo() -> i64 {
