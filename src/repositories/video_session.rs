@@ -89,6 +89,12 @@ impl VideoSessionRepository {
     /// Seed-and-store the room for a shift. The `DO UPDATE` (rather than
     /// `DO NOTHING`) is what makes this safe under two concurrent join
     /// requests — `DO NOTHING` returns no row for the loser.
+    ///
+    /// The conflict branch re-asserts the room knobs from config instead of
+    /// leaving them frozen at whatever the row was born with, so raising a
+    /// default reaches shifts that have already hosted a consult. Safe because
+    /// no caller ever passes a per-session custom value — the only one is
+    /// `ensure_session_for_shift`, which always passes `livekit.room_defaults()`.
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_session_for_shift(
         &self,
@@ -107,7 +113,10 @@ impl VideoSessionRepository {
                  max_participants, empty_timeout_s, departure_timeout_s)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (shift_id) DO UPDATE
-               SET updated_at = NOW()
+               SET max_participants    = EXCLUDED.max_participants,
+                   empty_timeout_s     = EXCLUDED.empty_timeout_s,
+                   departure_timeout_s = EXCLUDED.departure_timeout_s,
+                   updated_at          = NOW()
             RETURNING {SESSION_COLUMNS}
             "#
         ))
