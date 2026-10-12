@@ -234,7 +234,11 @@ impl LiveKitClient {
             std::env::var("LIVEKIT_API_SECRET").unwrap_or_default(),
             Duration::from_secs(env_u64("LIVEKIT_TOKEN_TTL_SECONDS", DEFAULT_TOKEN_TTL_SECONDS)),
             RoomOptions {
-                max_participants: env_u32("LIVEKIT_MAX_PARTICIPANTS", DEFAULT_MAX_PARTICIPANTS),
+                // Deliberately not env-driven. The deployment pins
+                // LIVEKIT_MAX_PARTICIPANTS at 4, which is exactly two people with one
+                // companion device each and so caps "Continue on phone" with no headroom.
+                // The constant is the only lever we control from here.
+                max_participants: DEFAULT_MAX_PARTICIPANTS,
                 empty_timeout_s: env_u32(
                     "LIVEKIT_EMPTY_TIMEOUT_SECONDS",
                     DEFAULT_EMPTY_TIMEOUT_SECONDS,
