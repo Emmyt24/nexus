@@ -25,6 +25,7 @@ use crate::{
     utils::{
         errors::{AppError, AppResult},
         extract_claims,
+        money::Naira,
     },
 };
 
@@ -38,16 +39,16 @@ pub struct ShiftPreviewResponse {
     pub priority: String,
     pub scheduled_start: String,
     pub duration_hours: f32,
-    pub base_amount_kobo: i64,
-    pub stat_bonus_kobo: i64,
+    pub base_amount_naira: Naira,
+    pub stat_bonus_naira: Naira,
     /// What the hospital escrows when the shift is created.
-    pub grand_total_kobo: i64,
-    /// Platform fee in **kobo**, deducted from the clinician's pay, not added to
-    /// the hospital's bill. Snapshotted onto the shift at creation, so this is
-    /// the figure that will actually settle (FRS BR-F1-42).
-    pub platform_fee_kobo: i64,
-    /// `grand_total_kobo - platform_fee_kobo` — what the clinician receives.
-    pub worker_net_kobo: i64,
+    pub grand_total_naira: Naira,
+    /// Platform fee, deducted from the clinician's pay, not added to the
+    /// hospital's bill. Snapshotted onto the shift at creation, so this is the
+    /// figure that will actually settle (FRS BR-F1-42).
+    pub platform_fee_naira: Naira,
+    /// `grand_total_naira - platform_fee_naira` — what the clinician receives.
+    pub worker_net_naira: Naira,
     pub virtual_link: Option<String>,
     pub estimated_matches: i32,
 }
@@ -84,11 +85,12 @@ impl From<shift_service::ShiftPreview> for ShiftPreviewResponse {
             priority: format!("{:?}", preview.priority),
             scheduled_start: preview.scheduled_start.to_rfc3339(),
             duration_hours: preview.duration_hours,
-            base_amount_kobo: preview.base_amount_kobo,
-            stat_bonus_kobo: preview.stat_bonus_kobo,
-            grand_total_kobo: preview.grand_total_kobo,
-            platform_fee_kobo: preview.platform_fee_kobo,
-            worker_net_kobo: preview.worker_net_kobo,
+            // The service computes in kobo; naira is the wire unit.
+            base_amount_naira: Naira::from_kobo(preview.base_amount_kobo),
+            stat_bonus_naira: Naira::from_kobo(preview.stat_bonus_kobo),
+            grand_total_naira: Naira::from_kobo(preview.grand_total_kobo),
+            platform_fee_naira: Naira::from_kobo(preview.platform_fee_kobo),
+            worker_net_naira: Naira::from_kobo(preview.worker_net_kobo),
             virtual_link: preview.virtual_link,
             estimated_matches: preview.estimated_matches,
         }

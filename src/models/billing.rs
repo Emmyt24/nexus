@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use crate::utils::money::Naira;
+
 // Enums
 
 /// Lifecycle state of a billing transaction.
@@ -46,7 +48,8 @@ pub struct BillingTransaction {
     pub hospital_id: Uuid,
 
     pub event_type: BillingEventType,
-    /// Amount in the smallest currency unit (kobo for NGN, e.g. 500000 = ₦5,000).
+    /// Kobo, as the column stores it (e.g. 500000 = ₦5,000). The wire form is
+    /// [`BillingTransactionResponse::amount_naira`].
     pub amount_kobo: i64,
     /// ISO 4217 currency code, e.g. "NGN".
     pub currency: String,
@@ -72,12 +75,14 @@ pub struct BillingTransaction {
 
 // Response types
 
+/// The wire form of a [`BillingTransaction`]. Naira, like every amount this API
+/// returns; the row it comes from keeps kobo.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BillingTransactionResponse {
     pub id: Uuid,
     pub hospital_id: Uuid,
     pub event_type: BillingEventType,
-    pub amount_kobo: i64,
+    pub amount_naira: Naira,
     pub currency: String,
     pub status: TransactionStatus,
     pub description: Option<String>,
@@ -94,7 +99,7 @@ impl From<BillingTransaction> for BillingTransactionResponse {
             id: t.id,
             hospital_id: t.hospital_id,
             event_type: t.event_type,
-            amount_kobo: t.amount_kobo,
+            amount_naira: Naira::from_kobo(t.amount_kobo),
             currency: t.currency,
             status: t.status,
             description: t.description,

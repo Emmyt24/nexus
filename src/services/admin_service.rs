@@ -10,6 +10,7 @@ use crate::repositories::admin::AdminRepository;
 use crate::services::email_outbox_service::EmailOutboxService;
 use crate::services::email_templates;
 use crate::utils::errors::AppError;
+use crate::utils::money::Naira;
 
 pub struct AdminService {
     repo: Arc<AdminRepository>,
@@ -57,7 +58,7 @@ impl AdminService {
         let by_priority = self.repo.revenue_by_priority().await?;
         let by_status = self.repo.revenue_by_status().await?;
         Ok(RevenueBreakdown {
-            total_revenue_kobo,
+            total_revenue_naira: Naira::from_kobo(total_revenue_kobo),
             by_priority,
             by_status,
         })
@@ -118,9 +119,9 @@ impl AdminService {
                     .into(),
             ));
         }
-        if req.resolution == "partial_refund" && req.resolution_amount_kobo.is_none() {
+        if req.resolution == "partial_refund" && req.resolution_amount_naira.is_none() {
             return Err(AppError::BadRequest(
-                "resolution_amount_kobo is required for partial_refund".into(),
+                "resolution_amount_naira is required for partial_refund".into(),
             ));
         }
 
@@ -128,7 +129,7 @@ impl AdminService {
             .resolve_dispute(
                 id,
                 &req.resolution,
-                req.resolution_amount_kobo,
+                req.resolution_amount_naira.map(Naira::kobo),
                 req.admin_notes.as_deref(),
                 admin_user_id,
             )
@@ -161,10 +162,11 @@ impl AdminService {
             }
         }
 
-        if let Some(flat_naira) = p.platform_fee_flat_naira {
-            if flat_naira < 0 {
+        if let Some(flat) = p.platform_fee_flat_naira {
+            let flat_kobo = flat.kobo();
+            if flat_kobo < 0 {
                 return Err(AppError::BadRequest(
-                    "platform_fee_flat_naira must not be negative".into(),
+                    "the flat platform fee must not be negative".into(),
                 ));
             }
 
@@ -187,11 +189,15 @@ impl AdminService {
             // Until that setting is actually honoured, the clamp is the
             // guarantee and this is advice.
             let current = self.repo.get_settings().await?;
-            let advertised_min_kobo =
-                p.min_hourly_rate_kobo.unwrap_or(current.min_hourly_rate_kobo);
-            if advertised_min_kobo > 0 && flat_naira.saturating_mul(100) >= advertised_min_kobo {
+            // Both sides are unwrapped to kobo, so there is no conversion to
+            // get wrong: `Naira` holds kobo and only renders naira on the wire.
+            let advertised_min_kobo = p
+                .min_hourly_rate_naira
+                .unwrap_or(current.min_hourly_rate_naira)
+                .kobo();
+            if advertised_min_kobo > 0 && flat_kobo >= advertised_min_kobo {
                 tracing::warn!(
-                    flat_naira,
+                    flat_kobo,
                     advertised_min_hourly_kobo = advertised_min_kobo,
                     "flat platform fee is at or above the advertised minimum hourly rate; \
                      payouts on the smallest shifts will net zero and fail the minimum-payout \
@@ -205,7 +211,7 @@ impl AdminService {
         // A flat ₦0 is a legitimate promotional config, so it is not rejected —
         // but "deliberately free" and "forgot to set the amount" look identical
         // in the data, and the difference is the platform's entire revenue.
-        if settings.platform_fee_mode == "flat" && settings.platform_fee_flat_naira == 0 {
+        if settings.platform_fee_mode == "flat" && settings.platform_fee_flat_naira.kobo() == 0 {
             tracing::warn!(
                 admin_user_id = %admin_user_id,
                 "platform fee saved as flat ₦0 — no fee will be taken on any payout"

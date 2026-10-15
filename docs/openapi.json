@@ -4386,7 +4386,7 @@
           "platform"
         ],
         "summary": "Read the platform fee",
-        "description": "The fee the platform retains from a completed shift. `platform_fee_flat_naira` is in NAIRA; `platform_fee_cap_kobo` is in kobo. The fee is deducted from the clinician's payout, so a hospital still escrows the full shift total. `POST /api/v1/shifts/preview` returns the resolved figure for a specific shift.",
+        "description": "The fee the platform retains from a completed shift. All amounts are in NAIRA, as everywhere in this API. The fee is deducted from the clinician's payout, so a hospital still escrows the full shift total. `POST /api/v1/shifts/preview` returns the resolved figure for a specific shift.",
         "operationId": "get_platform_fee",
         "responses": {
           "200": {
@@ -8215,12 +8215,15 @@
           "occurred_at"
         ],
         "properties": {
-          "amount_kobo": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
+          "amount_naira": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira"
+              }
+            ]
           },
           "entity_id": {
             "type": [
@@ -9480,13 +9483,12 @@
         "type": "object",
         "description": "Body for `POST /api/v1/wallet/deposits`.",
         "required": [
-          "amount_kobo"
+          "amount_naira"
         ],
         "properties": {
-          "amount_kobo": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Amount in kobo (e.g. 10_000_000 = ₦100,000). Minimum ₦1,000."
+          "amount_naira": {
+            "$ref": "#/components/schemas/Naira",
+            "description": "Amount in **naira** (e.g. 100000 = ₦100,000). Minimum ₦1,000.\n\nValidated by a custom function rather than `range`: the stored value is\nkobo, so a `range` bound here would be read as a naira bound by anyone\nediting it and as a kobo bound by `validator`. Comparing kobo to kobo\nleaves nothing to misread."
           }
         }
       },
@@ -9534,13 +9536,16 @@
             },
             "description": "F1-F13: Equipment the hospital provides. Optional."
           },
-          "fixed_rate_kobo": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Required when pay_type = fixed_rate"
+          "fixed_rate_naira": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira",
+                "description": "Required when pay_type = fixed_rate"
+              }
+            ]
           },
           "job_description": {
             "type": [
@@ -9561,13 +9566,16 @@
           "priority": {
             "$ref": "#/components/schemas/ShiftPriority"
           },
-          "rate_kobo_per_hour": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Required when pay_type = hourly_rate"
+          "rate_naira_per_hour": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira",
+                "description": "Required when pay_type = hourly_rate"
+              }
+            ]
           },
           "requirements": {
             "type": "array",
@@ -9601,13 +9609,16 @@
               "null"
             ]
           },
-          "stat_bonus_kobo": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "STAT bonus fixed amount in kobo (e.g. 500000 = ₦5,000)"
+          "stat_bonus_naira": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira",
+                "description": "STAT bonus fixed amount (e.g. 5000 = ₦5,000)"
+              }
+            ]
           },
           "tasks": {
             "type": "array",
@@ -9632,7 +9643,7 @@
           "active_workers",
           "active_shifts",
           "shifts_completed_30d",
-          "platform_revenue_30d_kobo",
+          "platform_revenue_30d_naira",
           "active_disputes",
           "pending_hospital_verifications",
           "pending_worker_verifications",
@@ -9663,10 +9674,9 @@
             "type": "integer",
             "format": "int64"
           },
-          "platform_revenue_30d_kobo": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Platform fee revenue over the last 30 days, in kobo."
+          "platform_revenue_30d_naira": {
+            "$ref": "#/components/schemas/Naira",
+            "description": "Platform fee revenue over the last 30 days."
           },
           "shifts_completed_30d": {
             "type": "integer",
@@ -9696,7 +9706,7 @@
         "required": [
           "account_number",
           "bank_name",
-          "amount_kobo",
+          "amount_naira",
           "instructions"
         ],
         "properties": {
@@ -9711,9 +9721,8 @@
             "type": "string",
             "description": "Account number to transfer into."
           },
-          "amount_kobo": {
-            "type": "integer",
-            "format": "int64",
+          "amount_naira": {
+            "$ref": "#/components/schemas/Naira",
             "description": "The amount the hospital intends to deposit (echoed; informational —\ncrediting is based on whatever is actually received)."
           },
           "bank_code": {
@@ -9737,15 +9746,14 @@
         "description": "Response for `POST /api/v1/wallet/deposits` and `GET /api/v1/wallet/deposits`.",
         "required": [
           "deposit_id",
-          "amount_kobo",
+          "amount_naira",
           "virtual_account_number",
           "expires_at",
           "status"
         ],
         "properties": {
-          "amount_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "amount_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
           "deposit_id": {
             "type": "string",
@@ -9803,12 +9811,15 @@
               "null"
             ]
           },
-          "amount_kobo": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
+          "amount_naira": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira"
+              }
+            ]
           },
           "created_at": {
             "type": "string",
@@ -9843,12 +9854,15 @@
               "null"
             ]
           },
-          "resolution_amount_kobo": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
+          "resolution_amount_naira": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira"
+              }
+            ]
           },
           "resolved_at": {
             "type": [
@@ -9953,9 +9967,9 @@
       "EarningsSummary": {
         "type": "object",
         "required": [
-          "total_earned_kobo",
-          "this_month_kobo",
-          "pending_kobo",
+          "total_earned_naira",
+          "this_month_naira",
+          "pending_naira",
           "transactions",
           "total_transactions",
           "page",
@@ -9970,17 +9984,14 @@
             "type": "integer",
             "format": "int64"
           },
-          "pending_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "pending_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
-          "this_month_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "this_month_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
-          "total_earned_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "total_earned_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
           "total_transactions": {
             "type": "integer",
@@ -9998,14 +10009,13 @@
         "type": "object",
         "required": [
           "id",
-          "amount_kobo",
+          "amount_naira",
           "status",
           "created_at"
         ],
         "properties": {
-          "amount_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "amount_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
           "completed_at": {
             "type": [
@@ -10321,14 +10331,13 @@
         "required": [
           "id",
           "hospital_id",
-          "amount_kobo",
+          "amount_naira",
           "currency",
           "created_at"
         ],
         "properties": {
-          "amount_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "amount_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
           "created_at": {
             "type": "string",
@@ -10617,12 +10626,12 @@
           "registration_step",
           "setup_progress_percent",
           "created_at",
-          "wallet_balance_kobo",
-          "wallet_held_kobo",
+          "wallet_balance_naira",
+          "wallet_held_naira",
           "total_shifts",
           "active_shifts",
           "completed_shifts",
-          "total_spent_kobo",
+          "total_spent_naira",
           "identity_verified",
           "documents_status",
           "payment_method_on_file",
@@ -10768,20 +10777,17 @@
             "type": "integer",
             "format": "int64"
           },
-          "total_spent_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "total_spent_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
           "verification_status": {
             "type": "string"
           },
-          "wallet_balance_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "wallet_balance_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
-          "wallet_held_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "wallet_held_naira": {
+            "$ref": "#/components/schemas/Naira"
           }
         }
       },
@@ -11980,6 +11986,11 @@
           }
         }
       },
+      "Naira": {
+        "type": "number",
+        "format": "double",
+        "description": "An amount in NAIRA (not kobo), with up to two decimal places."
+      },
       "NdprConsent": {
         "type": "object",
         "description": "All 5 NDPR consent booleans from spec . Every one must be `true`",
@@ -12040,12 +12051,15 @@
             "type": "number",
             "format": "float"
           },
-          "fixed_rate_kobo": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
+          "fixed_rate_naira": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira"
+              }
+            ]
           },
           "hospital_id": {
             "type": "string",
@@ -12067,12 +12081,15 @@
           "priority": {
             "$ref": "#/components/schemas/ShiftPriority"
           },
-          "rate_kobo_per_hour": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
+          "rate_naira_per_hour": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira"
+              }
+            ]
           },
           "role_title": {
             "type": "string"
@@ -12094,12 +12111,15 @@
               "null"
             ]
           },
-          "stat_bonus_kobo": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
+          "stat_bonus_naira": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira"
+              }
+            ]
           }
         }
       },
@@ -12506,14 +12526,13 @@
         "description": "A payout row surfaced to the wallet API.",
         "required": [
           "id",
-          "amount_kobo",
+          "amount_naira",
           "status",
           "created_at"
         ],
         "properties": {
-          "amount_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "amount_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
           "completed_at": {
             "type": [
@@ -12578,7 +12597,7 @@
       },
       "PlatformFeeResponse": {
         "type": "object",
-        "description": "The platform fee, as a hospital needs to see it before creating a shift.\n\nNote the unit in each field name. Every monetary column in this schema is\nkobo, so a bare `platform_fee` would be read as kobo and be off by 100x.",
+        "description": "The platform fee, as a hospital needs to see it before creating a shift.\n\nAmounts are **naira**, like every other amount this API returns. The ledger\nkeeps kobo; `utils::money::Naira` converts once, here at the boundary.",
         "required": [
           "mode",
           "platform_fee_flat_naira",
@@ -12594,18 +12613,20 @@
             "type": "string",
             "description": "`flat` or `percent`. Decides which field below applies."
           },
-          "platform_fee_cap_kobo": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Cap in **kobo** on a percentage fee; `null` means uncapped. Ignored in\nflat mode."
+          "platform_fee_cap_naira": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira",
+                "description": "Cap in naira on a percentage fee; `null` means uncapped. Ignored in flat\nmode."
+              }
+            ]
           },
           "platform_fee_flat_naira": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Flat fee in **naira**. Applies when `mode == \"flat\"`."
+            "$ref": "#/components/schemas/Naira",
+            "description": "Flat fee in naira. Applies when `mode == \"flat\"`."
           },
           "platform_fee_percent": {
             "type": "number",
@@ -12629,7 +12650,7 @@
           "handover_edit_window_hours",
           "dispute_filing_window_hours",
           "max_active_shifts_per_hospital",
-          "min_hourly_rate_kobo",
+          "min_hourly_rate_naira",
           "max_recording_minutes",
           "updated_at"
         ],
@@ -12658,22 +12679,23 @@
             "type": "integer",
             "format": "int32"
           },
-          "min_hourly_rate_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "min_hourly_rate_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
-          "platform_fee_cap_kobo": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Max fee taken per payout in kobo; NULL = no cap."
+          "platform_fee_cap_naira": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira",
+                "description": "Max fee taken per payout; NULL = no cap."
+              }
+            ]
           },
           "platform_fee_flat_naira": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Flat fee in **naira**, not kobo — the figure an admin types. Converted to\nkobo once, in `payout_service::compute_platform_fee`."
+            "$ref": "#/components/schemas/Naira",
+            "description": "Flat fee, the figure an admin types. Stored as kobo in\n`platform_fee_flat_kobo`; `Naira` converts at the serialisation boundary."
           },
           "platform_fee_mode": {
             "type": "string",
@@ -13197,18 +13219,16 @@
         "required": [
           "transactions_scanned",
           "deposits_credited",
-          "amount_credited_kobo",
-          "balance_kobo"
+          "amount_credited_naira",
+          "balance_naira"
         ],
         "properties": {
-          "amount_credited_kobo": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Total kobo credited during this run."
+          "amount_credited_naira": {
+            "$ref": "#/components/schemas/Naira",
+            "description": "Total credited during this run."
           },
-          "balance_kobo": {
-            "type": "integer",
-            "format": "int64",
+          "balance_naira": {
+            "$ref": "#/components/schemas/Naira",
             "description": "Wallet balance after reconciling."
           },
           "deposits_credited": {
@@ -13370,20 +13390,23 @@
             "type": "string",
             "description": "One of: full_payment, partial_refund, no_payment, escalate."
           },
-          "resolution_amount_kobo": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Required when resolution = partial_refund (kobo)."
+          "resolution_amount_naira": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira",
+                "description": "Required when resolution = partial_refund."
+              }
+            ]
           }
         }
       },
       "RevenueBreakdown": {
         "type": "object",
         "required": [
-          "total_revenue_kobo",
+          "total_revenue_naira",
           "by_priority",
           "by_status"
         ],
@@ -13400,9 +13423,8 @@
               "$ref": "#/components/schemas/RevenueSlice"
             }
           },
-          "total_revenue_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "total_revenue_naira": {
+            "$ref": "#/components/schemas/Naira"
           }
         }
       },
@@ -13411,9 +13433,9 @@
         "description": "One time bucket of platform revenue.",
         "required": [
           "bucket",
-          "gross_kobo",
-          "fee_kobo",
-          "net_kobo",
+          "gross_naira",
+          "fee_naira",
+          "net_naira",
           "payouts"
         ],
         "properties": {
@@ -13421,17 +13443,14 @@
             "type": "string",
             "format": "date-time"
           },
-          "fee_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "fee_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
-          "gross_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "gross_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
-          "net_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "net_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
           "payouts": {
             "type": "integer",
@@ -13443,15 +13462,14 @@
         "type": "object",
         "required": [
           "label",
-          "revenue_kobo"
+          "revenue_naira"
         ],
         "properties": {
           "label": {
             "type": "string"
           },
-          "revenue_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "revenue_naira": {
+            "$ref": "#/components/schemas/Naira"
           }
         }
       },
@@ -13875,29 +13893,38 @@
             "format": "float",
             "description": "Explicit duration in hours as entered in the wizard (e.g. 8)"
           },
-          "effective_rate_kobo_per_hour": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Effective rate after urgency bonus applied (computed field)"
+          "effective_rate_naira_per_hour": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira",
+                "description": "Effective rate after urgency bonus applied (computed field)"
+              }
+            ]
           },
-          "fixed_rate_kobo": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Fixed lump-sum rate in kobo (used when pay_type = fixed_rate)"
+          "fixed_rate_naira": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira",
+                "description": "Fixed lump-sum rate (used when pay_type = fixed_rate)"
+              }
+            ]
           },
-          "grand_total_kobo": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Pre-computed grand total for the shift in kobo (base + bonuses + allowances)"
+          "grand_total_naira": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira",
+                "description": "Pre-computed grand total for the shift (base + bonuses + allowances)"
+              }
+            ]
           },
           "hospital_id": {
             "type": "string",
@@ -13943,13 +13970,16 @@
           "priority": {
             "$ref": "#/components/schemas/ShiftPriority"
           },
-          "rate_kobo_per_hour": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Base hourly rate in kobo (e.g. 800000 = ₦8,000/hr)"
+          "rate_naira_per_hour": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira",
+                "description": "Base hourly rate (e.g. 8000 = ₦8,000/hr)"
+              }
+            ]
           },
           "role_category": {
             "$ref": "#/components/schemas/RoleCategory",
@@ -13987,13 +14017,16 @@
             ],
             "description": "Clinical specialty, e.g. Emergency Medicine, Pediatrics"
           },
-          "stat_bonus_kobo": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "STAT bonus fixed amount in kobo (e.g. 500000 = ₦5,000)"
+          "stat_bonus_naira": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira",
+                "description": "STAT bonus fixed amount (e.g. 5000 = ₦5,000)"
+              }
+            ]
           },
           "status": {
             "$ref": "#/components/schemas/ShiftStatus"
@@ -14310,17 +14343,16 @@
           "priority",
           "scheduled_start",
           "duration_hours",
-          "base_amount_kobo",
-          "stat_bonus_kobo",
-          "grand_total_kobo",
-          "platform_fee_kobo",
-          "worker_net_kobo",
+          "base_amount_naira",
+          "stat_bonus_naira",
+          "grand_total_naira",
+          "platform_fee_naira",
+          "worker_net_naira",
           "estimated_matches"
         ],
         "properties": {
-          "base_amount_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "base_amount_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
           "department": {
             "type": [
@@ -14336,15 +14368,13 @@
             "type": "integer",
             "format": "int32"
           },
-          "grand_total_kobo": {
-            "type": "integer",
-            "format": "int64",
+          "grand_total_naira": {
+            "$ref": "#/components/schemas/Naira",
             "description": "What the hospital escrows when the shift is created."
           },
-          "platform_fee_kobo": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Platform fee in **kobo**, deducted from the clinician's pay, not added to\nthe hospital's bill. Snapshotted onto the shift at creation, so this is\nthe figure that will actually settle (FRS BR-F1-42)."
+          "platform_fee_naira": {
+            "$ref": "#/components/schemas/Naira",
+            "description": "Platform fee, deducted from the clinician's pay, not added to the\nhospital's bill. Snapshotted onto the shift at creation, so this is the\nfigure that will actually settle (FRS BR-F1-42)."
           },
           "priority": {
             "type": "string"
@@ -14364,9 +14394,8 @@
               "null"
             ]
           },
-          "stat_bonus_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "stat_bonus_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
           "virtual_link": {
             "type": [
@@ -14374,10 +14403,9 @@
               "null"
             ]
           },
-          "worker_net_kobo": {
-            "type": "integer",
-            "format": "int64",
-            "description": "`grand_total_kobo - platform_fee_kobo` — what the clinician receives."
+          "worker_net_naira": {
+            "$ref": "#/components/schemas/Naira",
+            "description": "`grand_total_naira - platform_fee_naira` — what the clinician receives."
           }
         }
       },
@@ -14672,7 +14700,7 @@
         "required": [
           "worker_id",
           "shifts_completed",
-          "earnings_kobo"
+          "earnings_naira"
         ],
         "properties": {
           "avg_rating": {
@@ -14682,9 +14710,8 @@
             ],
             "format": "double"
           },
-          "earnings_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "earnings_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
           "full_name": {
             "type": [
@@ -14795,27 +14822,36 @@
             ],
             "format": "int32"
           },
-          "min_hourly_rate_kobo": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
+          "min_hourly_rate_naira": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira"
+              }
+            ]
           },
-          "platform_fee_cap_kobo": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
+          "platform_fee_cap_naira": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira"
+              }
+            ]
           },
           "platform_fee_flat_naira": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Flat fee in **naira**, not kobo."
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira",
+                "description": "Flat fee, in naira like every other amount on the wire."
+              }
+            ]
           },
           "platform_fee_mode": {
             "type": [
@@ -15082,7 +15118,7 @@
         "required": [
           "id",
           "hospital_id",
-          "amount_kobo",
+          "amount_naira",
           "virtual_account_number",
           "valid_until",
           "external_reference",
@@ -15091,9 +15127,8 @@
           "updated_at"
         ],
         "properties": {
-          "amount_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "amount_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
           "created_at": {
             "type": "string",
@@ -15110,12 +15145,15 @@
             "type": "string",
             "format": "uuid"
           },
-          "received_amount_kobo": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
+          "received_amount_naira": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Naira"
+              }
+            ]
           },
           "received_at": {
             "type": [
@@ -15159,8 +15197,8 @@
           "id",
           "hospital_id",
           "kind",
-          "delta_balance_kobo",
-          "delta_held_kobo",
+          "delta_balance_naira",
+          "delta_held_naira",
           "created_at"
         ],
         "properties": {
@@ -15168,13 +15206,11 @@
             "type": "string",
             "format": "date-time"
           },
-          "delta_balance_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "delta_balance_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
-          "delta_held_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "delta_held_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
           "hospital_id": {
             "type": "string",
@@ -15212,15 +15248,14 @@
         "type": "object",
         "description": "Response for `GET /api/v1/wallet`.",
         "required": [
-          "balance_kobo",
-          "held_kobo",
-          "total_kobo",
+          "balance_naira",
+          "held_naira",
+          "total_naira",
           "has_sub_account"
         ],
         "properties": {
-          "balance_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "balance_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
           "bank_name": {
             "type": [
@@ -15233,9 +15268,8 @@
             "type": "boolean",
             "description": "Whether a SafeHaven sub-account has been provisioned (drives the\n\"Create Wallet\" vs \"show account details\" state on the dashboard)."
           },
-          "held_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "held_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
           "safehaven_account_name": {
             "type": [
@@ -15255,10 +15289,9 @@
               "null"
             ]
           },
-          "total_kobo": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Sum of `balance_kobo + held_kobo` — total funds at SafeHaven we're"
+          "total_naira": {
+            "$ref": "#/components/schemas/Naira",
+            "description": "Sum of `balance_naira + held_naira` — total funds at SafeHaven we're"
           }
         }
       },
@@ -15266,7 +15299,7 @@
         "type": "object",
         "description": "Body for `POST /api/v1/wallet/withdraw`.",
         "required": [
-          "amount_kobo",
+          "amount_naira",
           "account_number",
           "bank_code"
         ],
@@ -15275,10 +15308,9 @@
             "type": "string",
             "description": "Destination NUBAN account number (10 digits)."
           },
-          "amount_kobo": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Amount in kobo to withdraw (e.g. 10_000 = ₦100). Minimum ₦100."
+          "amount_naira": {
+            "$ref": "#/components/schemas/Naira",
+            "description": "Amount in **naira** to withdraw (e.g. 100 = ₦100). Minimum ₦100."
           },
           "bank_code": {
             "type": "string",
@@ -15298,8 +15330,8 @@
         "description": "Response for `POST /api/v1/wallet/withdraw`.",
         "required": [
           "withdrawal_id",
-          "amount_kobo",
-          "fee_kobo",
+          "amount_naira",
+          "fee_naira",
           "account_number",
           "account_name",
           "bank_code",
@@ -15315,18 +15347,16 @@
           "account_number": {
             "type": "string"
           },
-          "amount_kobo": {
-            "type": "integer",
-            "format": "int64",
+          "amount_naira": {
+            "$ref": "#/components/schemas/Naira",
             "description": "Net amount sent to the beneficiary account."
           },
           "bank_code": {
             "type": "string"
           },
-          "fee_kobo": {
-            "type": "integer",
-            "format": "int64",
-            "description": "SafeHaven transfer fee charged on top of `amount_kobo` (also debited)."
+          "fee_naira": {
+            "$ref": "#/components/schemas/Naira",
+            "description": "SafeHaven transfer fee charged on top of `amount_naira` (also debited)."
           },
           "message": {
             "type": "string"
@@ -15379,14 +15409,13 @@
         "description": "A withdrawal (`billing_transactions` row, `event_type = 'withdrawal'`).",
         "required": [
           "id",
-          "amount_kobo",
+          "amount_naira",
           "status",
           "created_at"
         ],
         "properties": {
-          "amount_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "amount_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
           "completed_at": {
             "type": [
@@ -15461,7 +15490,7 @@
           "created_at",
           "has_bank_account",
           "completed_shifts",
-          "total_earned_kobo",
+          "total_earned_naira",
           "identity_verified"
         ],
         "properties": {
@@ -15540,9 +15569,8 @@
           "specialty": {
             "type": "string"
           },
-          "total_earned_kobo": {
-            "type": "integer",
-            "format": "int64"
+          "total_earned_naira": {
+            "$ref": "#/components/schemas/Naira"
           },
           "user_id": {
             "type": "string",

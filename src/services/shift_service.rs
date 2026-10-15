@@ -9,6 +9,7 @@ use crate::repositories::shift::ShiftRepository;
 use crate::services::email_outbox_service::EmailOutboxService;
 use crate::services::email_templates;
 use crate::services::notification_service::NotificationService;
+use crate::utils::money::Naira;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShiftServiceError {
@@ -352,7 +353,7 @@ impl ShiftService {
         }
 
         // hospital must have wallet funds covering the gross
-        let gross = shift.grand_total_kobo.unwrap_or(0);
+        let gross = shift.grand_total_naira.map(Naira::kobo).unwrap_or(0);
         if gross > 0 {
             self.wallet_service
                 .try_hold_in_tx(&mut tx, hospital_id, Some(shift.id), gross)
@@ -2156,9 +2157,9 @@ impl ShiftService {
                 scheduled_start: r.scheduled_start,
                 duration_hours: r.duration_hours,
                 pay_type: r.pay_type,
-                rate_kobo_per_hour: r.rate_kobo_per_hour,
-                fixed_rate_kobo: r.fixed_rate_kobo,
-                stat_bonus_kobo: r.stat_bonus_kobo,
+                rate_naira_per_hour: Naira::from_kobo_opt(r.rate_kobo_per_hour),
+                fixed_rate_naira: Naira::from_kobo_opt(r.fixed_rate_kobo),
+                stat_bonus_naira: Naira::from_kobo_opt(r.stat_bonus_kobo),
                 distance_km: r.distance_km,
                 interest_expressed: r.interest_expressed,
             })
@@ -2355,7 +2356,7 @@ impl ShiftService {
         }
 
         // release the escrowed funds back into the hospital's
-        let gross = shift.grand_total_kobo.unwrap_or(0);
+        let gross = shift.grand_total_naira.map(Naira::kobo).unwrap_or(0);
         if gross > 0 {
             if let Err(e) = self
                 .wallet_service
@@ -2552,7 +2553,7 @@ impl ShiftService {
         const MIN_FIXED_KOBO: i64 = 10_000; // ₦100
         match request.pay_type {
             crate::models::shift::PayType::HourlyRate => {
-                let rate = request.rate_kobo_per_hour.ok_or_else(|| {
+                let rate = request.rate_naira_per_hour.map(Naira::kobo).ok_or_else(|| {
                     ShiftServiceError::ValidationError(
                         "Hourly rate is required for hourly pay type".to_string(),
                     )
@@ -2564,7 +2565,7 @@ impl ShiftService {
                 }
             }
             crate::models::shift::PayType::FixedRate => {
-                let rate = request.fixed_rate_kobo.ok_or_else(|| {
+                let rate = request.fixed_rate_naira.map(Naira::kobo).ok_or_else(|| {
                     ShiftServiceError::ValidationError(
                         "Fixed rate is required for fixed pay type".to_string(),
                     )
@@ -3253,17 +3254,21 @@ impl ShiftService {
     /// joined that response, under-reported those too.
     fn apply_stat_auto_bonus_to(request: &mut CreateShiftRequest) {
         if request.priority == ShiftPriority::Stat
-            && request.stat_bonus_kobo.unwrap_or(0) == 0
+            && request.stat_bonus_naira.map(Naira::kobo).unwrap_or(0) == 0
             && request.urgency_bonus_pct.is_none()
         {
-            let base = match request.pay_type {
+            let base_kobo = match request.pay_type {
                 crate::models::shift::PayType::HourlyRate => request
-                    .rate_kobo_per_hour
+                    .rate_naira_per_hour
+                    .map(Naira::kobo)
                     .unwrap_or(0)
                     .saturating_mul(request.duration_hours as i64),
-                crate::models::shift::PayType::FixedRate => request.fixed_rate_kobo.unwrap_or(0),
+                crate::models::shift::PayType::FixedRate => {
+                    request.fixed_rate_naira.map(Naira::kobo).unwrap_or(0)
+                }
             };
-            request.stat_bonus_kobo = Some(base / 5); // +20%
+            // +20%, taken in kobo so the bonus on an odd total keeps its kobo.
+            request.stat_bonus_naira = Some(Naira::from_kobo(base_kobo / 5));
         }
     }
 
@@ -3351,25 +3356,32 @@ impl ShiftService {
         })
     }
 
+    /// Returns `(base_kobo, stat_bonus_kobo, grand_total_kobo)`.
     fn calculate_preview_compensation(&self, request: &CreateShiftRequest) -> (i64, i64, i64) {
         use crate::models::shift::PayType;
 
         let base_amount = match request.pay_type {
             PayType::HourlyRate => request
-                .rate_kobo_per_hour
-                .map(|rate| (rate as f64 * request.duration_hours as f64) as i64)
+                .rate_naira_per_hour
+                .map(|rate| (rate.kobo() as f64 * request.duration_hours as f64) as i64)
                 .unwrap_or(0),
-            PayType::FixedRate => request.fixed_rate_kobo.unwrap_or(0),
+            PayType::FixedRate => request.fixed_rate_naira.map(Naira::kobo).unwrap_or(0),
         };
 
-        let stat_bonus = request.stat_bonus_kobo.unwrap_or(0);
+        let stat_bonus = request.stat_bonus_naira.map(Naira::kobo).unwrap_or(0);
         let grand_total = base_amount + stat_bonus;
 
         (base_amount, stat_bonus, grand_total)
     }
 }
 
-/// Shift preview response
+/// The computed preview, in kobo.
+///
+/// Internal: this is the arithmetic, not the response. `ShiftPreviewResponse`
+/// is the naira form the handler converts it into, and nothing serialises this
+/// struct to a client. Kept in kobo so the fee, the bonus and the net are exact
+/// integers all the way through — `compute_platform_fee` works in kobo and a
+/// percentage fee is routinely fractional in naira.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShiftPreview {
     pub role_title: String,
@@ -3382,7 +3394,7 @@ pub struct ShiftPreview {
     pub base_amount_kobo: i64,
     pub stat_bonus_kobo: i64,
     pub grand_total_kobo: i64,
-    /// Platform fee in **kobo**, deducted from the clinician's pay (FRS BR-F1-42).
+    /// Platform fee in kobo, deducted from the clinician's pay (FRS BR-F1-42).
     /// The hospital still escrows `grand_total_kobo`.
     pub platform_fee_kobo: i64,
     /// `grand_total_kobo - platform_fee_kobo` — what the clinician receives.

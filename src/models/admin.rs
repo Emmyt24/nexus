@@ -5,6 +5,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use utoipa::ToSchema;
+
+use crate::utils::money::Naira;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -17,8 +19,8 @@ pub struct DashboardMetrics {
     pub active_workers: i64,
     pub active_shifts: i64,
     pub shifts_completed_30d: i64,
-    /// Platform fee revenue over the last 30 days, in kobo.
-    pub platform_revenue_30d_kobo: i64,
+    /// Platform fee revenue over the last 30 days.
+    pub platform_revenue_30d_naira: Naira,
     pub active_disputes: i64,
     pub pending_hospital_verifications: i64,
     pub pending_worker_verifications: i64,
@@ -74,7 +76,8 @@ pub struct TopPerformer {
     pub full_name: Option<String>,
     pub shifts_completed: i64,
     pub avg_rating: Option<f64>,
-    pub earnings_kobo: i64,
+    #[sqlx(rename = "earnings_kobo")]
+    pub earnings_naira: Naira,
 }
 
 // ---------------------------------------------------------------------------
@@ -84,12 +87,13 @@ pub struct TopPerformer {
 #[derive(Debug, Serialize, Deserialize, ToSchema, FromRow)]
 pub struct RevenueSlice {
     pub label: String,
-    pub revenue_kobo: i64,
+    #[sqlx(rename = "revenue_kobo")]
+    pub revenue_naira: Naira,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct RevenueBreakdown {
-    pub total_revenue_kobo: i64,
+    pub total_revenue_naira: Naira,
     pub by_priority: Vec<RevenueSlice>,
     pub by_status: Vec<RevenueSlice>,
 }
@@ -123,7 +127,8 @@ pub struct FailedPayment {
     pub id: Uuid,
     pub hospital_id: Uuid,
     pub hospital_name: Option<String>,
-    pub amount_kobo: i64,
+    #[sqlx(rename = "amount_kobo")]
+    pub amount_naira: Naira,
     pub currency: String,
     pub provider_reference: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -144,9 +149,11 @@ pub struct Dispute {
     pub reason: String,
     pub status: String,
     pub priority: String,
-    pub amount_kobo: Option<i64>,
+    #[sqlx(rename = "amount_kobo")]
+    pub amount_naira: Option<Naira>,
     pub resolution: Option<String>,
-    pub resolution_amount_kobo: Option<i64>,
+    #[sqlx(rename = "resolution_amount_kobo")]
+    pub resolution_amount_naira: Option<Naira>,
     pub admin_notes: Option<String>,
     pub resolved_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -156,8 +163,8 @@ pub struct Dispute {
 pub struct ResolveDisputeRequest {
     /// One of: full_payment, partial_refund, no_payment, escalate.
     pub resolution: String,
-    /// Required when resolution = partial_refund (kobo).
-    pub resolution_amount_kobo: Option<i64>,
+    /// Required when resolution = partial_refund.
+    pub resolution_amount_naira: Option<Naira>,
     pub admin_notes: Option<String>,
 }
 
@@ -170,12 +177,14 @@ pub struct PlatformSettings {
     /// `flat` (the default) or `percent`. Decides which of the two fee fields
     /// below is actually used.
     pub platform_fee_mode: String,
-    /// Flat fee in **naira**, not kobo — the figure an admin types. Converted to
-    /// kobo once, in `payout_service::compute_platform_fee`.
-    pub platform_fee_flat_naira: i64,
+    /// Flat fee, the figure an admin types. Stored as kobo in
+    /// `platform_fee_flat_kobo`; `Naira` converts at the serialisation boundary.
+    #[sqlx(rename = "platform_fee_flat_kobo")]
+    pub platform_fee_flat_naira: Naira,
     pub platform_fee_percent: f64,
-    /// Max fee taken per payout in kobo; NULL = no cap.
-    pub platform_fee_cap_kobo: Option<i64>,
+    /// Max fee taken per payout; NULL = no cap.
+    #[sqlx(rename = "platform_fee_cap_kobo")]
+    pub platform_fee_cap_naira: Option<Naira>,
     pub worker_broadcast_radius_km: f64,
     pub stat_bonus_percent: f64,
     pub urgent_bonus_percent: f64,
@@ -186,7 +195,8 @@ pub struct PlatformSettings {
     pub handover_edit_window_hours: i32,
     pub dispute_filing_window_hours: i32,
     pub max_active_shifts_per_hospital: i32,
-    pub min_hourly_rate_kobo: i64,
+    #[sqlx(rename = "min_hourly_rate_kobo")]
+    pub min_hourly_rate_naira: Naira,
     pub max_recording_minutes: i32,
     pub updated_at: DateTime<Utc>,
 }
@@ -196,10 +206,10 @@ pub struct PlatformSettings {
 pub struct UpdatePlatformSettings {
     /// `flat` or `percent`.
     pub platform_fee_mode: Option<String>,
-    /// Flat fee in **naira**, not kobo.
-    pub platform_fee_flat_naira: Option<i64>,
+    /// Flat fee, in naira like every other amount on the wire.
+    pub platform_fee_flat_naira: Option<Naira>,
     pub platform_fee_percent: Option<f64>,
-    pub platform_fee_cap_kobo: Option<i64>,
+    pub platform_fee_cap_naira: Option<Naira>,
     pub worker_broadcast_radius_km: Option<f64>,
     pub stat_bonus_percent: Option<f64>,
     pub urgent_bonus_percent: Option<f64>,
@@ -209,7 +219,7 @@ pub struct UpdatePlatformSettings {
     pub handover_edit_window_hours: Option<i32>,
     pub dispute_filing_window_hours: Option<i32>,
     pub max_active_shifts_per_hospital: Option<i32>,
-    pub min_hourly_rate_kobo: Option<i64>,
+    pub min_hourly_rate_naira: Option<Naira>,
     pub max_recording_minutes: Option<i32>,
 }
 
@@ -343,14 +353,17 @@ pub struct HospitalDetail {
     pub admin_email: Option<String>,
     pub admin_phone: Option<String>,
     // Wallet
-    pub wallet_balance_kobo: i64,
-    pub wallet_held_kobo: i64,
+    #[sqlx(rename = "wallet_balance_kobo")]
+    pub wallet_balance_naira: Naira,
+    #[sqlx(rename = "wallet_held_kobo")]
+    pub wallet_held_naira: Naira,
     pub safehaven_account_number: Option<String>,
     // Aggregates
     pub total_shifts: i64,
     pub active_shifts: i64,
     pub completed_shifts: i64,
-    pub total_spent_kobo: i64,
+    #[sqlx(rename = "total_spent_kobo")]
+    pub total_spent_naira: Naira,
     // Identity
     pub identity_verified: bool,
     // Compliance documents summary + payment method presence (image 2)
@@ -390,7 +403,8 @@ pub struct WorkerDetail {
     pub bank_account_name: Option<String>,
     // Aggregates
     pub completed_shifts: i64,
-    pub total_earned_kobo: i64,
+    #[sqlx(rename = "total_earned_kobo")]
+    pub total_earned_naira: Naira,
     // Identity
     pub identity_verified: bool,
 }
@@ -403,9 +417,12 @@ pub struct WorkerDetail {
 #[derive(Debug, Serialize, Deserialize, ToSchema, FromRow)]
 pub struct RevenuePoint {
     pub bucket: DateTime<Utc>,
-    pub gross_kobo: i64,
-    pub fee_kobo: i64,
-    pub net_kobo: i64,
+    #[sqlx(rename = "gross_kobo")]
+    pub gross_naira: Naira,
+    #[sqlx(rename = "fee_kobo")]
+    pub fee_naira: Naira,
+    #[sqlx(rename = "net_kobo")]
+    pub net_naira: Naira,
     pub payouts: i64,
 }
 
@@ -430,7 +447,8 @@ pub struct ActivityItem {
     pub title: String,
     pub subtitle: Option<String>,
     pub entity_id: Option<Uuid>,
-    pub amount_kobo: Option<i64>,
+    #[sqlx(rename = "amount_kobo")]
+    pub amount_naira: Option<Naira>,
     pub occurred_at: DateTime<Utc>,
 }
 

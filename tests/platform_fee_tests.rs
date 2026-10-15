@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use chrono::{Duration, Timelike, Utc};
 use nexuscare_backend::models::admin::UpdatePlatformSettings;
+use nexuscare_backend::utils::money::Naira;
 use nexuscare_backend::models::shift::{
     CreateShiftRequest, PayType, RoleCategory, ShiftPriority, ShiftType,
 };
@@ -122,14 +123,17 @@ fn fee_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// Set every fee field this suite cares about, so no test inherits a value from
 /// another. Call under [`fee_lock`].
-async fn set_fee(pool: &PgPool, mode: &str, flat_naira: i64, percent: f64) {
+///
+/// `flat_kobo` is kobo, because it binds `platform_fee_flat_kobo` directly:
+/// this is the ledger side of the boundary, not the wire.
+async fn set_fee(pool: &PgPool, mode: &str, flat_kobo: i64, percent: f64) {
     sqlx::query(
         "UPDATE platform_settings SET platform_fee_mode = $1, \
-         platform_fee_flat_naira = $2, platform_fee_percent = $3, \
+         platform_fee_flat_kobo = $2, platform_fee_percent = $3, \
          platform_fee_cap_kobo = NULL WHERE singleton = 'global'",
     )
     .bind(mode)
-    .bind(flat_naira)
+    .bind(flat_kobo)
     .bind(percent)
     .execute(pool)
     .await
@@ -211,9 +215,9 @@ fn shift_request() -> CreateShiftRequest {
         scheduled_start: start,
         duration_hours: 8.0,
         pay_type: PayType::HourlyRate,
-        rate_kobo_per_hour: Some(125_000), // ₦1,250/hr x 8 = ₦10,000
-        fixed_rate_kobo: None,
-        stat_bonus_kobo: None,
+        rate_naira_per_hour: Some(Naira::from_kobo(125_000)), // ₦1,250/hr x 8 = ₦10,000
+        fixed_rate_naira: None,
+        stat_bonus_naira: None,
         shift_label: Some("Fee Test".to_string()),
         job_description: Some("Covering a shift, for fee arithmetic.".to_string()),
         tasks: vec!["Triage".to_string()],
@@ -231,11 +235,11 @@ fn shift_request() -> CreateShiftRequest {
 async fn a_flat_fee_set_in_naira_is_read_back_and_charged_in_kobo() {
     let Some(pool) = test_pool().await else { return };
     let _fee_guard = fee_lock();
-    set_fee(&pool, "flat", 500, 10.0).await;
+    set_fee(&pool, "flat", 50_000, 10.0).await;
 
     let cfg = read_platform_fee_config(&pool).await;
     assert_eq!(cfg.mode, PlatformFeeMode::Flat, "got {cfg:?}");
-    assert_eq!(cfg.flat_naira, 500, "the stored figure is naira");
+    assert_eq!(cfg.flat_kobo, 50_000, "₦500 is stored as 50_000 kobo");
 
     // ₦500 of a ₦10,000 gross.
     assert_eq!(
@@ -243,6 +247,56 @@ async fn a_flat_fee_set_in_naira_is_read_back_and_charged_in_kobo() {
         50_000,
         "a ₦500 flat fee must charge 50_000 kobo, not 500"
     );
+}
+
+/// The 100x guard: naira arrives as JSON, kobo lands in the column.
+///
+/// Every other test here sets the fee through raw SQL or a `Naira::from_kobo`,
+/// which proves the storage and the arithmetic but never exercises the
+/// conversion itself. This one starts where a real admin starts — a JSON body
+/// with a naira number in it — and follows the value to the column and back out
+/// of `compute_platform_fee`. A dropped or doubled `* 100` anywhere in that
+/// path fails here and nowhere else, which is the whole reason the
+/// `utils::money::Naira` boundary exists.
+#[tokio::test]
+async fn naira_in_a_json_body_lands_in_the_column_as_kobo() {
+    let Some(pool) = test_pool().await else { return };
+    let _fee_guard = fee_lock();
+    let svc = admin_service(&pool);
+    let admin_user_id = seed_user(&pool, "super_admin", None).await;
+
+    // ₦500, exactly as a client would send it. Note the decimals: a fee of
+    // ₦500.25 is representable and must not be truncated to ₦500.
+    let body = r#"{"platform_fee_mode":"flat","platform_fee_flat_naira":500.25}"#;
+    let payload: UpdatePlatformSettings =
+        serde_json::from_str(body).expect("a naira number is a valid flat fee");
+
+    let saved = svc
+        .update_settings(payload, admin_user_id)
+        .await
+        .expect("setting the fee in naira must succeed");
+
+    // Out on the wire it is naira again, decimals intact.
+    assert_eq!(saved.platform_fee_flat_naira.as_naira_f64(), 500.25);
+    assert_eq!(
+        serde_json::to_value(&saved.platform_fee_flat_naira).unwrap(),
+        serde_json::json!(500.25),
+        "the response renders naira, not kobo"
+    );
+
+    // In the column it is kobo, and the column is the one the payout pipeline
+    // reads. 500.25 naira is 50_025 kobo — not 500, not 5_002_500.
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT platform_fee_flat_kobo FROM platform_settings WHERE singleton = 'global'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, 50_025, "₦500.25 must store as 50_025 kobo");
+
+    // And the fee actually charged matches, on a ₦10,000 gross.
+    let cfg = read_platform_fee_config(&pool).await;
+    assert_eq!(compute_platform_fee(1_000_000, &cfg), 50_025);
 }
 
 #[tokio::test]
@@ -271,7 +325,7 @@ async fn flat_is_the_default_mode_on_a_fresh_database() {
 async fn a_later_fee_change_does_not_re_price_an_existing_shift() {
     let Some(pool) = test_pool().await else { return };
     let _fee_guard = fee_lock();
-    set_fee(&pool, "flat", 500, 10.0).await;
+    set_fee(&pool, "flat", 50_000, 10.0).await;
 
     let hospital_id = seed_hospital(&pool).await;
     let admin_user_id = seed_user(&pool, "hospital_admin", Some(hospital_id)).await;
@@ -295,7 +349,7 @@ async fn a_later_fee_change_does_not_re_price_an_existing_shift() {
     );
 
     // The admin doubles the fee afterwards.
-    set_fee(&pool, "flat", 1_000, 10.0).await;
+    set_fee(&pool, "flat", 100_000, 10.0).await;
 
     let after: Option<i64> =
         sqlx::query_scalar("SELECT platform_fee_kobo FROM shifts WHERE id = $1")
@@ -314,7 +368,7 @@ async fn a_later_fee_change_does_not_re_price_an_existing_shift() {
 async fn the_preview_shows_the_fee_and_the_workers_net() {
     let Some(pool) = test_pool().await else { return };
     let _fee_guard = fee_lock();
-    set_fee(&pool, "flat", 500, 10.0).await;
+    set_fee(&pool, "flat", 50_000, 10.0).await;
 
     let preview = shift_service(&pool)
         .preview_shift(&shift_request())
@@ -352,14 +406,16 @@ async fn a_flat_fee_at_or_above_the_minimum_shift_rate_is_allowed_but_warned() {
     // hardcoded ₦100 floor instead), so rejecting against it blocked legitimate
     // configurations while still admitting fees that zero the real smallest
     // shift. The clamp in compute_platform_fee is the actual guarantee.
-    let flat_naira = min_rate_kobo / 100;
+    // Equal to the advertised minimum, in the same unit — this used to divide
+    // by 100 to turn a kobo setting into the naira the column then held.
+    let flat_kobo = min_rate_kobo;
     let updated = svc
         .update_settings(
             UpdatePlatformSettings {
                 platform_fee_mode: Some("flat".into()),
-                platform_fee_flat_naira: Some(flat_naira),
+                platform_fee_flat_naira: Some(Naira::from_kobo(flat_kobo)),
                 platform_fee_percent: None,
-                platform_fee_cap_kobo: None,
+                platform_fee_cap_naira: None,
                 worker_broadcast_radius_km: None,
                 stat_bonus_percent: None,
                 urgent_bonus_percent: None,
@@ -369,7 +425,7 @@ async fn a_flat_fee_at_or_above_the_minimum_shift_rate_is_allowed_but_warned() {
                 handover_edit_window_hours: None,
                 dispute_filing_window_hours: None,
                 max_active_shifts_per_hospital: None,
-                min_hourly_rate_kobo: None,
+                min_hourly_rate_naira: None,
                 max_recording_minutes: None,
             },
             admin_user_id,
@@ -377,7 +433,7 @@ async fn a_flat_fee_at_or_above_the_minimum_shift_rate_is_allowed_but_warned() {
         .await
         .expect("a large flat fee is permitted, with a warning logged");
 
-    assert_eq!(updated.platform_fee_flat_naira, flat_naira);
+    assert_eq!(updated.platform_fee_flat_naira.kobo(), flat_kobo);
 
     // The safety property that actually matters: however large the fee, a
     // clinician's net never goes below zero.
@@ -401,7 +457,7 @@ async fn an_unknown_fee_mode_is_rejected() {
                 platform_fee_mode: Some("tiered".into()),
                 platform_fee_flat_naira: None,
                 platform_fee_percent: None,
-                platform_fee_cap_kobo: None,
+                platform_fee_cap_naira: None,
                 worker_broadcast_radius_km: None,
                 stat_bonus_percent: None,
                 urgent_bonus_percent: None,
@@ -411,7 +467,7 @@ async fn an_unknown_fee_mode_is_rejected() {
                 handover_edit_window_hours: None,
                 dispute_filing_window_hours: None,
                 max_active_shifts_per_hospital: None,
-                min_hourly_rate_kobo: None,
+                min_hourly_rate_naira: None,
                 max_recording_minutes: None,
             },
             admin_user_id,
@@ -431,7 +487,7 @@ async fn an_unknown_fee_mode_is_rejected() {
 async fn percent_mode_still_charges_ten_percent() {
     let Some(pool) = test_pool().await else { return };
     let _fee_guard = fee_lock();
-    set_fee(&pool, "percent", 500, 10.0).await;
+    set_fee(&pool, "percent", 50_000, 10.0).await;
 
     let cfg = read_platform_fee_config(&pool).await;
     assert_eq!(cfg.mode, PlatformFeeMode::Percent, "got {cfg:?}");
@@ -454,7 +510,7 @@ async fn the_migration_leaves_the_existing_settings_row_on_percent() {
     // state, and confirm it lands on percent rather than flat.
     sqlx::query(
         "UPDATE platform_settings SET platform_fee_mode = 'flat', \
-         platform_fee_flat_naira = 500 WHERE singleton = 'global'",
+         platform_fee_flat_kobo = 50000 WHERE singleton = 'global'",
     )
     .execute(&pool)
     .await
@@ -463,7 +519,7 @@ async fn the_migration_leaves_the_existing_settings_row_on_percent() {
     sqlx::query(
         "UPDATE platform_settings SET platform_fee_mode = 'percent' \
          WHERE singleton = 'global' AND platform_fee_mode = 'flat' \
-           AND platform_fee_flat_naira = 500",
+           AND platform_fee_flat_kobo = 50000",
     )
     .execute(&pool)
     .await

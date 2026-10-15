@@ -260,6 +260,8 @@ pub struct AppState {
             crate::models::shift::RatingFeed,
             crate::models::shift::RatingFeedItem,
             crate::handlers::platform::PlatformFeeResponse,
+            // The money type every amount on the wire resolves to.
+            crate::utils::money::Naira,
             crate::models::search::HospitalSearchResults,
             crate::models::search::HospitalSearchHit,
             crate::models::registration::UploadDocumentRequest,
@@ -1802,8 +1804,91 @@ mod openapi_tests {
         }
     }
 
-    /// The fee is the one place in this API where an amount is naira rather than
-    /// kobo, so the field name has to keep saying so.
+    /// Every amount on the wire is naira, and says so in its name.
+    ///
+    /// The unit used to differ per field — one naira field among kobo ones —
+    /// which is the shape that eventually ships a 100x error. The ledger is kobo
+    /// throughout and the API is naira throughout, with `utils::money::Naira`
+    /// converting at the boundary. No wire field may be named `*_kobo`.
+    ///
+    /// This had an allowlist of 59 fields while the conversion was in progress.
+    /// The allowlist is gone because the list is empty: there is nothing left to
+    /// exempt, so a single kobo field reappearing is now a failure rather than a
+    /// line someone adds to a worklist.
+    #[test]
+    fn no_amount_on_the_wire_is_denominated_in_kobo() {
+        let spec = spec();
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("schemas object");
+
+        let mut offenders = Vec::new();
+        for (name, schema) in schemas {
+            let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+                continue;
+            };
+            for prop in props.keys() {
+                if prop.contains("kobo") {
+                    offenders.push(format!("{name}.{prop}"));
+                }
+            }
+        }
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "amounts on the wire are naira — these publish kobo: {offenders:?}"
+        );
+    }
+
+    /// And a `*_naira` field must actually be the `Naira` type.
+    ///
+    /// The name alone is a comment. Without this, a field could be renamed from
+    /// `amount_kobo` to `amount_naira` while still carrying a kobo integer —
+    /// which is strictly worse than before, because the name now asserts
+    /// something false. `Naira` is the only type that does the conversion, so
+    /// every naira-named amount must resolve to its schema.
+    #[test]
+    fn every_naira_field_carries_the_naira_type() {
+        let spec = spec();
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("schemas object");
+
+        // `Naira` renders as a $ref, and an `Option<Naira>` as a oneOf of null
+        // and that $ref. Anything else — a bare integer, a string — is a field
+        // whose name promises a conversion that is not happening.
+        fn refers_to_naira(v: &serde_json::Value) -> bool {
+            if v.get("$ref").and_then(|r| r.as_str()) == Some("#/components/schemas/Naira") {
+                return true;
+            }
+            v.get("oneOf")
+                .and_then(|o| o.as_array())
+                .map(|variants| variants.iter().any(refers_to_naira))
+                .unwrap_or(false)
+        }
+
+        let mut offenders = Vec::new();
+        for (name, schema) in schemas {
+            let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+                continue;
+            };
+            for (prop, def) in props {
+                // `platform_fee_percent` is a percentage, not an amount, and
+                // `*_naira_per_hour` is a rate — both are still amounts of money
+                // and both are `Naira`. Only names containing `naira` are checked.
+                if prop.contains("naira") && !refers_to_naira(def) {
+                    offenders.push(format!("{name}.{prop}"));
+                }
+            }
+        }
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "these fields are named naira but are not the Naira type: {offenders:?}"
+        );
+    }
+
+    /// The fee surface specifically, since it is the one that was inconsistent.
     #[test]
     fn the_fee_response_names_its_unit() {
         let spec = spec();
@@ -1814,10 +1899,6 @@ mod openapi_tests {
             props.contains_key("platform_fee_flat_naira"),
             "the flat fee field must carry its unit in the name, got {:?}",
             props.keys().collect::<Vec<_>>()
-        );
-        assert!(
-            !props.contains_key("platform_fee_flat"),
-            "an unqualified amount field would be read as kobo"
         );
     }
 }

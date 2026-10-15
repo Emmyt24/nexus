@@ -9,6 +9,7 @@ use crate::repositories::clinician::ClinicianRepository;
 use crate::repositories::wallet::WalletRepository;
 use crate::services::encryption::EncryptionService;
 use crate::services::safehaven::{SafeHavenClient, SafeHavenError, TransferStatus};
+use crate::utils::money::Naira;
 
 pub const PLATFORM_FEE_NUMERATOR: i64 = 1;
 pub const PLATFORM_FEE_DENOMINATOR: i64 = 10;
@@ -64,12 +65,13 @@ impl PlatformFeeMode {
     }
 }
 
-/// The admin-configured fee, as stored. `flat_naira` is naira; everything else
-/// in this module is kobo.
+/// The admin-configured fee, as stored. All kobo, like everything else in this
+/// module — the naira the admin types is converted at the HTTP boundary by
+/// `utils::money::Naira`, not here.
 #[derive(Debug, Clone, Copy)]
 pub struct PlatformFeeConfig {
     pub mode: PlatformFeeMode,
-    pub flat_naira: i64,
+    pub flat_kobo: i64,
     pub percent: f64,
     pub cap_kobo: Option<i64>,
 }
@@ -80,7 +82,7 @@ impl PlatformFeeConfig {
     pub fn legacy_percent_default() -> Self {
         Self {
             mode: PlatformFeeMode::Percent,
-            flat_naira: 0,
+            flat_kobo: 0,
             percent: (PLATFORM_FEE_NUMERATOR as f64 / PLATFORM_FEE_DENOMINATOR as f64) * 100.0,
             cap_kobo: None,
         }
@@ -89,12 +91,12 @@ impl PlatformFeeConfig {
 
 /// The platform's cut of `gross_kobo`, in kobo.
 ///
-/// This is the **only** place naira becomes kobo. `flat_naira * 100` is exact,
+/// This is the **only** place naira becomes kobo. `flat_kobo * 100` is exact,
 /// and the result is clamped into `[0, gross]` so a flat fee larger than a small
 /// shift can never produce a negative net — it takes the whole gross instead.
 pub fn compute_platform_fee(gross_kobo: i64, cfg: &PlatformFeeConfig) -> i64 {
     let fee = match cfg.mode {
-        PlatformFeeMode::Flat => cfg.flat_naira.saturating_mul(100),
+        PlatformFeeMode::Flat => cfg.flat_kobo,
         PlatformFeeMode::Percent => {
             let pct = cfg.percent.clamp(0.0, 100.0);
             let mut fee = ((gross_kobo as f64) * pct / 100.0).round() as i64;
@@ -129,7 +131,7 @@ pub async fn try_read_platform_fee_config(
     pool: &PgPool,
 ) -> Result<PlatformFeeConfig, sqlx::Error> {
     let row: Option<(String, i64, f64, Option<i64>)> = sqlx::query_as(
-        "SELECT platform_fee_mode, platform_fee_flat_naira, \
+        "SELECT platform_fee_mode, platform_fee_flat_kobo, \
          platform_fee_percent::DOUBLE PRECISION, platform_fee_cap_kobo \
          FROM platform_settings WHERE singleton = 'global'",
     )
@@ -137,9 +139,9 @@ pub async fn try_read_platform_fee_config(
     .await?;
 
     match row {
-        Some((mode, flat_naira, percent, cap_kobo)) => Ok(PlatformFeeConfig {
+        Some((mode, flat_kobo, percent, cap_kobo)) => Ok(PlatformFeeConfig {
             mode: PlatformFeeMode::from_db(&mode),
-            flat_naira,
+            flat_kobo,
             percent,
             cap_kobo,
         }),
@@ -176,7 +178,7 @@ pub fn split_payout_with(gross_kobo: i64, fee_percent: f64, cap_kobo: Option<i64
         gross_kobo,
         &PlatformFeeConfig {
             mode: PlatformFeeMode::Percent,
-            flat_naira: 0,
+            flat_kobo: 0,
             percent: fee_percent,
             cap_kobo,
         },
@@ -818,7 +820,8 @@ struct PendingTransfer {
 pub struct PayoutRow {
     pub id: Uuid,
     pub shift_id: Option<Uuid>,
-    pub amount_kobo: i64,
+    #[sqlx(rename = "amount_kobo")]
+    pub amount_naira: Naira,
     pub status: String,
     pub provider_reference: Option<String>,
     pub provider_transaction_id: Option<String>,
@@ -872,24 +875,25 @@ mod tests {
         assert_eq!(g, f + n);
     }
 
-    fn flat(naira: i64) -> PlatformFeeConfig {
+    /// `kobo`, like the stored column. ₦500 is 50_000.
+    fn flat(kobo: i64) -> PlatformFeeConfig {
         PlatformFeeConfig {
             mode: PlatformFeeMode::Flat,
-            flat_naira: naira,
+            flat_kobo: kobo,
             percent: 10.0,
             cap_kobo: None,
         }
     }
 
-    /// The one that matters. A flat fee is configured in naira and charged in
-    /// kobo; if the `* 100` is ever dropped or doubled this is the test that
-    /// says so, and nothing else in the suite would.
+    /// A flat fee is taken exactly as configured, with no scaling anywhere in
+    /// the path. The naira an admin types is converted once, at the HTTP
+    /// boundary, so nothing here multiplies or divides.
     #[test]
-    fn flat_fee_in_naira_is_charged_in_kobo() {
-        // ₦500 flat on a ₦10,000 gross → ₦500 fee, ₦9,500 net.
-        let (gross, fee, net) = split_payout_config(1_000_000, &flat(500));
+    fn a_flat_fee_is_taken_exactly_as_configured() {
+        // ₦500 flat (50_000 kobo) on a ₦10,000 gross → ₦9,500 net.
+        let (gross, fee, net) = split_payout_config(1_000_000, &flat(50_000));
         assert_eq!(gross, 1_000_000);
-        assert_eq!(fee, 50_000, "a ₦500 flat fee is 50_000 kobo, not 500");
+        assert_eq!(fee, 50_000, "the configured kobo amount, unscaled");
         assert_eq!(net, 950_000);
         assert_eq!(gross, fee + net);
     }
@@ -897,15 +901,15 @@ mod tests {
     #[test]
     fn flat_fee_is_independent_of_gross() {
         // Unlike percent, the same flat fee applies whatever the shift is worth.
-        assert_eq!(compute_platform_fee(1_000_000, &flat(500)), 50_000);
-        assert_eq!(compute_platform_fee(9_000_000, &flat(500)), 50_000);
+        assert_eq!(compute_platform_fee(1_000_000, &flat(50_000)), 50_000);
+        assert_eq!(compute_platform_fee(9_000_000, &flat(50_000)), 50_000);
     }
 
     #[test]
     fn flat_fee_larger_than_gross_takes_the_gross_not_more() {
         // ₦500 flat against a ₦100 shift: the fee cannot exceed the gross, or
         // net goes negative and the clinician owes the platform money.
-        let (gross, fee, net) = split_payout_config(10_000, &flat(500));
+        let (gross, fee, net) = split_payout_config(10_000, &flat(50_000));
         assert_eq!(gross, 10_000);
         assert_eq!(fee, 10_000);
         assert_eq!(net, 0);
@@ -922,7 +926,7 @@ mod tests {
     fn flat_mode_ignores_percent_and_cap() {
         let cfg = PlatformFeeConfig {
             mode: PlatformFeeMode::Flat,
-            flat_naira: 500,
+            flat_kobo: 50_000,
             percent: 90.0,
             cap_kobo: Some(1),
         };
@@ -934,7 +938,7 @@ mod tests {
     fn percent_mode_is_unchanged_by_the_flat_rollout() {
         let cfg = PlatformFeeConfig {
             mode: PlatformFeeMode::Percent,
-            flat_naira: 999_999,
+            flat_kobo: 99_999_900,
             percent: 10.0,
             cap_kobo: None,
         };
@@ -963,13 +967,13 @@ mod tests {
 
     #[test]
     fn absurd_flat_fee_cannot_overflow() {
-        // saturating_mul, then clamped to gross.
+        // Clamped to gross, so even an absurd configured fee cannot overflow.
         assert_eq!(compute_platform_fee(1_000_000, &flat(i64::MAX)), 1_000_000);
     }
 
     #[test]
     fn negative_gross_yields_no_fee() {
         // Defensive: grand_total_kobo is CHECK (>= 0), but the helper is public.
-        assert_eq!(compute_platform_fee(-5, &flat(500)), 0);
+        assert_eq!(compute_platform_fee(-5, &flat(50_000)), 0);
     }
 }

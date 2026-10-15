@@ -6,11 +6,11 @@
 --
 -- Two deliberate choices here, both of which cost real money if reversed:
 --
---  1. `platform_fee_flat_naira` is NAIRA, not kobo, and the column name says so.
---     Every other amount in this schema is `*_kobo BIGINT`, so an unmarked
---     `platform_fee_flat` would be read as kobo by the next person and silently
---     charge a hundredth of the intended fee. The naira -> kobo conversion
---     happens in exactly one place, `PayoutService::compute_platform_fee`.
+--  1. `platform_fee_flat_kobo` is kobo, like every other stored amount here.
+--     An admin sets the fee in naira and the API speaks naira throughout, but
+--     the conversion happens once at the HTTP boundary (`utils::money::Naira`)
+--     rather than giving one column a different unit from its neighbours. A
+--     per-column exception is how a 100x error eventually ships.
 --
 --  2. `shifts.platform_fee_kobo` snapshots the fee at creation time. Payout runs
 --     days or weeks after a shift is created, so recomputing from current
@@ -38,8 +38,9 @@
 ALTER TABLE platform_settings
     ADD COLUMN IF NOT EXISTS platform_fee_mode TEXT NOT NULL DEFAULT 'flat'
         CHECK (platform_fee_mode IN ('flat', 'percent')),
-    ADD COLUMN IF NOT EXISTS platform_fee_flat_naira BIGINT NOT NULL DEFAULT 500
-        CHECK (platform_fee_flat_naira >= 0);
+    -- Kobo, like every other stored amount. 50000 kobo = ₦500.
+    ADD COLUMN IF NOT EXISTS platform_fee_flat_kobo BIGINT NOT NULL DEFAULT 50000
+        CHECK (platform_fee_flat_kobo >= 0);
 
 ALTER TABLE shifts
     ADD COLUMN IF NOT EXISTS platform_fee_kobo BIGINT
@@ -53,10 +54,10 @@ UPDATE platform_settings
    SET platform_fee_mode = 'percent'
  WHERE singleton = 'global'
    AND platform_fee_mode = 'flat'
-   AND platform_fee_flat_naira = 500;
+   AND platform_fee_flat_kobo = 50000;
 
 -- Rollback:
 --   ALTER TABLE shifts DROP COLUMN IF EXISTS platform_fee_kobo;
 --   ALTER TABLE platform_settings
---       DROP COLUMN IF EXISTS platform_fee_flat_naira,
+--       DROP COLUMN IF EXISTS platform_fee_flat_kobo,
 --       DROP COLUMN IF EXISTS platform_fee_mode;

@@ -3,6 +3,7 @@ use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::models::registration::RegistrationStatus;
+use crate::utils::money::Naira;
 use crate::models::shift::{
     CreateShiftRequest, PayType, Shift, ShiftApplication, ShiftApplicationStatus, ShiftPriority,
     ShiftStatus, ShiftType,
@@ -36,6 +37,9 @@ pub struct EligibleClinicianRow {
 }
 
 /// Raw row backing the "Shifts Near You" query. Distance and final
+///
+/// Kobo, as the columns store it. `NearbyShiftCard` is the naira form that goes
+/// on the wire; this one never leaves the repository.
 #[derive(Debug, Clone, FromRow)]
 pub struct NearbyShiftRow {
     pub shift_id: Uuid,
@@ -1961,9 +1965,9 @@ impl ShiftRepository {
         .bind(request.duration_hours)
         .bind(scheduled_end)
         .bind(&request.pay_type)
-        .bind(request.rate_kobo_per_hour)
-        .bind(request.fixed_rate_kobo)
-        .bind(request.stat_bonus_kobo)
+        .bind(request.rate_naira_per_hour.map(Naira::kobo))
+        .bind(request.fixed_rate_naira.map(Naira::kobo))
+        .bind(request.stat_bonus_naira.map(Naira::kobo))
         .bind(effective_rate)
         .bind(grand_total)
         .bind(&request.shift_label)
@@ -2471,16 +2475,21 @@ impl ShiftRepository {
         Ok(())
     }
 
+    /// Returns `(effective_rate_kobo, grand_total_kobo)`.
+    ///
+    /// Kobo throughout: these feed `*_kobo` columns and the escrow hold, and an
+    /// exact integer minor unit is the only representation that cannot drift.
+    /// `Naira` is unwrapped on the way in and never re-wrapped here.
     fn calculate_compensation(&self, request: &CreateShiftRequest) -> (Option<i64>, Option<i64>) {
         let base_amount = match request.pay_type {
             PayType::HourlyRate => request
-                .rate_kobo_per_hour
-                .map(|rate| (rate as f64 * request.duration_hours as f64) as i64),
-            PayType::FixedRate => request.fixed_rate_kobo,
+                .rate_naira_per_hour
+                .map(|rate| (rate.kobo() as f64 * request.duration_hours as f64) as i64),
+            PayType::FixedRate => request.fixed_rate_naira.map(Naira::kobo),
         };
 
         let effective_rate = match request.pay_type {
-            PayType::HourlyRate => request.rate_kobo_per_hour.map(|rate| {
+            PayType::HourlyRate => request.rate_naira_per_hour.map(Naira::kobo).map(|rate| {
                 if let Some(bonus_pct) = request.urgency_bonus_pct {
                     rate + (rate * bonus_pct as i64 / 100)
                 } else {
@@ -2491,7 +2500,7 @@ impl ShiftRepository {
         };
 
         let grand_total = base_amount.map(|base| {
-            let stat_bonus = request.stat_bonus_kobo.unwrap_or(0);
+            let stat_bonus = request.stat_bonus_naira.map(Naira::kobo).unwrap_or(0);
             base + stat_bonus
         });
 

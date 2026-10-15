@@ -107,7 +107,10 @@ pub async fn safehaven_webhook(
             "status": "ok",
             "deposit_id": deposit_id,
             "hospital_id": hospital_id,
-            "amount_kobo": amount_kobo
+            // Naira, like every amount this API emits. SafeHaven ignores the
+            // body of an acknowledgement, but this is still a response of ours
+            // and the rule does not get a hand-rolled-JSON exception.
+            "amount_naira": crate::utils::money::Naira::from_kobo(amount_kobo)
         }),
     };
 

@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use utoipa::ToSchema;
+
+use crate::utils::money::Naira;
 use uuid::Uuid;
 use validator::Validate;
 
@@ -155,18 +157,23 @@ pub struct Shift {
     /// The clinician assigned to this shift (NULL while open)
     pub assigned_clinician_id: Option<Uuid>,
 
-    /// Base hourly rate in kobo (e.g. 800000 = ₦8,000/hr)
-    pub rate_kobo_per_hour: Option<i64>,
-    /// Fixed lump-sum rate in kobo (used when pay_type = fixed_rate)
-    pub fixed_rate_kobo: Option<i64>,
+    /// Base hourly rate (e.g. 8000 = ₦8,000/hr)
+    #[sqlx(rename = "rate_kobo_per_hour")]
+    pub rate_naira_per_hour: Option<Naira>,
+    /// Fixed lump-sum rate (used when pay_type = fixed_rate)
+    #[sqlx(rename = "fixed_rate_kobo")]
+    pub fixed_rate_naira: Option<Naira>,
     /// Whether pay is hourly or a fixed lump sum per shift
     pub pay_type: PayType,
-    /// STAT bonus fixed amount in kobo (e.g. 500000 = ₦5,000)
-    pub stat_bonus_kobo: Option<i64>,
+    /// STAT bonus fixed amount (e.g. 5000 = ₦5,000)
+    #[sqlx(rename = "stat_bonus_kobo")]
+    pub stat_bonus_naira: Option<Naira>,
     /// Effective rate after urgency bonus applied (computed field)
-    pub effective_rate_kobo_per_hour: Option<i64>,
-    /// Pre-computed grand total for the shift in kobo (base + bonuses + allowances)
-    pub grand_total_kobo: Option<i64>,
+    #[sqlx(rename = "effective_rate_kobo_per_hour")]
+    pub effective_rate_naira_per_hour: Option<Naira>,
+    /// Pre-computed grand total for the shift (base + bonuses + allowances)
+    #[sqlx(rename = "grand_total_kobo")]
+    pub grand_total_naira: Option<Naira>,
 
     /// Human-readable label for the shift, e.g. "Night Shift: General Ward A"
     pub shift_label: Option<String>,
@@ -268,8 +275,9 @@ pub struct DashboardKpiSnapshot {
     /// Delta vs previous week in percentage points
     pub fill_rate_delta_pct: f32,
 
-    /// Total disbursements this week in kobo
-    pub total_disbursements_kobo: i64,
+    /// Total disbursements this week
+    #[sqlx(rename = "total_disbursements_kobo")]
+    pub total_disbursements_naira: Naira,
     /// Week-over-week change as a percentage (e.g. +4.2)
     pub disbursements_delta_pct: f32,
 
@@ -310,8 +318,9 @@ pub struct ShiftAllowance {
     pub draft_id: Option<Uuid>,
     /// Label entered by the hospital admin, e.g. "Transport Allowance"
     pub label: String,
-    /// Amount in kobo
-    pub amount_kobo: i64,
+    /// Amount paid as this allowance
+    #[sqlx(rename = "amount_kobo")]
+    pub amount_naira: Naira,
     pub created_at: DateTime<Utc>,
 }
 
@@ -320,22 +329,31 @@ pub struct ShiftAllowance {
 pub struct AddAllowanceRequest {
     #[validate(length(min = 1, max = 100, message = "Allowance label is required"))]
     pub label: String,
-    #[validate(range(min = 1, message = "Amount must be greater than zero"))]
-    pub amount_kobo: i64,
+    #[validate(custom(function = "positive_allowance"))]
+    pub amount_naira: Naira,
+}
+
+/// An allowance of zero is a data-entry slip, not a free allowance.
+fn positive_allowance(amount: &Naira) -> Result<(), validator::ValidationError> {
+    if amount.kobo() < 1 {
+        return Err(validator::ValidationError::new("positive_allowance")
+            .with_message("Amount must be greater than zero".into()));
+    }
+    Ok(())
 }
 
 /// The full compensation breakdown returned to the frontend for the summary card.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompensationSummary {
     pub pay_type: PayType,
-    /// Base amount in kobo (hourly_rate × duration_hours OR fixed_rate)
-    pub base_amount_kobo: i64,
-    /// STAT bonus fixed amount in kobo
-    pub stat_bonus_kobo: i64,
-    /// Sum of all additional allowances in kobo
-    pub allowances_total_kobo: i64,
-    /// Grand total in kobo
-    pub grand_total_kobo: i64,
+    /// Base amount (hourly_rate × duration_hours OR fixed_rate)
+    pub base_amount_naira: Naira,
+    /// STAT bonus fixed amount
+    pub stat_bonus_naira: Naira,
+    /// Sum of all additional allowances
+    pub allowances_total_naira: Naira,
+    /// Grand total
+    pub grand_total_naira: Naira,
     /// Display label, e.g. "8 hrs × ₦8,000"
     pub base_calculation_label: String,
 }
@@ -456,11 +474,15 @@ pub struct ShiftWizardDraft {
 
     // --- Step 2: Compensation ---
     pub pay_type: Option<PayType>,
-    pub rate_kobo_per_hour: Option<i64>,
-    pub fixed_rate_kobo: Option<i64>,
-    pub stat_bonus_kobo: Option<i64>,
+    #[sqlx(rename = "rate_kobo_per_hour")]
+    pub rate_naira_per_hour: Option<Naira>,
+    #[sqlx(rename = "fixed_rate_kobo")]
+    pub fixed_rate_naira: Option<Naira>,
+    #[sqlx(rename = "stat_bonus_kobo")]
+    pub stat_bonus_naira: Option<Naira>,
     /// Pre-computed grand total snapshot for the summary card
-    pub grand_total_kobo: Option<i64>,
+    #[sqlx(rename = "grand_total_kobo")]
+    pub grand_total_naira: Option<Naira>,
 
     // --- Step 3: Requirements / Shift Description ---
     pub department: Option<String>,
@@ -582,11 +604,11 @@ pub struct CreateShiftRequest {
     // --- Step 2: Compensation ---
     pub pay_type: PayType,
     /// Required when pay_type = hourly_rate
-    pub rate_kobo_per_hour: Option<i64>,
+    pub rate_naira_per_hour: Option<Naira>,
     /// Required when pay_type = fixed_rate
-    pub fixed_rate_kobo: Option<i64>,
-    /// STAT bonus fixed amount in kobo (e.g. 500000 = ₦5,000)
-    pub stat_bonus_kobo: Option<i64>,
+    pub fixed_rate_naira: Option<Naira>,
+    /// STAT bonus fixed amount (e.g. 5000 = ₦5,000)
+    pub stat_bonus_naira: Option<Naira>,
 
     #[validate(length(max = 100))]
     pub shift_label: Option<String>,
@@ -635,9 +657,9 @@ pub struct SaveShiftDraftRequest {
     pub priority: Option<ShiftPriority>,
     pub urgency_bonus_pct: Option<i16>,
     pub pay_type: Option<PayType>,
-    pub rate_kobo_per_hour: Option<i64>,
-    pub fixed_rate_kobo: Option<i64>,
-    pub stat_bonus_kobo: Option<i64>,
+    pub rate_naira_per_hour: Option<Naira>,
+    pub fixed_rate_naira: Option<Naira>,
+    pub stat_bonus_naira: Option<Naira>,
     pub shift_label: Option<String>,
     pub department: Option<String>,
     pub job_description: Option<String>,
@@ -998,9 +1020,9 @@ pub struct NearbyShiftCard {
     pub scheduled_start: DateTime<Utc>,
     pub duration_hours: f32,
     pub pay_type: PayType,
-    pub rate_kobo_per_hour: Option<i64>,
-    pub fixed_rate_kobo: Option<i64>,
-    pub stat_bonus_kobo: Option<i64>,
+    pub rate_naira_per_hour: Option<Naira>,
+    pub fixed_rate_naira: Option<Naira>,
+    pub stat_bonus_naira: Option<Naira>,
     /// Distance from the worker in km. `None` if the worker has no recorded
     pub distance_km: Option<f64>,
     /// Whether the caller has already expressed interest in this shift.

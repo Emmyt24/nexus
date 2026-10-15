@@ -14,24 +14,25 @@
 use axum::{extract::State, Json};
 
 use crate::routes::AppState;
+use crate::utils::money::Naira;
 use crate::services::payout_service::try_read_platform_fee_config;
 use crate::utils::errors::AppResult;
 
 /// The platform fee, as a hospital needs to see it before creating a shift.
 ///
-/// Note the unit in each field name. Every monetary column in this schema is
-/// kobo, so a bare `platform_fee` would be read as kobo and be off by 100x.
+/// Amounts are **naira**, like every other amount this API returns. The ledger
+/// keeps kobo; `utils::money::Naira` converts once, here at the boundary.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct PlatformFeeResponse {
     /// `flat` or `percent`. Decides which field below applies.
     pub mode: String,
-    /// Flat fee in **naira**. Applies when `mode == "flat"`.
-    pub platform_fee_flat_naira: i64,
+    /// Flat fee in naira. Applies when `mode == "flat"`.
+    pub platform_fee_flat_naira: Naira,
     /// Percentage of gross. Applies when `mode == "percent"`.
     pub platform_fee_percent: f64,
-    /// Cap in **kobo** on a percentage fee; `null` means uncapped. Ignored in
-    /// flat mode.
-    pub platform_fee_cap_kobo: Option<i64>,
+    /// Cap in naira on a percentage fee; `null` means uncapped. Ignored in flat
+    /// mode.
+    pub platform_fee_cap_naira: Option<Naira>,
     /// The fee is deducted from the clinician's pay, not added to the hospital's
     /// bill (FRS BR-F1-42). Stated on the wire so a client does not have to
     /// guess which side bears it.
@@ -50,9 +51,9 @@ pub struct PlatformFeeResponse {
     ),
     tag = "platform",
     summary = "Read the platform fee",
-    description = "The fee the platform retains from a completed shift. `platform_fee_flat_naira` \
-                   is in NAIRA; `platform_fee_cap_kobo` is in kobo. The fee is deducted from the \
-                   clinician's payout, so a hospital still escrows the full shift total. \
+    description = "The fee the platform retains from a completed shift. All amounts are in \
+                   NAIRA, as everywhere in this API. The fee is deducted from the clinician's \
+                   payout, so a hospital still escrows the full shift total. \
                    `POST /api/v1/shifts/preview` returns the resolved figure for a specific shift.",
     security(("bearerAuth" = []))
 )]
@@ -64,9 +65,9 @@ pub async fn get_platform_fee(State(state): State<AppState>) -> AppResult<Json<P
     let cfg = try_read_platform_fee_config(&state.pool).await?;
     Ok(Json(PlatformFeeResponse {
         mode: cfg.mode.as_str().to_string(),
-        platform_fee_flat_naira: cfg.flat_naira,
+        platform_fee_flat_naira: Naira::from_kobo(cfg.flat_kobo),
         platform_fee_percent: cfg.percent,
-        platform_fee_cap_kobo: cfg.cap_kobo,
+        platform_fee_cap_naira: cfg.cap_kobo.map(Naira::from_kobo),
         deducted_from: "clinician_payout",
     }))
 }
