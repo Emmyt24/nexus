@@ -40,7 +40,14 @@ pub struct ShiftPreviewResponse {
     pub duration_hours: f32,
     pub base_amount_kobo: i64,
     pub stat_bonus_kobo: i64,
+    /// What the hospital escrows when the shift is created.
     pub grand_total_kobo: i64,
+    /// Platform fee in **kobo**, deducted from the clinician's pay, not added to
+    /// the hospital's bill. Snapshotted onto the shift at creation, so this is
+    /// the figure that will actually settle (FRS BR-F1-42).
+    pub platform_fee_kobo: i64,
+    /// `grand_total_kobo - platform_fee_kobo` — what the clinician receives.
+    pub worker_net_kobo: i64,
     pub virtual_link: Option<String>,
     pub estimated_matches: i32,
 }
@@ -80,6 +87,8 @@ impl From<shift_service::ShiftPreview> for ShiftPreviewResponse {
             base_amount_kobo: preview.base_amount_kobo,
             stat_bonus_kobo: preview.stat_bonus_kobo,
             grand_total_kobo: preview.grand_total_kobo,
+            platform_fee_kobo: preview.platform_fee_kobo,
+            worker_net_kobo: preview.worker_net_kobo,
             virtual_link: preview.virtual_link,
             estimated_matches: preview.estimated_matches,
         }

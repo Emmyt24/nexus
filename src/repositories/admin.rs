@@ -345,6 +345,8 @@ impl AdminRepository {
         sqlx::query_as::<_, PlatformSettings>(
             r#"
             SELECT
+                platform_fee_mode,
+                platform_fee_flat_naira,
                 platform_fee_percent::DOUBLE PRECISION        AS platform_fee_percent,
                 platform_fee_cap_kobo,
                 worker_broadcast_radius_km::DOUBLE PRECISION  AS worker_broadcast_radius_km,
@@ -387,7 +389,9 @@ impl AdminRepository {
                 min_hourly_rate_kobo        = COALESCE($10, min_hourly_rate_kobo),
                 max_recording_minutes       = COALESCE($11, max_recording_minutes),
                 platform_fee_cap_kobo       = COALESCE($12, platform_fee_cap_kobo),
-                updated_by = $13,
+                platform_fee_mode           = COALESCE($13, platform_fee_mode),
+                platform_fee_flat_naira     = COALESCE($14, platform_fee_flat_naira),
+                updated_by = $15,
                 updated_at = NOW()
             WHERE singleton = 'global'
             "#,
@@ -404,6 +408,8 @@ impl AdminRepository {
         .bind(p.min_hourly_rate_kobo)
         .bind(p.max_recording_minutes)
         .bind(p.platform_fee_cap_kobo)
+        .bind(p.platform_fee_mode.as_deref())
+        .bind(p.platform_fee_flat_naira)
         .bind(updated_by)
         .execute(&self.pool)
         .await?;

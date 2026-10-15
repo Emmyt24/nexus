@@ -320,12 +320,25 @@ impl ShiftService {
         let equipment = std::mem::take(&mut request.equipment);
         let requirements = std::mem::take(&mut request.requirements);
 
+        // Snapshot the fee before the transaction opens. Payout settles days or
+        // weeks later, and recomputing from the settings then would let an admin
+        // re-price work already agreed — including work the hospital accepted on
+        // the strength of the net figure `preview_shift` showed it.
+        let (_, _, preview_gross) = self.calculate_preview_compensation(&request);
+        let platform_fee_kobo = self.platform_fee_for_gross(preview_gross).await;
+
         let mut tx = self.pool.begin().await?;
 
         // Create shift
         let shift = self
             .shift_repo
-            .create(&mut tx, hospital_id, created_by, request)
+            .create(
+                &mut tx,
+                hospital_id,
+                created_by,
+                request,
+                Some(platform_fee_kobo),
+            )
             .await?;
 
         // F1-F12 / F1-F13 / F1-F14 — persist atomically within the same tx.
@@ -2965,6 +2978,16 @@ impl ShiftService {
     }
 
     /// Preview shift before publishing
+    /// The platform's cut of `gross_kobo`, from the live admin settings.
+    ///
+    /// Both the preview and `create_shift` go through here so the figure a
+    /// hospital is shown is the figure that gets snapshotted onto the shift.
+    /// The naira → kobo conversion lives in `payout_service`, not here.
+    async fn platform_fee_for_gross(&self, gross_kobo: i64) -> i64 {
+        let cfg = crate::services::payout_service::read_platform_fee_config(&self.pool).await;
+        crate::services::payout_service::compute_platform_fee(gross_kobo, &cfg)
+    }
+
     pub async fn preview_shift(
         &self,
         request: &CreateShiftRequest,
@@ -2974,6 +2997,11 @@ impl ShiftService {
 
         // Calculate compensation
         let (base_amount, stat_bonus, grand_total) = self.calculate_preview_compensation(request);
+
+        // The fee the clinician will have deducted, and what they actually take
+        // home. Shown here because this is the hospital's last look before it
+        // commits money, and the same figure is snapshotted at create time.
+        let platform_fee_kobo = self.platform_fee_for_gross(grand_total).await;
 
         // Generate preview
         Ok(ShiftPreview {
@@ -2987,6 +3015,8 @@ impl ShiftService {
             base_amount_kobo: base_amount,
             stat_bonus_kobo: stat_bonus,
             grand_total_kobo: grand_total,
+            platform_fee_kobo,
+            worker_net_kobo: grand_total - platform_fee_kobo,
             virtual_link: if request.shift_type == ShiftType::Virtual {
                 Some(consult_deep_link(None))
             } else {
@@ -3030,6 +3060,11 @@ pub struct ShiftPreview {
     pub base_amount_kobo: i64,
     pub stat_bonus_kobo: i64,
     pub grand_total_kobo: i64,
+    /// Platform fee in **kobo**, deducted from the clinician's pay (FRS BR-F1-42).
+    /// The hospital still escrows `grand_total_kobo`.
+    pub platform_fee_kobo: i64,
+    /// `grand_total_kobo - platform_fee_kobo` — what the clinician receives.
+    pub worker_net_kobo: i64,
     pub virtual_link: Option<String>,
     pub estimated_matches: i32,
 }

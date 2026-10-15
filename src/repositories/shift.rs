@@ -1665,12 +1665,17 @@ impl ShiftRepository {
         .await
     }
 
+    /// `platform_fee_kobo` is the fee the hospital was shown at preview time and
+    /// is snapshotted onto the row, so a later settings change cannot re-price
+    /// work already agreed. The caller computes it — the fee configuration is a
+    /// service-layer concern. See `migrations/20240064_platform_fee_mode.sql`.
     pub async fn create(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         hospital_id: Uuid,
         created_by: Uuid,
         request: CreateShiftRequest,
+        platform_fee_kobo: Option<i64>,
     ) -> Result<Shift, sqlx::Error> {
         let id = Uuid::new_v4();
         let scheduled_end =
@@ -1688,12 +1693,12 @@ impl ShiftRepository {
                 pay_type, rate_kobo_per_hour, fixed_rate_kobo, stat_bonus_kobo,
                 effective_rate_kobo_per_hour, grand_total_kobo,
                 shift_label, job_description, notes, created_by, broadcast_consent_confirmed,
-                attachment_urls, created_at, updated_at
+                attachment_urls, platform_fee_kobo, created_at, updated_at
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17, $18, $19,
-                $20, $21, $22, $23, $24, $25, NOW(), NOW()
+                $20, $21, $22, $23, $24, $25, $26, NOW(), NOW()
             )
             "#,
         )
@@ -1728,6 +1733,7 @@ impl ShiftRepository {
                 .map(|u| serde_json::Value::String(u.clone()))
                 .collect(),
         ))
+        .bind(platform_fee_kobo)
         .execute(&mut **tx)
         .await?;
 

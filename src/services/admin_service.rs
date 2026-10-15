@@ -152,7 +152,52 @@ impl AdminService {
                 ));
             }
         }
-        Ok(self.repo.update_settings(&p, admin_user_id).await?)
+
+        if let Some(mode) = p.platform_fee_mode.as_deref() {
+            if !matches!(mode, "flat" | "percent") {
+                return Err(AppError::BadRequest(
+                    "platform_fee_mode must be 'flat' or 'percent'".into(),
+                ));
+            }
+        }
+
+        if let Some(flat_naira) = p.platform_fee_flat_naira {
+            if flat_naira < 0 {
+                return Err(AppError::BadRequest(
+                    "platform_fee_flat_naira must not be negative".into(),
+                ));
+            }
+
+            // A flat fee at or above the smallest shift a hospital can post
+            // would swallow that shift's whole gross, leaving a net of zero —
+            // which `PayoutService::process_one` then rejects as "below minimum
+            // payout", burning the 3-failure retry budget on every small shift.
+            // Reject it here as a 400 rather than letting it surface later as a
+            // pile of failed payouts. Compared in kobo: the stored fee is naira.
+            let current = self.repo.get_settings().await?;
+            let min_rate_kobo = p.min_hourly_rate_kobo.unwrap_or(current.min_hourly_rate_kobo);
+            if flat_naira.saturating_mul(100) >= min_rate_kobo && min_rate_kobo > 0 {
+                return Err(AppError::BadRequest(format!(
+                    "platform_fee_flat_naira (₦{}) must be below the minimum shift rate (₦{})",
+                    flat_naira,
+                    min_rate_kobo / 100
+                )));
+            }
+        }
+
+        let settings = self.repo.update_settings(&p, admin_user_id).await?;
+
+        // A flat ₦0 is a legitimate promotional config, so it is not rejected —
+        // but "deliberately free" and "forgot to set the amount" look identical
+        // in the data, and the difference is the platform's entire revenue.
+        if settings.platform_fee_mode == "flat" && settings.platform_fee_flat_naira == 0 {
+            tracing::warn!(
+                admin_user_id = %admin_user_id,
+                "platform fee saved as flat ₦0 — no fee will be taken on any payout"
+            );
+        }
+
+        Ok(settings)
     }
 
     /// §7 Report generation. Reports are produced asynchronously in the full

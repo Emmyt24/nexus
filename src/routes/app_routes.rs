@@ -21,8 +21,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     admin, auth, clinician_registration, consultation_notes, distance, earnings, emails, health,
-    here_maps, hospitals, identity, location, notifications, patients, pipeline, registration,
-    shifts, uploads, video, wallet, webhooks,
+    here_maps, hospitals, identity, location, notifications, patients, pipeline, platform,
+    registration, shifts, uploads, video, wallet, webhooks,
 };
 use crate::repositories::{
     admin::AdminRepository, audit::AuditRepository, billing::BillingRepository,
@@ -119,6 +119,8 @@ pub struct AppState {
         crate::handlers::shifts::create_shift,
         crate::handlers::shifts::list_shifts,
         crate::handlers::shifts::preview_shift,
+        // Platform configuration readable by hospitals/workers
+        crate::handlers::platform::get_platform_fee,
         crate::handlers::shifts::get_shift,
         crate::handlers::shifts::express_interest,
         crate::handlers::shifts::apply_for_shift,
@@ -240,6 +242,7 @@ pub struct AppState {
             crate::handlers::registration::ListHospitalsQuery,
             // Shifts
             crate::handlers::shifts::ShiftPreviewResponse,
+            crate::handlers::platform::PlatformFeeResponse,
             crate::handlers::shifts::ErrorResponse,
             crate::handlers::shifts::ShiftListResponse,
             crate::handlers::shifts::ShiftApplicationsResponse,
@@ -485,7 +488,8 @@ pub struct AppState {
         (name = "earnings", description = "Worker earnings — totals + transaction history"),
         (name = "identity", description = "BVN/NIN identity verification and bank list"),
         (name = "notifications", description = "Device push-token registration and the in-app notification center"),
-        (name = "emails", description = "Generic frontend-templated transactional email relay")
+        (name = "emails", description = "Generic frontend-templated transactional email relay"),
+        (name = "platform", description = "Platform-wide configuration readable by hospitals and workers")
     ),
     modifiers(&SecurityAddon)
 )]
@@ -839,6 +843,18 @@ pub fn create_router(
             "/api/v1/shifts/preview",
             post(shifts::preview_shift).route_layer(from_fn(require_role(&[
                 UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+            ]))),
+        )
+        // The fee a hospital needs before it commits money to a shift.
+        // `GET /admin/settings` is ManageSettings (super_admin only), so this is
+        // the hospital-readable slice of it. Workers can read it too: it is
+        // deducted from their pay.
+        .route(
+            "/api/v1/platform/fee",
+            get(platform::get_platform_fee).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::HealthWorker,
                 UserRole::SuperAdmin,
             ]))),
         )

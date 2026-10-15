@@ -167,6 +167,12 @@ pub struct ResolveDisputeRequest {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema, FromRow)]
 pub struct PlatformSettings {
+    /// `flat` (the default) or `percent`. Decides which of the two fee fields
+    /// below is actually used.
+    pub platform_fee_mode: String,
+    /// Flat fee in **naira**, not kobo — the figure an admin types. Converted to
+    /// kobo once, in `payout_service::compute_platform_fee`.
+    pub platform_fee_flat_naira: i64,
     pub platform_fee_percent: f64,
     /// Max fee taken per payout in kobo; NULL = no cap.
     pub platform_fee_cap_kobo: Option<i64>,
@@ -186,6 +192,10 @@ pub struct PlatformSettings {
 /// Partial update — every field optional; only provided fields are changed.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdatePlatformSettings {
+    /// `flat` or `percent`.
+    pub platform_fee_mode: Option<String>,
+    /// Flat fee in **naira**, not kobo.
+    pub platform_fee_flat_naira: Option<i64>,
     pub platform_fee_percent: Option<f64>,
     pub platform_fee_cap_kobo: Option<i64>,
     pub worker_broadcast_radius_km: Option<f64>,
