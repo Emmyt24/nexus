@@ -86,6 +86,11 @@ pub async fn upload_document(
     ),
     tag = "hospitals",
     summary = "List a hospital's documents",
+    description = "Every document on file for this hospital, newest first, with its \
+                   `submission_status` and — once a reviewer has decided — `reviewed_at` and \
+                   `review_notes`. Scoped to the caller's own hospital; a super admin may read \
+                   any. `reviewed_by` is deliberately not returned: the hospital needs the \
+                   decision and the reason, not the individual reviewer's identity.",
     security(("bearerAuth" = []))
 )]
 pub async fn list_documents(

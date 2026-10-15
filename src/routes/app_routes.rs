@@ -520,7 +520,18 @@ pub struct AppState {
     ),
     modifiers(&SecurityAddon)
 )]
-struct ApiDoc;
+pub struct ApiDoc;
+
+/// The generated OpenAPI document.
+///
+/// There is no spec file in this repository — the contract is produced from the
+/// `#[utoipa::path]` attributes at runtime and served at `/api/openapi.json`.
+/// This accessor exists so it can also be dumped without booting the server and
+/// a database (`cargo run --bin openapi`), which is what makes the spec
+/// reviewable in a diff and checkable in CI.
+pub fn openapi_spec() -> utoipa::openapi::OpenApi {
+    <ApiDoc as utoipa::OpenApi>::openapi()
+}
 
 /// Swagger UI security wiring — adds the `bearerAuth` scheme so the
 struct SecurityAddon;
@@ -1687,6 +1698,106 @@ mod openapi_tests {
             assert!(
                 schemas.contains_key(name),
                 "{name} is not in components.schemas"
+            );
+        }
+    }
+
+    /// Every operation needs a summary and a description.
+    ///
+    /// Scoped to the routes this branch added, not the whole spec: the existing
+    /// surface has gaps that are not this branch's to fix, and a test that fails
+    /// for pre-existing reasons gets ignored.
+    #[test]
+    fn the_new_operations_are_fully_described() {
+        let spec = spec();
+        for (path, method) in [
+            ("/api/v1/platform/fee", "get"),
+            ("/api/v1/search", "get"),
+            ("/api/v1/clinicians/{clinician_id}/ratings", "get"),
+            ("/api/v1/hospitals/{hospital_id}/ratings", "get"),
+            ("/api/v1/hospitals/{hospital_id}/documents", "post"),
+            ("/api/v1/hospitals/{hospital_id}/documents", "get"),
+            ("/api/v1/hospitals/{hospital_id}/documents/submit", "post"),
+            ("/api/v1/hospitals/{hospital_id}/documents/{document_id}", "delete"),
+            ("/api/v1/admin/hospitals/{hospital_id}/documents", "get"),
+            ("/api/v1/admin/hospitals/{hospital_id}/documents/{document_id}", "patch"),
+        ] {
+            let op = &spec["paths"][path][method];
+            assert!(
+                op.get("summary").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()),
+                "{method} {path} has no summary"
+            );
+            assert!(
+                op.get("description").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()),
+                "{method} {path} has no description"
+            );
+            assert!(
+                op["responses"].as_object().is_some_and(|r| r.len() >= 2),
+                "{method} {path} documents fewer than two responses"
+            );
+        }
+    }
+
+    /// A query field added to a `params(...)` list written out by hand is
+    /// invisible in the spec until it is added there too — the attribute does
+    /// not read the struct. `require_qualification_match` shipped missing for
+    /// exactly that reason.
+    #[test]
+    fn hand_written_query_params_match_their_handler() {
+        let spec = spec();
+        let names: Vec<&str> = spec["paths"]["/api/v1/worker/shifts/nearby"]["get"]["parameters"]
+            .as_array()
+            .expect("nearby should declare parameters")
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+
+        for expected in [
+            "lat",
+            "lng",
+            "accuracy_meters",
+            "radius_km",
+            "limit",
+            "offset",
+            "require_qualification_match",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "nearby query param '{expected}' is in NearbyShiftsQuery but not in the spec; \
+                 found {names:?}"
+            );
+        }
+    }
+
+    /// Request bodies have to resolve, or a client generator produces a method
+    /// that takes nothing.
+    #[test]
+    fn the_new_request_bodies_resolve_to_registered_schemas() {
+        let spec = spec();
+        for (path, method, schema) in [
+            (
+                "/api/v1/hospitals/{hospital_id}/documents",
+                "post",
+                "UploadDocumentRequest",
+            ),
+            (
+                "/api/v1/admin/hospitals/{hospital_id}/documents/{document_id}",
+                "patch",
+                "ReviewDocumentRequest",
+            ),
+        ] {
+            let got = spec["paths"][path][method]["requestBody"]["content"]
+                ["application/json"]["schema"]["$ref"]
+                .as_str()
+                .unwrap_or_default();
+            assert_eq!(
+                got,
+                format!("#/components/schemas/{schema}"),
+                "{method} {path} request body"
+            );
+            assert!(
+                spec["components"]["schemas"][schema].is_object(),
+                "{schema} is referenced but not registered"
             );
         }
     }

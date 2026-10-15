@@ -1098,7 +1098,8 @@ impl NearbyShiftsQuery {
         ("accuracy_meters" = Option<f32>, Query, description = "Optional GPS accuracy in metres"),
         ("radius_km" = Option<f64>, Query, description = "Search radius in km (default 5, max 50)"),
         ("limit" = Option<i64>, Query, description = "Page size (default 50, max 100)"),
-        ("offset" = Option<i64>, Query, description = "Rows to skip (default 0)")
+        ("offset" = Option<i64>, Query, description = "Rows to skip (default 0)"),
+        ("require_qualification_match" = Option<bool>, Query, description = "Only return shifts whose every requirement is covered by one of your saved qualifications. Off by default: requirements are free text with no shared vocabulary, so an exact-fit filter would empty most feeds. A shift with no requirements always matches.")
     ),
     responses(
         (status = 200, description = "Open shifts within the radius, ranked by urgency then distance", body = NearbyShiftsResponse),
