@@ -180,6 +180,8 @@ pub struct PlatformSettings {
     pub stat_bonus_percent: f64,
     pub urgent_bonus_percent: f64,
     pub clock_in_grace_minutes: i32,
+    /// Minutes after `scheduled_end` before the timeout sweep closes a shift.
+    pub shift_close_grace_minutes: i32,
     pub auto_clock_out_hours: i32,
     pub handover_edit_window_hours: i32,
     pub dispute_filing_window_hours: i32,
@@ -202,6 +204,7 @@ pub struct UpdatePlatformSettings {
     pub stat_bonus_percent: Option<f64>,
     pub urgent_bonus_percent: Option<f64>,
     pub clock_in_grace_minutes: Option<i32>,
+    pub shift_close_grace_minutes: Option<i32>,
     pub auto_clock_out_hours: Option<i32>,
     pub handover_edit_window_hours: Option<i32>,
     pub dispute_filing_window_hours: Option<i32>,

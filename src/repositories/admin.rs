@@ -353,6 +353,7 @@ impl AdminRepository {
                 stat_bonus_percent::DOUBLE PRECISION          AS stat_bonus_percent,
                 urgent_bonus_percent::DOUBLE PRECISION        AS urgent_bonus_percent,
                 clock_in_grace_minutes,
+                shift_close_grace_minutes,
                 auto_clock_out_hours,
                 handover_edit_window_hours,
                 dispute_filing_window_hours,
@@ -391,7 +392,8 @@ impl AdminRepository {
                 platform_fee_cap_kobo       = COALESCE($12, platform_fee_cap_kobo),
                 platform_fee_mode           = COALESCE($13, platform_fee_mode),
                 platform_fee_flat_naira     = COALESCE($14, platform_fee_flat_naira),
-                updated_by = $15,
+                shift_close_grace_minutes   = COALESCE($15, shift_close_grace_minutes),
+                updated_by = $16,
                 updated_at = NOW()
             WHERE singleton = 'global'
             "#,
@@ -410,6 +412,7 @@ impl AdminRepository {
         .bind(p.platform_fee_cap_kobo)
         .bind(p.platform_fee_mode.as_deref())
         .bind(p.platform_fee_flat_naira)
+        .bind(p.shift_close_grace_minutes)
         .bind(updated_by)
         .execute(&self.pool)
         .await?;

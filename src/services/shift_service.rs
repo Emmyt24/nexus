@@ -2667,6 +2667,166 @@ impl ShiftService {
 
     /// One iteration of the offer-expiry sweep. Flips every
 
+    /// Minutes of grace after `scheduled_end` before the sweep closes a shift.
+    ///
+    /// Read from `platform_settings` rather than hardcoded. Ten of the twelve
+    /// settings in that table are already written by the admin API and read by
+    /// nothing; a third dead grace period would be worse than none. Falls back
+    /// to 15 — the value the FRS uses for late clock-in — if the row cannot be
+    /// read, since refusing to sweep leaves escrow and clinicians stuck.
+    async fn shift_close_grace_minutes(&self) -> i32 {
+        match sqlx::query_scalar::<_, i32>(
+            "SELECT shift_close_grace_minutes FROM platform_settings WHERE singleton = 'global'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(Some(m)) => m.max(0),
+            Ok(None) => 15,
+            Err(e) => {
+                tracing::error!("could not read shift_close_grace_minutes, using 15: {e}");
+                15
+            }
+        }
+    }
+
+    /// Close out shifts whose scheduled end has passed and whose grace period
+    /// has run out. Returns how many were closed.
+    ///
+    /// Two branches, because the two cases owe opposite things:
+    ///
+    ///  * **Clocked in, never clocked out** → the shift completes. The work
+    ///    happened, so the payout pipeline should pay it. Nothing is refunded.
+    ///  * **Never clocked in** → `no_show`, and the escrow goes back to the
+    ///    hospital. Nobody worked; the money must not sit in `held_kobo`
+    ///    forever, which is what happens today because `cancel_shift` refuses
+    ///    anything past `upcoming`.
+    ///
+    /// Each branch claims its rows in one atomic statement, so this is safe to
+    /// run on more than one instance. Per-row failures are logged and skipped
+    /// rather than aborting the tick, following `rebroadcast_due_shifts`.
+    pub async fn close_timed_out_shifts(&self) -> Result<usize, ShiftServiceError> {
+        let grace = self.shift_close_grace_minutes().await;
+        let mut closed = 0usize;
+
+        // 1 — worked but not closed out. Completing is all that is needed; the
+        // payout pipeline requires an approved handover, so the clinician is
+        // nudged to file one rather than silently losing the money.
+        for (shift_id, hospital_id, clinician_id, role_title) in self
+            .shift_repo
+            .close_timed_out_worked_shifts(grace)
+            .await?
+        {
+            closed += 1;
+            tracing::info!(
+                "Shift {shift_id} ({role_title}) timed out with a clock-in and was completed \
+                 at its scheduled end (hospital {hospital_id})"
+            );
+
+            if self.shift_repo.get_handover(shift_id).await.ok().flatten().is_none() {
+                if let Some(cid) = clinician_id {
+                    self.notify_clinician_handover_outstanding(shift_id, cid, &role_title)
+                        .await;
+                }
+            }
+        }
+
+        // 2 — never started. Release the hold, then flag attendance if a row
+        // exists at all.
+        for (shift_id, hospital_id, _clinician_id, role_title, grand_total_kobo) in self
+            .shift_repo
+            .close_timed_out_unworked_shifts(grace)
+            .await?
+        {
+            closed += 1;
+
+            let mut tx = match self.pool.begin().await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    tracing::error!(
+                        "shift {shift_id} marked no_show but its escrow could not be \
+                         released (begin failed): {e}"
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(e) = self.shift_repo.mark_attendance_missed_tx(&mut tx, shift_id).await {
+                tracing::error!("could not flag attendance as missed for shift {shift_id}: {e}");
+            }
+
+            let hold = grand_total_kobo.unwrap_or(0);
+            if hold > 0 {
+                if let Err(e) = self
+                    .wallet_service
+                    .release_hold_in_tx(&mut tx, hospital_id, Some(shift_id), hold)
+                    .await
+                {
+                    // Loud: the status is already committed by the claim above,
+                    // so a failure here leaves money held against a dead shift.
+                    tracing::error!(
+                        "shift {shift_id} is no_show but releasing its {hold} kobo hold \
+                         failed: {e}"
+                    );
+                    continue;
+                }
+            }
+
+            if let Err(e) = tx.commit().await {
+                tracing::error!("escrow release for no_show shift {shift_id} failed: {e}");
+                continue;
+            }
+
+            tracing::info!(
+                "Shift {shift_id} ({role_title}) timed out with no clock-in, marked no_show, \
+                 {hold} kobo released to hospital {hospital_id}"
+            );
+
+            self.notify_hospital_no_show(hospital_id, &role_title).await;
+        }
+
+        Ok(closed)
+    }
+
+    /// Best-effort nudge; a missing email must not fail the sweep.
+    async fn notify_clinician_handover_outstanding(
+        &self,
+        shift_id: Uuid,
+        clinician_id: Uuid,
+        role_title: &str,
+    ) {
+        // Push targets a `users.id`, so resolve it the way the rest of this
+        // service does.
+        let Ok(Some(user_id)) = self.shift_repo.get_clinician_user_id(clinician_id).await else {
+            tracing::warn!("no user behind clinician {clinician_id}; skipping handover nudge");
+            return;
+        };
+
+        self.push
+            .notify_best_effort(
+                user_id,
+                "handover_outstanding",
+                "Handover still needed",
+                &format!(
+                    "Your {role_title} shift was closed automatically. File the handover so \
+                     payment can be released."
+                ),
+                serde_json::json!({ "shift_id": shift_id }),
+            )
+            .await;
+    }
+
+    async fn notify_hospital_no_show(&self, hospital_id: Uuid, role_title: &str) {
+        if let Ok(Some((_, hospital_email))) =
+            self.shift_repo.get_hospital_contact(hospital_id).await
+        {
+            let content = email_templates::shift_no_show(role_title);
+            if let Err(e) = self.email_outbox.enqueue_email(&hospital_email, &content).await {
+                tracing::warn!("could not queue no-show email: {e}");
+            }
+        }
+    }
+
     pub async fn expire_due_offers(&self) -> Result<usize, ShiftServiceError> {
         let expired = self.shift_repo.expire_due_offers().await?;
         let count = expired.len();

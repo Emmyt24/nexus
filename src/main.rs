@@ -11,6 +11,7 @@ use nexuscare_backend::repositories::EmailOutboxRepository;
 use nexuscare_backend::routes;
 use nexuscare_backend::schedulers::{
     BroadcastScheduler, HandoverAutoApprovalScheduler, OfferExpiryScheduler, PayoutScheduler,
+    ShiftTimeoutScheduler,
     VideoSessionReconciler,
 };
 use nexuscare_backend::services::{
@@ -102,6 +103,14 @@ async fn main() -> anyhow::Result<()> {
     // offer-expiry sweep. Marks offers past their
     let offer_expiry_scheduler = OfferExpiryScheduler::new(state.shift_service.clone());
     tokio::spawn(offer_expiry_scheduler.run());
+
+    // shift-timeout sweep. Closes shifts whose scheduled end has passed and
+    // whose grace period has run out: completed if the clinician clocked in,
+    // no_show (with the escrow released) if they never did. Without it a shift
+    // nobody closed holds the hospital's money and keeps the clinician marked
+    // busy indefinitely. Spawned only here, like the rest.
+    let shift_timeout_scheduler = ShiftTimeoutScheduler::new(state.shift_service.clone());
+    tokio::spawn(shift_timeout_scheduler.run());
 
     // handover auto-approval sweep. Approves handovers
     let handover_scheduler = HandoverAutoApprovalScheduler::new(state.shift_service.clone());

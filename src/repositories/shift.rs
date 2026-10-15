@@ -1393,6 +1393,129 @@ impl ShiftRepository {
 
     /// Sweep step: flip every offered assignment whose
 
+    /// Claim shifts past `scheduled_end + grace` whose clinician **did** clock in
+    /// but never clocked out, completing them.
+    ///
+    /// The work happened, so the shift completes and the payout pipeline picks
+    /// it up as normal. `worked_minutes` is measured to `scheduled_end`, not to
+    /// `NOW()` — a clinician who forgets to clock out for two days did not work
+    /// for two days, and the hospital escrowed the scheduled amount.
+    /// `completed_at` is set to `scheduled_end` for the same reason, which also
+    /// starts the rating window from when the shift actually ended.
+    ///
+    /// Claimed in a single statement: the `status`/`clockout_at` predicates live
+    /// inside the `UPDATE`, so two concurrent sweeps (or two Render instances)
+    /// cannot both take the same row. Compare `expire_due_offers` below. A
+    /// read-then-write here would double-process.
+    pub async fn close_timed_out_worked_shifts(
+        &self,
+        grace_minutes: i32,
+    ) -> Result<Vec<(Uuid, Uuid, Option<Uuid>, String)>, sqlx::Error> {
+        sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, String)>(
+            r#"
+            WITH due AS (
+                SELECT s.id, a.clockin_at
+                FROM shifts s
+                JOIN shift_attendance a ON a.shift_id = s.id
+                WHERE s.status = 'in_progress'
+                  AND s.scheduled_end < NOW() - make_interval(mins => $1)
+                  AND a.clockin_at  IS NOT NULL
+                  AND a.clockout_at IS NULL
+            ),
+            attended AS (
+                UPDATE shift_attendance a
+                   SET clockout_at    = s.scheduled_end,
+                       clockout_method = 'manual',
+                       worked_minutes = GREATEST(
+                           0,
+                           (EXTRACT(EPOCH FROM (s.scheduled_end - due.clockin_at)) / 60)::INTEGER
+                       ),
+                       updated_at     = NOW()
+                  FROM due
+                  JOIN shifts s ON s.id = due.id
+                 WHERE a.shift_id = due.id
+                   AND a.clockout_at IS NULL
+                RETURNING a.shift_id
+            ),
+            closed AS (
+                UPDATE shifts s
+                   SET status       = 'completed',
+                       completed_at = COALESCE(s.completed_at, s.scheduled_end),
+                       updated_at   = NOW()
+                  FROM attended
+                 WHERE s.id = attended.shift_id
+                   AND s.status = 'in_progress'
+                RETURNING s.id, s.hospital_id, s.assigned_clinician_id, s.role_title
+            )
+            SELECT id, hospital_id, assigned_clinician_id, role_title FROM closed
+            "#,
+        )
+        .bind(grace_minutes)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Claim shifts past `scheduled_end + grace` whose clinician never clocked
+    /// in, marking them `no_show`.
+    ///
+    /// Returns `grand_total_kobo` as well, because the caller has to release the
+    /// escrow this shift is still holding — nobody worked, so the hospital's
+    /// money must go back. `no_show` and `shift_attendance.missed` are both
+    /// pre-existing and previously unwritten (20240001, 20240024).
+    ///
+    /// `assigned`, `upcoming` and `in_progress` are all claimable: a shift can
+    /// reach `in_progress` without an attendance row via the virtual clock-in
+    /// path, and one that is still `assigned` well past its end was never
+    /// started at all.
+    pub async fn close_timed_out_unworked_shifts(
+        &self,
+        grace_minutes: i32,
+    ) -> Result<Vec<(Uuid, Uuid, Option<Uuid>, String, Option<i64>)>, sqlx::Error> {
+        sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, String, Option<i64>)>(
+            r#"
+            WITH missed AS (
+                UPDATE shifts s
+                   SET status       = 'no_show',
+                       completed_at = COALESCE(s.completed_at, s.scheduled_end),
+                       updated_at   = NOW()
+                 WHERE s.status IN ('assigned', 'upcoming', 'in_progress')
+                   AND s.scheduled_end < NOW() - make_interval(mins => $1)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM shift_attendance a
+                       WHERE a.shift_id = s.id AND a.clockin_at IS NOT NULL
+                   )
+                RETURNING s.id, s.hospital_id, s.assigned_clinician_id,
+                          s.role_title, s.grand_total_kobo
+            )
+            SELECT id, hospital_id, assigned_clinician_id, role_title, grand_total_kobo
+            FROM missed
+            "#,
+        )
+        .bind(grace_minutes)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Flag the attendance row of a shift the sweep marked `no_show`.
+    ///
+    /// Separate from the claim because most no-shows have no attendance row at
+    /// all; this only touches the ones that do (a clock-in approval request was
+    /// raised, say) and is harmless when there is none.
+    pub async fn mark_attendance_missed_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        shift_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE shift_attendance SET missed = TRUE, updated_at = NOW() \
+             WHERE shift_id = $1 AND clockin_at IS NULL",
+        )
+        .bind(shift_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     pub async fn expire_due_offers(&self) -> Result<Vec<(Uuid, Uuid, Uuid, String)>, sqlx::Error> {
         sqlx::query_as::<_, (Uuid, Uuid, Uuid, String)>(
             r#"
