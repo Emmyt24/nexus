@@ -192,6 +192,32 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        /// The honest form of a property test that used to live in
+        /// `repositories::location` as `if P { prop_assert!(P) }` — it restated
+        /// its own precondition, so it could not fail, and it named itself
+        /// after coordinate validation while never calling any. This sweeps
+        /// past both bounds and holds the real function to the exact range.
+        #[test]
+        fn validation_accepts_exactly_the_valid_range(
+            latitude in -200.0f64..200.0,
+            longitude in -200.0f64..200.0,
+        ) {
+            let in_range = (-90.0..=90.0).contains(&latitude)
+                && (-180.0..=180.0).contains(&longitude);
+            let coords = Coordinates { latitude, longitude };
+
+            proptest::prop_assert_eq!(
+                LocationService::validate_coordinates(&coords).is_ok(),
+                in_range,
+                "({}, {}) should be {}",
+                latitude,
+                longitude,
+                if in_range { "accepted" } else { "rejected" }
+            );
+        }
+    }
+
     #[test]
     fn a_service_radius_must_be_within_one_hundred_km() {
         let coords = Coordinates {

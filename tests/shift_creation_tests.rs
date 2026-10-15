@@ -5,7 +5,7 @@ use nexuscare_backend::models::shift::{
 use nexuscare_backend::repositories::shift::ShiftRepository;
 use nexuscare_backend::utils::money::Naira;
 use nexuscare_backend::services::notification_service::NotificationService;
-use nexuscare_backend::services::shift_service::{ShiftService, ShiftServiceError};
+use nexuscare_backend::services::shift_service::ShiftService;
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -267,14 +267,6 @@ mod shift_creation_tests {
         );
     }
 
-    /// Test hospital name is included in shift
-    #[test]
-    fn test_hospital_name_in_shift() {
-        // Verify that shifts include the hospital name
-        let hospital_name = Some("Lagos University Teaching Hospital".to_string());
-        assert!(hospital_name.is_some());
-        assert_eq!(hospital_name.unwrap(), "Lagos University Teaching Hospital");
-    }
 }
 
 #[cfg(test)]
