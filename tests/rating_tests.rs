@@ -322,8 +322,13 @@ async fn a_colleague_cannot_stack_a_second_rating_on_the_same_shift() {
     );
 
     // And the clinician's public rating reflects one vote, not two.
-    let (rating, count): (Option<f32>, Option<i32>) =
-        sqlx::query_as("SELECT rating, rating_count FROM clinicians WHERE id = $1")
+    let (rating, count): (Option<f64>, Option<i32>) =
+        // `clinicians.rating` is NUMERIC(3,1) and sqlx cannot decode NUMERIC into
+        // a Rust float, so the ::DOUBLE PRECISION cast is load-bearing — the same
+        // reason every settings read in this repo casts.
+        sqlx::query_as(
+            "SELECT rating::DOUBLE PRECISION, rating_count FROM clinicians WHERE id = $1",
+        )
             .bind(f.clinician_id)
             .fetch_one(&pool)
             .await
@@ -890,8 +895,13 @@ async fn the_cached_clinician_rating_matches_the_recomputed_average() {
         .unwrap();
     }
 
-    let (cached, count): (Option<f32>, Option<i32>) =
-        sqlx::query_as("SELECT rating, rating_count FROM clinicians WHERE id = $1")
+    let (cached, count): (Option<f64>, Option<i32>) =
+        // `clinicians.rating` is NUMERIC(3,1) and sqlx cannot decode NUMERIC into
+        // a Rust float, so the ::DOUBLE PRECISION cast is load-bearing — the same
+        // reason every settings read in this repo casts.
+        sqlx::query_as(
+            "SELECT rating::DOUBLE PRECISION, rating_count FROM clinicians WHERE id = $1",
+        )
             .bind(clinician_id)
             .fetch_one(&pool)
             .await
