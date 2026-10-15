@@ -22,6 +22,7 @@ pub mod payout_service;
 pub mod push_service;
 pub mod registration_service;
 pub mod safehaven;
+pub mod search_service;
 pub mod shift_service;
 pub mod video_service;
 pub mod wallet_service;

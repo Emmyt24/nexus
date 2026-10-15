@@ -22,7 +22,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::handlers::{
     admin, auth, clinician_registration, consultation_notes, distance, earnings, emails, health,
     here_maps, hospitals, identity, location, notifications, patients, pipeline, platform,
-    registration, shifts, uploads, video, wallet, webhooks,
+    registration, search, shifts, uploads, video, wallet, webhooks,
 };
 use crate::repositories::{
     admin::AdminRepository, audit::AuditRepository, billing::BillingRepository,
@@ -44,6 +44,7 @@ use crate::services::{
     patient_prediction_service::PatientPredictionService,
     payout_service::PayoutService, push_service::PushService,
     registration_service::RegistrationService, safehaven::SafeHavenClient,
+    search_service::SearchService,
     shift_service::ShiftService, video_service::VideoService, wallet_service::WalletService,
 };
 
@@ -69,6 +70,7 @@ pub struct AppState {
     pub pipeline_events: Arc<tokio::sync::broadcast::Sender<crate::models::patient_prediction::PipelineEvent>>,
     pub consultation_note_service: Arc<ConsultationNoteService>,
     pub video_service: Arc<VideoService>,
+    pub search_service: Arc<SearchService>,
 }
 
 #[derive(OpenApi)]
@@ -121,6 +123,8 @@ pub struct AppState {
         crate::handlers::shifts::preview_shift,
         // Platform configuration readable by hospitals/workers
         crate::handlers::platform::get_platform_fee,
+        // Hospital-scoped search
+        crate::handlers::search::hospital_search,
         crate::handlers::shifts::get_shift,
         crate::handlers::shifts::express_interest,
         crate::handlers::shifts::apply_for_shift,
@@ -247,6 +251,8 @@ pub struct AppState {
             crate::models::shift::RatingFeed,
             crate::models::shift::RatingFeedItem,
             crate::handlers::platform::PlatformFeeResponse,
+            crate::models::search::HospitalSearchResults,
+            crate::models::search::HospitalSearchHit,
             crate::handlers::shifts::ErrorResponse,
             crate::handlers::shifts::ShiftListResponse,
             crate::handlers::shifts::ShiftApplicationsResponse,
@@ -493,7 +499,8 @@ pub struct AppState {
         (name = "identity", description = "BVN/NIN identity verification and bank list"),
         (name = "notifications", description = "Device push-token registration and the in-app notification center"),
         (name = "emails", description = "Generic frontend-templated transactional email relay"),
-        (name = "platform", description = "Platform-wide configuration readable by hospitals and workers")
+        (name = "platform", description = "Platform-wide configuration readable by hospitals and workers"),
+        (name = "search", description = "Hospital-scoped search across shifts, clinicians, patients and handovers")
     ),
     modifiers(&SecurityAddon)
 )]
@@ -636,6 +643,10 @@ pub fn create_router(
         tracing::warn!("LiveKit running in MOCK mode — join tokens are fake");
     }
     let video_repo = Arc::new(VideoSessionRepository::new(pool.clone()));
+    let search_service = Arc::new(SearchService::new(Arc::new(
+        crate::repositories::search::SearchRepository::new(pool.clone()),
+    )));
+
     let video_service = Arc::new(VideoService::new(
         video_repo,
         shift_repo.clone(),
@@ -691,6 +702,7 @@ pub fn create_router(
         pipeline_events,
         consultation_note_service,
         video_service,
+        search_service,
     };
 
     let api_router = Router::new()
@@ -859,6 +871,17 @@ pub fn create_router(
             get(platform::get_platform_fee).route_layer(from_fn(require_role(&[
                 UserRole::HospitalAdmin,
                 UserRole::HealthWorker,
+                UserRole::SuperAdmin,
+            ]))),
+        )
+        // Hospital-scoped search. The tenant is taken from the token inside
+        // SearchService, not from a parameter — a `hospital_id` argument here
+        // would be a cross-tenant read with a legitimate role attached, which
+        // the route guard cannot detect. Platform staff use /admin/search.
+        .route(
+            "/api/v1/search",
+            get(search::hospital_search).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
                 UserRole::SuperAdmin,
             ]))),
         )

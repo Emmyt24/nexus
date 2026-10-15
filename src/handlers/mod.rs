@@ -15,6 +15,7 @@ pub mod patients;
 pub mod pipeline;
 pub mod platform;
 pub mod registration;
+pub mod search;
 pub mod shifts;
 pub mod uploads;
 pub mod video;

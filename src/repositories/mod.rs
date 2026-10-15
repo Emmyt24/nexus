@@ -10,6 +10,7 @@ pub mod location;
 pub mod notification;
 pub mod patient;
 pub mod patient_prediction;
+pub mod search;
 pub mod shift;
 pub mod video_session;
 pub mod wallet;

@@ -16,6 +16,7 @@ pub mod notification;
 pub mod patient;
 pub mod patient_prediction;
 pub mod registration;
+pub mod search;
 pub mod shift;
 pub mod user;
 pub mod video_session;
