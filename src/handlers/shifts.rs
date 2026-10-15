@@ -14,7 +14,7 @@ use crate::{
         EditRatingRequest, HandoverAppealRequest, HandoverResponse, HandoverRevisionRequest,
         MyApplicationEntry,
         NearbyShiftsResponse, RankedInterestedClinician, RateHospitalRequest, RateWorkerRequest,
-        RatingResponse, Shift, ShiftApplication, ShiftApplicationRequest, ShiftApplicationsQuery,
+        RatingFeed, RatingResponse, Shift, ShiftApplication, ShiftApplicationRequest, ShiftApplicationsQuery,
         ShiftDetailResponse,
         ShiftAssignRequest, ShiftCancelRequest, ShiftListQuery,
         ShiftOfferRequest, ShiftOfferResponse, ShiftRescheduleRequest, SubmitHandoverRequest,
@@ -846,12 +846,10 @@ pub async fn rate_worker(
     Json(payload): Json<RateWorkerRequest>,
 ) -> AppResult<(StatusCode, Json<RatingResponse>)> {
     let claims = extract_claims(&headers)?;
-    let requester_user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| AppError::Unauthorized("Invalid user ID in token".to_string()))?;
 
     let rating = state
         .shift_service
-        .rate_worker(shift_id, requester_user_id, payload)
+        .rate_worker(shift_id, &claims, payload)
         .await
         .map_err(map_shift_error)?;
 
@@ -893,6 +891,83 @@ pub async fn rate_hospital(
         .map_err(map_shift_error)?;
 
     Ok((StatusCode::CREATED, Json(rating)))
+}
+
+
+/// Query for a page of ratings.
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub struct RatingFeedQuery {
+    /// Page size, 1-100. Defaults to 20.
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// GET /api/v1/clinicians/{clinician_id}/ratings
+#[utoipa::path(
+    get,
+    path = "/api/v1/clinicians/{clinician_id}/ratings",
+    params(
+        ("clinician_id" = Uuid, Path, description = "Clinician being rated"),
+        RatingFeedQuery
+    ),
+    responses(
+        (status = 200, description = "Ratings written about this clinician", body = RatingFeed),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Role may not read ratings", body = ErrorResponse),
+        (status = 422, description = "Validation error", body = ErrorResponse)
+    ),
+    tag = "shifts",
+    summary = "List a clinician's ratings",
+    description = "Newest first, with the overall average and total across all ratings — not \
+                   just this page. `rater_name` is null for anonymous ratings, which is the \
+                   default (BR-F1-48).",
+    security(("bearerAuth" = []))
+)]
+pub async fn list_clinician_ratings(
+    State(state): State<AppState>,
+    Path(clinician_id): Path<Uuid>,
+    Query(q): Query<RatingFeedQuery>,
+) -> AppResult<Json<RatingFeed>> {
+    let feed = state
+        .shift_service
+        .list_ratings("clinician", clinician_id, q.limit.unwrap_or(20), q.offset.unwrap_or(0))
+        .await
+        .map_err(map_shift_error)?;
+    Ok(Json(feed))
+}
+
+/// GET /api/v1/hospitals/{hospital_id}/ratings
+#[utoipa::path(
+    get,
+    path = "/api/v1/hospitals/{hospital_id}/ratings",
+    params(
+        ("hospital_id" = Uuid, Path, description = "Hospital being rated"),
+        RatingFeedQuery
+    ),
+    responses(
+        (status = 200, description = "Ratings written about this hospital", body = RatingFeed),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Role may not read ratings", body = ErrorResponse),
+        (status = 422, description = "Validation error", body = ErrorResponse)
+    ),
+    tag = "shifts",
+    summary = "List a hospital's ratings",
+    description = "Newest first, with the overall average and total across all ratings. Items \
+                   carry the four sub-scores (staff support, equipment, communication, payment \
+                   timeliness) in `dimensions`. `rater_name` is null for anonymous ratings.",
+    security(("bearerAuth" = []))
+)]
+pub async fn list_hospital_ratings(
+    State(state): State<AppState>,
+    Path(hospital_id): Path<Uuid>,
+    Query(q): Query<RatingFeedQuery>,
+) -> AppResult<Json<RatingFeed>> {
+    let feed = state
+        .shift_service
+        .list_ratings("hospital", hospital_id, q.limit.unwrap_or(20), q.offset.unwrap_or(0))
+        .await
+        .map_err(map_shift_error)?;
+    Ok(Json(feed))
 }
 
 /// PATCH /api/v1/ratings/{rating_id}

@@ -192,6 +192,12 @@ pub struct Shift {
     /// `#[sqlx(default)]` so column-list SELECTs that omit it still decode.
     #[sqlx(default)]
     pub attachment_urls: Option<serde_json::Value>,
+    /// When the shift reached `completed`. Written where the status transition
+    /// happens, and the anchor for the rating windows — `updated_at` moves on
+    /// any write to the row, which silently slid those deadlines.
+    /// `#[sqlx(default)]` so column-list SELECTs that omit it still decode.
+    #[sqlx(default)]
+    pub completed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -885,6 +891,11 @@ pub struct RateWorkerRequest {
     pub score: i16,
     #[validate(length(max = 2000))]
     pub comment: Option<String>,
+    /// Hide the rater's identity from the ratee (BR-F1-48). Defaults to true:
+    /// ratings have always been stored anonymous, and a client that omits the
+    /// field must not accidentally start revealing who rated whom.
+    #[serde(default = "default_true")]
+    pub is_anonymous: bool,
 }
 
 /// Request body for `POST /api/v1/shifts/{shift_id}/ratings/hospital`.
@@ -896,6 +907,11 @@ pub struct RateHospitalRequest {
     pub comment: Option<String>,
     #[validate(nested)]
     pub dimensions: HospitalRatingDimensions,
+    /// Hide the rater's identity from the ratee (BR-F1-48). Defaults to true:
+    /// ratings have always been stored anonymous, and a client that omits the
+    /// field must not accidentally start revealing who rated whom.
+    #[serde(default = "default_true")]
+    pub is_anonymous: bool,
 }
 
 /// Request body for `PATCH /api/v1/ratings/{rating_id}` — edit within 48h
@@ -907,6 +923,10 @@ pub struct EditRatingRequest {
     pub comment: Option<String>,
     #[validate(nested)]
     pub dimensions: Option<HospitalRatingDimensions>,
+    /// Withdraw the comment entirely. Needed because an omitted `comment` means
+    /// "leave it as it is", so there was otherwise no way to take one back.
+    #[serde(default)]
+    pub clear_comment: bool,
 }
 
 // Shift detail (SCRUM-25 / US-09)
@@ -1013,6 +1033,39 @@ pub struct MyApplicationEntry {
     pub created_at: DateTime<Utc>,
 }
 
+/// One rating as it is shown to the person or hospital being rated.
+///
+/// Deliberately *not* `RatingResponse`: that type carries `editable_until` and
+/// `window_closes_at`, which are the rater's business, and it has no rater name.
+/// Here the rater is named only when they chose not to be anonymous, so the
+/// reader cannot infer identity from what is present (BR-F1-48).
+#[derive(Debug, Serialize, Deserialize, ToSchema, FromRow)]
+pub struct RatingFeedItem {
+    pub id: Uuid,
+    pub shift_id: Uuid,
+    /// Role title of the shift the rating came from — context without exposing
+    /// who the other party was.
+    pub shift_role_title: Option<String>,
+    pub score: i16,
+    /// Sub-scores, present on worker-rates-hospital ratings only.
+    pub dimensions: Option<serde_json::Value>,
+    pub comment: Option<String>,
+    /// NULL when the rating is anonymous, which is the default.
+    pub rater_name: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A page of ratings plus the aggregate, so a caller needs one request to
+/// render a profile's rating section.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RatingFeed {
+    /// Mean score across *all* ratings, not just this page. NULL when none.
+    pub average: Option<f64>,
+    /// Total number of ratings, not the length of `items`.
+    pub total: i64,
+    pub items: Vec<RatingFeedItem>,
+}
+
 /// API response for a stored rating.
 #[derive(Debug, Clone, Serialize, ToSchema, FromRow)]
 pub struct RatingResponse {
@@ -1027,4 +1080,10 @@ pub struct RatingResponse {
     pub editable_until: DateTime<Utc>,
     pub window_closes_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+}
+
+/// serde default for `is_anonymous`: absent means anonymous, preserving the
+/// behaviour from before the field was settable.
+fn default_true() -> bool {
+    true
 }

@@ -139,6 +139,8 @@ pub struct AppState {
         crate::handlers::shifts::rate_worker,
         crate::handlers::shifts::rate_hospital,
         crate::handlers::shifts::edit_rating,
+        crate::handlers::shifts::list_clinician_ratings,
+        crate::handlers::shifts::list_hospital_ratings,
         crate::handlers::shifts::list_nearby_shifts,
         crate::handlers::shifts::list_my_applications,
         crate::handlers::shifts::withdraw_interest,
@@ -242,6 +244,8 @@ pub struct AppState {
             crate::handlers::registration::ListHospitalsQuery,
             // Shifts
             crate::handlers::shifts::ShiftPreviewResponse,
+            crate::models::shift::RatingFeed,
+            crate::models::shift::RatingFeedItem,
             crate::handlers::platform::PlatformFeeResponse,
             crate::handlers::shifts::ErrorResponse,
             crate::handlers::shifts::ShiftListResponse,
@@ -948,6 +952,29 @@ pub fn create_router(
                 .route_layer(from_fn(require_role(&[UserRole::HealthWorker]))),
         )
         .route("/api/v1/ratings/{rating_id}", patch(shifts::edit_rating))
+        // The read side of ratings. Comments were persisted and never
+        // returned, so neither party could see what was said about them.
+        // Authenticated but not tenant-scoped: both sides of the marketplace
+        // need these to choose each other, and the aggregate is already public
+        // on the worker/hospital detail endpoints.
+        .route(
+            "/api/v1/clinicians/{clinician_id}/ratings",
+            get(shifts::list_clinician_ratings).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::HealthWorker,
+                UserRole::SuperAdmin,
+                UserRole::OperationsAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/hospitals/{hospital_id}/ratings",
+            get(shifts::list_hospital_ratings).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::HealthWorker,
+                UserRole::SuperAdmin,
+                UserRole::OperationsAdmin,
+            ]))),
+        )
         .route(
             "/api/v1/worker/shifts/nearby",
             get(shifts::list_nearby_shifts)

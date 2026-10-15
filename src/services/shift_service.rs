@@ -4,6 +4,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::models::shift::{CreateShiftRequest, Shift, ShiftPriority, ShiftStatus, ShiftType};
+use crate::models::user::{Claims, UserRole};
 use crate::repositories::shift::ShiftRepository;
 use crate::services::email_outbox_service::EmailOutboxService;
 use crate::services::email_templates;
@@ -1705,10 +1706,24 @@ impl ShiftService {
         let worked_minutes = now.signed_duration_since(clockin_at).num_minutes().max(0) as i32;
 
         let mut tx = self.pool.begin().await?;
-        let attendance_id = self
+        // `record_clockout_tx` is guarded on `in_progress` and reports
+        // `RowNotFound` when it loses that race — the status check above is a
+        // read-then-write and cannot be the authority. Translate it into the
+        // same 409 the pre-check produces rather than letting a lost race
+        // surface as a 500.
+        let attendance_id = match self
             .shift_repo
             .record_clockout_tx(&mut tx, shift_id, worked_minutes)
-            .await?;
+            .await
+        {
+            Ok(id) => id,
+            Err(sqlx::Error::RowNotFound) => {
+                return Err(ShiftServiceError::InvalidStatus(
+                    "Shift is no longer in progress; it may already have been closed".to_string(),
+                ));
+            }
+            Err(e) => return Err(ShiftServiceError::DatabaseError(e)),
+        };
         tx.commit().await?;
 
         Ok(ClockoutResponse {
@@ -1800,10 +1815,51 @@ impl ShiftService {
 
     /// Hospital rates the assigned worker
 
+    /// A page of ratings written about a clinician or a hospital.
+    ///
+    /// `ratee_kind` is validated here rather than taken from the caller as a
+    /// free string: it is interpolated into a Postgres enum cast, and the two
+    /// read endpoints each know which kind they are asking for.
+    ///
+    /// Not tenant-scoped, deliberately. A clinician's rating is already public
+    /// on `GET /workers/{id}` and a hospital's on `GET /hospitals/{id}`; this
+    /// adds the comments behind them, which both sides of the marketplace need
+    /// in order to choose each other. The rater's identity stays hidden unless
+    /// they waived anonymity.
+    pub async fn list_ratings(
+        &self,
+        ratee_kind: &str,
+        ratee_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<crate::models::shift::RatingFeed, ShiftServiceError> {
+        if !matches!(ratee_kind, "clinician" | "hospital") {
+            return Err(ShiftServiceError::ValidationError(
+                "ratee_kind must be 'clinician' or 'hospital'".to_string(),
+            ));
+        }
+
+        let limit = limit.clamp(1, 100);
+        let offset = offset.max(0);
+
+        let (items, average, total) = self
+            .shift_repo
+            .list_ratings_for(ratee_kind, ratee_id, limit, offset)
+            .await?;
+
+        Ok(crate::models::shift::RatingFeed {
+            average,
+            total,
+            items,
+        })
+    }
+
+    /// Takes `&Claims` rather than a bare user id because the authorization here
+    /// is a *tenant* check, which needs the caller's role and hospital.
     pub async fn rate_worker(
         &self,
         shift_id: Uuid,
-        requester_user_id: Uuid,
+        claims: &Claims,
         request: crate::models::shift::RateWorkerRequest,
     ) -> Result<crate::models::shift::RatingResponse, ShiftServiceError> {
         use validator::Validate;
@@ -1811,14 +1867,27 @@ impl ShiftService {
             .validate()
             .map_err(|e| ShiftServiceError::ValidationError(e.to_string()))?;
 
+        let requester_user_id = Uuid::parse_str(&claims.sub)
+            .map_err(|_| ShiftServiceError::NotAuthorized)?;
+
         let shift = self
             .shift_repo
             .get_by_id(shift_id)
             .await?
             .ok_or(ShiftServiceError::NotFound(shift_id))?;
 
-        if shift.created_by != requester_user_id {
-            return Err(ShiftServiceError::NotAuthorized);
+        // The hospital rates the worker, not the individual who happened to post
+        // the shift. This used to compare `shift.created_by` against the caller,
+        // which 403'd a second admin at the same hospital — simultaneously too
+        // narrow and not a tenant check at all.
+        match claims.role {
+            UserRole::SuperAdmin => {}
+            UserRole::HospitalAdmin => {
+                if claims_hospital_id(claims) != Some(shift.hospital_id) {
+                    return Err(ShiftServiceError::NotAuthorized);
+                }
+            }
+            _ => return Err(ShiftServiceError::NotAuthorized),
         }
         if shift.status != ShiftStatus::Completed {
             return Err(ShiftServiceError::InvalidStatus(
@@ -1829,8 +1898,11 @@ impl ShiftService {
             ShiftServiceError::InvalidStatus("Shift has no assigned clinician to rate".to_string())
         })?;
 
-        // 7-day submission window after completion. We use the
-        let window_closes_at = shift.updated_at + Duration::days(7);
+        // 7-day submission window from completion (BR-F1-46). Anchored to
+        // `completed_at`, not `updated_at`: the latter moves on any write to the
+        // row, which silently slid this deadline. `updated_at` remains the
+        // fallback for shifts completed before that column existed.
+        let window_closes_at = shift.completed_at.unwrap_or(shift.updated_at) + Duration::days(7);
         if Utc::now() > window_closes_at {
             return Err(ShiftServiceError::RatingWindowClosed);
         }
@@ -1847,6 +1919,7 @@ impl ShiftService {
                 request.score,
                 None,
                 request.comment.as_deref(),
+                request.is_anonymous,
                 window_closes_at,
             )
             .await
@@ -1899,7 +1972,8 @@ impl ShiftService {
             ));
         }
 
-        let window_closes_at = shift.updated_at + Duration::days(7);
+        // Same anchor as `rate_worker` — see the comment there.
+        let window_closes_at = shift.completed_at.unwrap_or(shift.updated_at) + Duration::days(7);
         if Utc::now() > window_closes_at {
             return Err(ShiftServiceError::RatingWindowClosed);
         }
@@ -1920,6 +1994,7 @@ impl ShiftService {
                 request.score,
                 Some(&dims_json),
                 request.comment.as_deref(),
+                request.is_anonymous,
                 window_closes_at,
             )
             .await
@@ -1977,6 +2052,7 @@ impl ShiftService {
                 request.score,
                 dims_json.as_ref(),
                 request.comment.as_deref(),
+                request.clear_comment,
             )
             .await?;
 
@@ -3174,4 +3250,16 @@ mod consult_deep_link_tests {
         let link = with_base_url(Some("https://app.example.test"), || consult_deep_link(None));
         assert_eq!(link, "https://app.example.test/consults/preview");
     }
+}
+
+/// `Claims.hospital_id` is a string on the wire; parse it once.
+///
+/// Mirrors the helper of the same name in `video_service`, deliberately rather
+/// than sharing it: both are three lines, and a shared one would couple the
+/// shift domain to the video domain for no gain.
+fn claims_hospital_id(claims: &Claims) -> Option<Uuid> {
+    claims
+        .hospital_id
+        .as_deref()
+        .and_then(|id| Uuid::parse_str(id).ok())
 }

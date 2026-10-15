@@ -724,16 +724,32 @@ impl ShiftRepository {
         .fetch_one(&mut **tx)
         .await?;
 
-        sqlx::query(
+        // Guarded on `in_progress` so a late or retried clock-out cannot
+        // resurrect a shift that has already reached a terminal state. The
+        // service checks the status first, but that is a read-then-write and
+        // loses the race; this is the authority. Compare the comment on
+        // `accept_offer_tx`, and `record_clockin_if_absent_tx` below.
+        //
+        // `completed_at` is set here because this is the only place a clock-out
+        // completes a shift. It is what the rating windows are measured from, so
+        // it must not be left to `updated_at`.
+        let completed = sqlx::query(
             r#"
             UPDATE shifts
-               SET status = 'completed', updated_at = NOW()
-             WHERE id = $1
+               SET status       = 'completed',
+                   completed_at = COALESCE(completed_at, NOW()),
+                   updated_at   = NOW()
+             WHERE id = $1 AND status = 'in_progress'
             "#,
         )
         .bind(shift_id)
         .execute(&mut **tx)
         .await?;
+
+        if completed.rows_affected() == 0 {
+            // Someone else moved this shift out of `in_progress` first.
+            return Err(sqlx::Error::RowNotFound);
+        }
 
         Ok(id)
     }
@@ -789,6 +805,7 @@ impl ShiftRepository {
         score: i16,
         dimensions: Option<&serde_json::Value>,
         comment: Option<&str>,
+        is_anonymous: bool,
         window_closes_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::models::shift::RatingResponse, sqlx::Error> {
         sqlx::query_as::<_, crate::models::shift::RatingResponse>(
@@ -800,8 +817,8 @@ impl ShiftRepository {
             )
             VALUES (
                 $1, $2, $3, $4::rating_ratee_kind,
-                $5, $6, $7, TRUE,
-                NOW() + INTERVAL '48 hours', $8
+                $5, $6, $7, $8,
+                NOW() + INTERVAL '48 hours', $9
             )
             RETURNING
                 id, shift_id, ratee_id, ratee_kind::text AS ratee_kind,
@@ -816,6 +833,7 @@ impl ShiftRepository {
         .bind(score)
         .bind(dimensions)
         .bind(comment)
+        .bind(is_anonymous)
         .bind(window_closes_at)
         .fetch_one(&mut **tx)
         .await
@@ -823,19 +841,24 @@ impl ShiftRepository {
 
     /// Edit a rating within the 48h window. Caller validates the
 
+    /// `clear_comment` exists because the `COALESCE` pattern used for the other
+    /// fields makes NULL mean "leave unchanged", so a comment could be rewritten
+    /// but never withdrawn. Someone who regrets what they wrote needs to be able
+    /// to remove it inside the edit window, not just replace it with a space.
     pub async fn update_rating(
         &self,
         rating_id: Uuid,
         score: Option<i16>,
         dimensions: Option<&serde_json::Value>,
         comment: Option<&str>,
+        clear_comment: bool,
     ) -> Result<crate::models::shift::RatingResponse, sqlx::Error> {
         sqlx::query_as::<_, crate::models::shift::RatingResponse>(
             r#"
             UPDATE shift_ratings
                SET score      = COALESCE($2, score),
                    dimensions = COALESCE($3, dimensions),
-                   comment    = COALESCE($4, comment),
+                   comment    = CASE WHEN $5 THEN NULL ELSE COALESCE($4, comment) END,
                    updated_at = NOW()
              WHERE id = $1
              RETURNING
@@ -848,6 +871,7 @@ impl ShiftRepository {
         .bind(score)
         .bind(dimensions)
         .bind(comment)
+        .bind(clear_comment)
         .fetch_one(&self.pool)
         .await
     }
@@ -1535,6 +1559,64 @@ impl ShiftRepository {
     /// Average score (1–5) and count of submitted ratings for a hospital
     /// (SCRUM-25 / US-09 AC-05). Returns `(None, 0)` when the hospital has no
     /// ratings yet.
+    /// A page of ratings written *about* `ratee_id`, newest first, with the
+    /// aggregate over the whole set.
+    ///
+    /// The rater's name is resolved in SQL and returned only when the rating is
+    /// not anonymous, so an anonymous rater's identity never leaves the
+    /// database. Doing that filtering in Rust would mean selecting the name and
+    /// trusting every caller to drop it.
+    pub async fn list_ratings_for(
+        &self,
+        ratee_kind: &str,
+        ratee_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<crate::models::shift::RatingFeedItem>, Option<f64>, i64), sqlx::Error> {
+        let items = sqlx::query_as::<_, crate::models::shift::RatingFeedItem>(
+            r#"
+            SELECT r.id,
+                   r.shift_id,
+                   s.role_title AS shift_role_title,
+                   r.score,
+                   r.dimensions,
+                   r.comment,
+                   CASE WHEN r.is_anonymous THEN NULL
+                        ELSE NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' ||
+                                         COALESCE(u.last_name, '')), '')
+                   END AS rater_name,
+                   r.created_at
+            FROM shift_ratings r
+            LEFT JOIN shifts s ON s.id = r.shift_id
+            LEFT JOIN users  u ON u.id = r.rater_user_id
+            WHERE r.ratee_kind = $1::rating_ratee_kind
+              AND r.ratee_id   = $2
+            ORDER BY r.created_at DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(ratee_kind)
+        .bind(ratee_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let (average, total) = sqlx::query_as::<_, (Option<f64>, i64)>(
+            r#"
+            SELECT AVG(score)::float8, COUNT(*)
+            FROM shift_ratings
+            WHERE ratee_kind = $1::rating_ratee_kind AND ratee_id = $2
+            "#,
+        )
+        .bind(ratee_kind)
+        .bind(ratee_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok((items, average, total))
+    }
+
     pub async fn hospital_rating_summary(
         &self,
         hospital_id: Uuid,
