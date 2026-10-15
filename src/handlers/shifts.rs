@@ -920,17 +920,20 @@ pub struct RatingFeedQuery {
     summary = "List a clinician's ratings",
     description = "Newest first, with the overall average and total across all ratings — not \
                    just this page. `rater_name` is null for anonymous ratings, which is the \
-                   default (BR-F1-48).",
+                   default (BR-F1-48). A health worker may only read their own feed; hospitals \
+                   and platform staff may read any clinician's.",
     security(("bearerAuth" = []))
 )]
 pub async fn list_clinician_ratings(
     State(state): State<AppState>,
     Path(clinician_id): Path<Uuid>,
+    headers: HeaderMap,
     Query(q): Query<RatingFeedQuery>,
 ) -> AppResult<Json<RatingFeed>> {
+    let claims = extract_claims(&headers)?;
     let feed = state
         .shift_service
-        .list_ratings("clinician", clinician_id, q.limit.unwrap_or(20), q.offset.unwrap_or(0))
+        .list_ratings(&claims, "clinician", clinician_id, q.limit.unwrap_or(20), q.offset.unwrap_or(0))
         .await
         .map_err(map_shift_error)?;
     Ok(Json(feed))
@@ -960,11 +963,13 @@ pub async fn list_clinician_ratings(
 pub async fn list_hospital_ratings(
     State(state): State<AppState>,
     Path(hospital_id): Path<Uuid>,
+    headers: HeaderMap,
     Query(q): Query<RatingFeedQuery>,
 ) -> AppResult<Json<RatingFeed>> {
+    let claims = extract_claims(&headers)?;
     let feed = state
         .shift_service
-        .list_ratings("hospital", hospital_id, q.limit.unwrap_or(20), q.offset.unwrap_or(0))
+        .list_ratings(&claims, "hospital", hospital_id, q.limit.unwrap_or(20), q.offset.unwrap_or(0))
         .await
         .map_err(map_shift_error)?;
     Ok(Json(feed))

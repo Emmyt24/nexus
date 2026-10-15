@@ -168,20 +168,35 @@ impl AdminService {
                 ));
             }
 
-            // A flat fee at or above the smallest shift a hospital can post
-            // would swallow that shift's whole gross, leaving a net of zero —
-            // which `PayoutService::process_one` then rejects as "below minimum
-            // payout", burning the 3-failure retry budget on every small shift.
-            // Reject it here as a 400 rather than letting it surface later as a
-            // pile of failed payouts. Compared in kobo: the stored fee is naira.
+            // A flat fee can exceed a small shift's gross. That is *safe* —
+            // `compute_platform_fee` clamps the fee to the gross so the net can
+            // never go negative — but it is rarely intended, and its real
+            // consequence is downstream: `PayoutService::process_one` compares
+            // `min_payout_kobo()` against the net, so a fee that zeroes the net
+            // sends every such payout into the "below minimum" bucket and burns
+            // the 3-failure retry budget.
+            //
+            // This is a warning rather than a rejection, deliberately. The
+            // obvious threshold to reject against is
+            // `platform_settings.min_hourly_rate_kobo`, but that setting is read
+            // by nothing else in the codebase — `validate_request` enforces a
+            // hardcoded `MIN_HOURLY_KOBO` of ₦100 instead. Keying a hard 400 to
+            // a value the rest of the system ignores would reject legitimate
+            // configurations (a ₦2,000 flat fee on a ₦64,000 shift is ~3%) while
+            // still admitting a fee that zeroes the genuinely smallest shift.
+            // Until that setting is actually honoured, the clamp is the
+            // guarantee and this is advice.
             let current = self.repo.get_settings().await?;
-            let min_rate_kobo = p.min_hourly_rate_kobo.unwrap_or(current.min_hourly_rate_kobo);
-            if flat_naira.saturating_mul(100) >= min_rate_kobo && min_rate_kobo > 0 {
-                return Err(AppError::BadRequest(format!(
-                    "platform_fee_flat_naira (₦{}) must be below the minimum shift rate (₦{})",
+            let advertised_min_kobo =
+                p.min_hourly_rate_kobo.unwrap_or(current.min_hourly_rate_kobo);
+            if advertised_min_kobo > 0 && flat_naira.saturating_mul(100) >= advertised_min_kobo {
+                tracing::warn!(
                     flat_naira,
-                    min_rate_kobo / 100
-                )));
+                    advertised_min_hourly_kobo = advertised_min_kobo,
+                    "flat platform fee is at or above the advertised minimum hourly rate; \
+                     payouts on the smallest shifts will net zero and fail the minimum-payout \
+                     check"
+                );
             }
         }
 

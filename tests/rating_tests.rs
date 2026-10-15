@@ -210,6 +210,11 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     seed_fixture_completed_at(pool, Utc::now()).await
 }
 
+/// The hospital admin who posted the shift, as a caller.
+fn admin_claims(f: &Fixture) -> Claims {
+    claims(f.creator_user_id, UserRole::HospitalAdmin, Some(f.hospital_id))
+}
+
 fn worker_rating(score: i16) -> RateWorkerRequest {
     RateWorkerRequest {
         score,
@@ -659,7 +664,7 @@ async fn a_clinicians_ratings_can_be_read_back_with_the_aggregate() {
     .unwrap();
 
     let feed = svc
-        .list_ratings("clinician", f.clinician_id, 20, 0)
+        .list_ratings(&admin_claims(&f), "clinician", f.clinician_id, 20, 0)
         .await
         .expect("the feed should be readable");
 
@@ -698,7 +703,7 @@ async fn an_anonymous_rating_never_names_its_author() {
     .await
     .unwrap();
 
-    let feed = svc.list_ratings("clinician", f.clinician_id, 20, 0).await.unwrap();
+    let feed = svc.list_ratings(&admin_claims(&f), "clinician", f.clinician_id, 20, 0).await.unwrap();
     assert_eq!(
         feed.items[0].rater_name, None,
         "BR-F1-48: an anonymous rater must not be identifiable"
@@ -723,7 +728,7 @@ async fn a_rater_who_waives_anonymity_is_named() {
     .await
     .unwrap();
 
-    let feed = svc.list_ratings("clinician", f.clinician_id, 20, 0).await.unwrap();
+    let feed = svc.list_ratings(&admin_claims(&f), "clinician", f.clinician_id, 20, 0).await.unwrap();
     assert_eq!(
         feed.items[0].rater_name.as_deref(),
         Some("Ada Okeke"),
@@ -741,7 +746,7 @@ async fn a_hospitals_feed_carries_the_four_sub_scores() {
         .await
         .unwrap();
 
-    let feed = svc.list_ratings("hospital", f.hospital_id, 20, 0).await.unwrap();
+    let feed = svc.list_ratings(&admin_claims(&f), "hospital", f.hospital_id, 20, 0).await.unwrap();
     assert_eq!(feed.total, 1);
     let dims = feed.items[0]
         .dimensions
@@ -762,7 +767,7 @@ async fn one_hospitals_ratings_do_not_appear_in_anothers_feed() {
         .unwrap();
 
     let unrelated = seed_hospital(&pool).await;
-    let feed = svc.list_ratings("hospital", unrelated, 20, 0).await.unwrap();
+    let feed = svc.list_ratings(&admin_claims(&f), "hospital", unrelated, 20, 0).await.unwrap();
     assert_eq!(feed.total, 0, "ratings are keyed to their ratee");
     assert!(feed.items.is_empty());
     assert_eq!(feed.average, None);
@@ -775,7 +780,13 @@ async fn an_unknown_ratee_kind_is_refused() {
 
     // `ratee_kind` is cast to a Postgres enum, so it is validated rather than
     // passed through from a caller.
-    let result = svc.list_ratings("admin", Uuid::new_v4(), 20, 0).await;
+    let result = svc.list_ratings(
+        &claims(Uuid::new_v4(), UserRole::HospitalAdmin, Some(Uuid::new_v4())),
+        "admin",
+        Uuid::new_v4(),
+        20,
+        0,
+    ).await;
     assert!(
         matches!(result, Err(ShiftServiceError::ValidationError(_))),
         "got {result:?}"
@@ -821,7 +832,94 @@ async fn the_cached_clinician_rating_matches_the_recomputed_average() {
         "cached rating {cached} should be the mean of 5 and 2"
     );
 
-    let feed = svc.list_ratings("clinician", clinician_id, 20, 0).await.unwrap();
+    let feed = svc.list_ratings(&claims(admin, UserRole::HospitalAdmin, Some(hospital_id)), "clinician", clinician_id, 20, 0).await.unwrap();
     assert_eq!(feed.total, 2);
     assert_eq!(feed.average, Some(3.5), "the feed aggregate must agree");
+}
+
+// 7 — who may read a rating feed. A clinician's written feedback is not open to
+//     every other clinician on the platform.
+
+#[tokio::test]
+async fn a_worker_can_read_their_own_rating_feed() {
+    let Some(pool) = test_pool().await else { return };
+    let svc = shift_service(&pool);
+    let f = seed_fixture(&pool).await;
+
+    svc.rate_worker(f.shift_id, &admin_claims(&f), worker_rating(4))
+        .await
+        .unwrap();
+
+    let feed = svc
+        .list_ratings(
+            &claims(f.worker_user_id, UserRole::HealthWorker, None),
+            "clinician",
+            f.clinician_id,
+            20,
+            0,
+        )
+        .await
+        .expect("a worker should be able to read their own feedback");
+
+    assert_eq!(feed.total, 1);
+}
+
+#[tokio::test]
+async fn a_worker_cannot_read_another_workers_rating_feed() {
+    let Some(pool) = test_pool().await else { return };
+    let svc = shift_service(&pool);
+    let f = seed_fixture(&pool).await;
+
+    svc.rate_worker(f.shift_id, &admin_claims(&f), worker_rating(1))
+        .await
+        .unwrap();
+
+    // A different clinician on the platform. The route guard admits any health
+    // worker, so the service has to be the one that refuses.
+    let rival_user = seed_user(&pool, "health_worker", None).await;
+    seed_clinician(&pool, rival_user).await;
+
+    let result = svc
+        .list_ratings(
+            &claims(rival_user, UserRole::HealthWorker, None),
+            "clinician",
+            f.clinician_id,
+            20,
+            0,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(ShiftServiceError::NotAuthorized)),
+        "a competing clinician must not read someone else's performance feedback; got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_worker_can_read_any_hospitals_rating_feed() {
+    let Some(pool) = test_pool().await else { return };
+    let svc = shift_service(&pool);
+    let f = seed_fixture(&pool).await;
+
+    svc.rate_hospital(f.shift_id, f.worker_user_id, hospital_rating(5))
+        .await
+        .unwrap();
+
+    // A clinician weighing up a shift needs to see what the hospital is like,
+    // including one they have never worked for (BR-F1-49).
+    let other_worker = seed_user(&pool, "health_worker", None).await;
+    seed_clinician(&pool, other_worker).await;
+
+    let feed = svc
+        .list_ratings(
+            &claims(other_worker, UserRole::HealthWorker, None),
+            "hospital",
+            f.hospital_id,
+            20,
+            0,
+        )
+        .await
+        .expect("hospital feedback is marketplace information");
+
+    assert_eq!(feed.total, 1);
 }

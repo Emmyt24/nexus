@@ -171,7 +171,7 @@ pub async fn get_registration_status(
         (status = 409, description = "Invalid status transition", body = ErrorResponse)
     ),
     security(
-        ("bearer_auth" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn approve_hospital(
@@ -234,7 +234,7 @@ pub async fn approve_hospital(
         (status = 409, description = "Invalid status transition", body = ErrorResponse)
     ),
     security(
-        ("bearer_auth" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn reject_hospital(

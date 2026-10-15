@@ -1478,3 +1478,175 @@ fn admin_dashboard_routes() -> Router<AppState> {
                 .route_layer(from_fn(require_permission(P::ViewHospitals))),
         )
 }
+
+#[cfg(test)]
+mod openapi_tests {
+    use super::*;
+    use utoipa::OpenApi;
+
+    /// Adding an endpoint here is a four-step change: the handler attribute, the
+    /// `.route(...)`, the entry in `paths(...)`, and the DTO in
+    /// `components(schemas(...))`. Miss the third and the route is invisible in
+    /// the spec while compiling perfectly — which is what commit `b3eca25`
+    /// existed to fix, for four routes at once. CI runs neither the tests nor
+    /// any spec check, so these assertions are the only thing standing between
+    /// a forgotten registration and a frontend that cannot see the endpoint.
+    ///
+    /// No database needed: the document is generated from the attribute macros.
+    fn spec() -> serde_json::Value {
+        serde_json::to_value(ApiDoc::openapi()).expect("the OpenAPI document should serialise")
+    }
+
+    #[test]
+    fn every_registered_route_appears_in_the_spec() {
+        let spec = spec();
+        let paths = spec["paths"].as_object().expect("paths object");
+
+        for (path, method) in [
+            ("/api/v1/platform/fee", "get"),
+            ("/api/v1/search", "get"),
+            ("/api/v1/clinicians/{clinician_id}/ratings", "get"),
+            ("/api/v1/hospitals/{hospital_id}/ratings", "get"),
+            ("/api/v1/shifts/preview", "post"),
+        ] {
+            let item = paths
+                .get(path)
+                .unwrap_or_else(|| panic!("{path} is missing from the OpenAPI spec"));
+            assert!(
+                item.get(method).is_some(),
+                "{path} is in the spec but has no {method} operation"
+            );
+        }
+    }
+
+    /// `e2f913b` fixed two handlers that referenced `bearer_auth` while the
+    /// registered scheme is `bearerAuth`. A name that does not resolve produces
+    /// a document Swagger renders without an auth button, silently.
+    #[test]
+    fn every_security_requirement_names_a_registered_scheme() {
+        let spec = spec();
+        let registered: Vec<String> = spec["components"]["securitySchemes"]
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            registered.contains(&"bearerAuth".to_string()),
+            "bearerAuth should be registered, found {registered:?}"
+        );
+
+        let mut checked = 0;
+        for (path, item) in spec["paths"].as_object().expect("paths object") {
+            for (method, op) in item.as_object().expect("path item object") {
+                let Some(requirements) = op.get("security").and_then(|s| s.as_array()) else {
+                    continue;
+                };
+                for requirement in requirements {
+                    for name in requirement.as_object().expect("security requirement").keys() {
+                        assert!(
+                            registered.contains(name),
+                            "{method} {path} requires security scheme '{name}', \
+                             which is not registered; registered are {registered:?}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 0, "no security requirements were found to check");
+    }
+
+    /// A `$ref` to a schema that was never added to `components(schemas(...))`
+    /// renders as an empty box in Swagger and breaks client generation.
+    #[test]
+    fn no_schema_reference_is_dangling() {
+        let spec = spec();
+        let known: Vec<String> = spec["components"]["schemas"]
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+
+        let mut refs = Vec::new();
+        collect_refs(&spec, &mut refs);
+        assert!(!refs.is_empty(), "expected the spec to contain $refs");
+
+        let mut dangling: Vec<&String> = refs
+            .iter()
+            .filter(|r| {
+                r.strip_prefix("#/components/schemas/")
+                    .map(|name| !known.contains(&name.to_string()))
+                    .unwrap_or(true)
+            })
+            .collect();
+        dangling.sort();
+        dangling.dedup();
+
+        assert!(
+            dangling.is_empty(),
+            "these $refs resolve to nothing: {dangling:?}"
+        );
+    }
+
+    fn collect_refs(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    if k == "$ref" {
+                        if let Some(s) = v.as_str() {
+                            out.push(s.to_string());
+                        }
+                    } else {
+                        collect_refs(v, out);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_refs(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The new schemas have to be in `components`, not merely referenced.
+    #[test]
+    fn the_new_response_schemas_are_registered() {
+        let spec = spec();
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("schemas object");
+
+        for name in [
+            "PlatformFeeResponse",
+            "HospitalSearchResults",
+            "HospitalSearchHit",
+            "RatingFeed",
+            "RatingFeedItem",
+            "ShiftPreviewResponse",
+        ] {
+            assert!(
+                schemas.contains_key(name),
+                "{name} is not in components.schemas"
+            );
+        }
+    }
+
+    /// The fee is the one place in this API where an amount is naira rather than
+    /// kobo, so the field name has to keep saying so.
+    #[test]
+    fn the_fee_response_names_its_unit() {
+        let spec = spec();
+        let props = spec["components"]["schemas"]["PlatformFeeResponse"]["properties"]
+            .as_object()
+            .expect("PlatformFeeResponse properties");
+        assert!(
+            props.contains_key("platform_fee_flat_naira"),
+            "the flat fee field must carry its unit in the name, got {:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !props.contains_key("platform_fee_flat"),
+            "an unqualified amount field would be read as kobo"
+        );
+    }
+}

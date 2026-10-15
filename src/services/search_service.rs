@@ -115,8 +115,16 @@ impl SearchService {
         }
     }
 
-    /// Patient rows are clinical data. Only the hospital's own administrators
-    /// and a super admin acting within a hospital see them here.
+    /// Patient rows are clinical data.
+    ///
+    /// Note honestly: this currently admits exactly the two roles `tenant_for`
+    /// already admits, so it cannot reject a caller that got this far — it is
+    /// redundant *today*. It is kept because the patient bucket is the one piece
+    /// of this response that is clinical rather than operational, and if the
+    /// route guard is ever widened (to let a clinician search the shifts they
+    /// worked, say) this is the line that stops patients being widened with it.
+    /// A redundant check that documents an intent is cheaper than rediscovering
+    /// the intent after a leak.
     fn may_read_patients(role: &UserRole) -> bool {
         matches!(role, UserRole::HospitalAdmin | UserRole::SuperAdmin)
     }
@@ -210,6 +218,30 @@ mod tests {
         let w = SearchService::parse_types(Some("shift,clinicians")).unwrap();
         assert!(w.shifts && w.clinicians);
         assert!(!w.patients && !w.handovers);
+    }
+
+    /// Pins the redundancy described on `may_read_patients`. If someone widens
+    /// `tenant_for` without thinking about patients, this fails and says why.
+    #[test]
+    fn the_patient_gate_is_currently_redundant_with_the_tenant_gate() {
+        let hospital_id = Uuid::new_v4();
+        for role in [
+            UserRole::HospitalAdmin,
+            UserRole::SuperAdmin,
+            UserRole::HealthWorker,
+            UserRole::OperationsAdmin,
+            UserRole::VerificationAdmin,
+            UserRole::FinanceAdmin,
+        ] {
+            let admitted =
+                SearchService::tenant_for(&claims(role.clone(), Some(hospital_id))).is_ok();
+            assert_eq!(
+                admitted,
+                SearchService::may_read_patients(&role),
+                "{role:?}: the patient gate and the tenant gate have diverged — decide \
+                 deliberately whether this role should see patient rows in search results"
+            );
+        }
     }
 
     #[test]

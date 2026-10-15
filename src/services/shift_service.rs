@@ -1821,13 +1821,25 @@ impl ShiftService {
     /// free string: it is interpolated into a Postgres enum cast, and the two
     /// read endpoints each know which kind they are asking for.
     ///
-    /// Not tenant-scoped, deliberately. A clinician's rating is already public
-    /// on `GET /workers/{id}` and a hospital's on `GET /hospitals/{id}`; this
-    /// adds the comments behind them, which both sides of the marketplace need
-    /// in order to choose each other. The rater's identity stays hidden unless
-    /// they waived anonymity.
+    /// Not tenant-scoped — a rating is marketplace information, and the
+    /// aggregate behind it is already on `GET /workers/{id}` and
+    /// `GET /hospitals/{id}`. What this adds is the *comments*, so it is scoped
+    /// by who has a reason to read them:
+    ///
+    ///  * A hospital's feed is open to any authenticated caller. A clinician
+    ///    deciding whether to accept a shift there needs it, which is the whole
+    ///    point of BR-F1-49.
+    ///  * A clinician's feed is open to hospitals and platform staff, but a
+    ///    health worker may only read **their own**. Written performance
+    ///    feedback about one clinician is not something a competing clinician
+    ///    has any business reading, and the route guard cannot tell the two
+    ///    cases apart.
+    ///
+    /// The rater's identity stays hidden either way unless they waived
+    /// anonymity.
     pub async fn list_ratings(
         &self,
+        claims: &Claims,
         ratee_kind: &str,
         ratee_id: Uuid,
         limit: i64,
@@ -1837,6 +1849,19 @@ impl ShiftService {
             return Err(ShiftServiceError::ValidationError(
                 "ratee_kind must be 'clinician' or 'hospital'".to_string(),
             ));
+        }
+
+        if ratee_kind == "clinician" && claims.role == UserRole::HealthWorker {
+            let own = self
+                .shift_repo
+                .find_clinician_id_for_user(
+                    Uuid::parse_str(&claims.sub).map_err(|_| ShiftServiceError::NotAuthorized)?,
+                )
+                .await?
+                .ok_or(ShiftServiceError::NoClinicianProfile)?;
+            if own != ratee_id {
+                return Err(ShiftServiceError::NotAuthorized);
+            }
         }
 
         let limit = limit.clamp(1, 100);
@@ -3059,6 +3084,16 @@ impl ShiftService {
     /// Both the preview and `create_shift` go through here so the figure a
     /// hospital is shown is the figure that gets snapshotted onto the shift.
     /// The naira → kobo conversion lives in `payout_service`, not here.
+    ///
+    /// Known gap, in **percent mode only**: `preview_shift` does not apply the
+    /// STAT auto-bonus that `create_shift` adds at line ~313, so for a STAT
+    /// shift the preview's gross is lower than the created shift's and a
+    /// percentage fee previews low. That divergence predates this method —
+    /// `calculate_preview_compensation` and the repository's
+    /// `calculate_compensation` have always disagreed — and fixing it means
+    /// changing what preview reports for STAT shifts generally, which is a
+    /// wider behavioural change than a fee belongs in. Flat mode, the default,
+    /// is immune because a flat fee does not depend on the gross.
     async fn platform_fee_for_gross(&self, gross_kobo: i64) -> i64 {
         let cfg = crate::services::payout_service::read_platform_fee_config(&self.pool).await;
         crate::services::payout_service::compute_platform_fee(gross_kobo, &cfg)
