@@ -7,6 +7,7 @@ pub mod earnings;
 pub mod emails;
 pub mod health;
 pub mod here_maps;
+pub mod hospital_documents;
 pub mod hospitals;
 pub mod identity;
 pub mod location;

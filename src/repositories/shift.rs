@@ -973,6 +973,19 @@ impl ShiftRepository {
     /// The bounding-box predicate is an index-friendly prefilter; correctness
     /// comes from the exact haversine `<= radius_km` gate that follows it.
     #[allow(clippy::too_many_arguments)]
+    /// `require_qualification_match` restricts results to shifts whose every
+    /// `shift_requirements` row is matched by one of this clinician's
+    /// `clinician_qualifications`.
+    ///
+    /// Opt-in, not the default. Requirements are free text with no taxonomy, so
+    /// a hospital writing "Valid medical license" and a clinician who typed
+    /// "Medical License (MDCN)" do not match, and making this mandatory would
+    /// empty most workers' feeds. The comparison is case-insensitive substring
+    /// containment, matching the ranking logic in
+    /// `ShiftService::rank_interested_clinicians` rather than the stricter exact
+    /// equality in `match_qualifications` — two semantics for one concept
+    /// already exist in this codebase, and the looser one is the right default
+    /// for a discovery filter.
     pub async fn list_nearby_shifts(
         &self,
         clinician_id: Uuid,
@@ -980,6 +993,7 @@ impl ShiftRepository {
         radius_km: f64,
         limit: i64,
         offset: i64,
+        require_qualification_match: bool,
     ) -> Result<Vec<NearbyShiftRow>, sqlx::Error> {
         // Split the optional origin into nullable binds; the `$2::double
         // precision` casts in the CTE handle NULL binds correctly.
@@ -1025,6 +1039,30 @@ impl ShiftRepository {
             LEFT JOIN hospital_locations hl ON hl.hospital_id = h.id
             CROSS JOIN origin o
             WHERE s.status = 'open'
+              -- Opt-in qualification fit: no requirement of this shift is left
+              -- unmatched by one of the clinician's qualifications. Expressed as
+              -- "no unmatched requirement exists" rather than a count
+              -- comparison so a shift with no requirements still qualifies.
+              AND (
+                  -- $7, not $6: $6 is already OFFSET below. The ::boolean
+                  -- cast is load-bearing too — without it Postgres infers the
+                  -- bind as bigint and rejects the statement with "argument of
+                  -- NOT must be type boolean". Neither mistake is visible to a
+                  -- compile, because these queries are runtime-checked.
+                  NOT $7::boolean
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM shift_requirements sr
+                      WHERE sr.shift_id = s.id
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM clinician_qualifications cq
+                            WHERE cq.clinician_id = $1
+                              AND LOWER(cq.qualification) LIKE
+                                  '%' || LOWER(sr.qualification) || '%'
+                        )
+                  )
+              )
               AND NOT EXISTS (
                   SELECT 1 FROM shift_dismissals sd
                   WHERE sd.shift_id = s.id AND sd.clinician_id = $1
@@ -1070,6 +1108,7 @@ impl ShiftRepository {
         .bind(radius_km)
         .bind(limit)
         .bind(offset)
+        .bind(require_qualification_match)
         .fetch_all(&self.pool)
         .await
     }

@@ -2097,6 +2097,8 @@ impl ShiftService {
     /// neither is available a [`ShiftServiceError::LocationRequired`] is returned
     /// so the caller can prompt for location access. Filtering, sorting and
     /// paging are performed in SQL — see [`ShiftRepository::list_nearby_shifts`].
+    /// `require_qualification_match` is opt-in — see
+    /// [`ShiftRepository::list_nearby_shifts`] for why it is not the default.
     pub async fn list_nearby_shifts_for_worker(
         &self,
         worker_user_id: Uuid,
@@ -2104,6 +2106,7 @@ impl ShiftService {
         radius_km: f64,
         limit: i64,
         offset: i64,
+        require_qualification_match: bool,
     ) -> Result<NearbyShiftsResult, ShiftServiceError> {
         use crate::models::shift::NearbyShiftCard;
 
@@ -2129,7 +2132,14 @@ impl ShiftService {
 
         let rows = self
             .shift_repo
-            .list_nearby_shifts(clinician_id, origin_coords, radius_km, limit, offset)
+            .list_nearby_shifts(
+                clinician_id,
+                origin_coords,
+                radius_km,
+                limit,
+                offset,
+                require_qualification_match,
+            )
             .await?;
 
         // Rows arrive already filtered, ranked and paged; map them 1:1.

@@ -5,6 +5,7 @@ pub mod clinician;
 pub mod consultation_note;
 pub mod email_outbox;
 pub mod hospital;
+pub mod hospital_document;
 pub mod identity_verification;
 pub mod location;
 pub mod notification;
@@ -24,6 +25,7 @@ pub use consultation_note::{
 };
 pub use email_outbox::EmailOutboxRepository;
 pub use hospital::HospitalRepository;
+pub use hospital_document::HospitalDocumentRepository;
 pub use identity_verification::{IdentityRepoError, IdentityVerificationRepository};
 pub use location::LocationRepository;
 pub use patient::{PatientRepository, RepositoryError as PatientRepoError};

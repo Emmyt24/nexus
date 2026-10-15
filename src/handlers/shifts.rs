@@ -1036,6 +1036,10 @@ pub struct NearbyShiftsQuery {
     pub limit: Option<i64>,
     /// Rows to skip for pagination (default 0).
     pub offset: Option<i64>,
+    /// When true, only return shifts whose every requirement is matched by one
+    /// of your saved qualifications. Off by default: requirements are free text
+    /// with no shared vocabulary, so an exact-fit filter would empty most feeds.
+    pub require_qualification_match: Option<bool>,
 }
 
 /// Normalized nearby-shift request: a validated origin plus paging.
@@ -1104,7 +1108,7 @@ impl NearbyShiftsQuery {
     ),
     tag = "shifts",
     summary = "Shifts Near You (worker discovery)",
-    description = "Returns open shifts within `radius_km` of the worker, ranked by urgency (STAT first) then distance. Supply live `lat`/`lng` to refresh the worker's location; otherwise the last-known location is used. Virtual shifts are always included and carry no distance."
+    description = "Returns open shifts within `radius_km` of the worker, ranked by urgency (STAT first) then distance. Supply live `lat`/`lng` to refresh the worker's location; otherwise the last-known location is used. Virtual shifts are always included and carry no distance. Pass `require_qualification_match=true` to hide shifts whose requirements your saved qualifications do not cover — off by default, since requirements are free text and an exact-fit filter would empty most feeds."
 )]
 pub async fn list_nearby_shifts(
     State(state): State<AppState>,
@@ -1119,7 +1123,14 @@ pub async fn list_nearby_shifts(
 
     let result = state
         .shift_service
-        .list_nearby_shifts_for_worker(worker_user_id, origin, radius_km, limit, offset)
+        .list_nearby_shifts_for_worker(
+            worker_user_id,
+            origin,
+            radius_km,
+            limit,
+            offset,
+            query.require_qualification_match.unwrap_or(false),
+        )
         .await
         .map_err(map_shift_error)?;
     Ok(Json(NearbyShiftsResponse {
@@ -1648,6 +1659,7 @@ mod nearby_query_tests {
             radius_km,
             limit,
             offset,
+            require_qualification_match: None,
         }
     }
 

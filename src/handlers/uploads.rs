@@ -24,6 +24,10 @@ pub struct SignatureQuery {
 fn folder_for(kind: Option<&str>) -> &'static str {
     match kind {
         Some("hospital_logo") => "nexuscare/hospital_logos",
+        // Legal verification files. Persisted by
+        // POST /hospitals/{id}/documents — before that endpoint existed the
+        // signed upload succeeded and the URL was dropped.
+        Some("hospital_document") => "nexuscare/hospital_documents",
         Some("worker_avatar") => "nexuscare/worker_avatars",
         Some("handover") => "nexuscare/handovers",
         Some("shift") => "nexuscare/shifts",

@@ -21,8 +21,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     admin, auth, clinician_registration, consultation_notes, distance, earnings, emails, health,
-    here_maps, hospitals, identity, location, notifications, patients, pipeline, platform,
-    registration, search, shifts, uploads, video, wallet, webhooks,
+    here_maps, hospital_documents, hospitals, identity, location, notifications, patients,
+    pipeline, platform, registration, search, shifts, uploads, video, wallet, webhooks,
 };
 use crate::repositories::{
     admin::AdminRepository, audit::AuditRepository, billing::BillingRepository,
@@ -43,6 +43,7 @@ use crate::services::{
     notification_service::NotificationService,
     patient_prediction_service::PatientPredictionService,
     payout_service::PayoutService, push_service::PushService,
+    hospital_document_service::HospitalDocumentService,
     registration_service::RegistrationService, safehaven::SafeHavenClient,
     search_service::SearchService,
     shift_service::ShiftService, video_service::VideoService, wallet_service::WalletService,
@@ -71,6 +72,7 @@ pub struct AppState {
     pub consultation_note_service: Arc<ConsultationNoteService>,
     pub video_service: Arc<VideoService>,
     pub search_service: Arc<SearchService>,
+    pub hospital_document_service: Arc<HospitalDocumentService>,
 }
 
 #[derive(OpenApi)]
@@ -125,6 +127,13 @@ pub struct AppState {
         crate::handlers::platform::get_platform_fee,
         // Hospital-scoped search
         crate::handlers::search::hospital_search,
+        // Hospital legal verification documents
+        crate::handlers::hospital_documents::upload_document,
+        crate::handlers::hospital_documents::list_documents,
+        crate::handlers::hospital_documents::delete_document,
+        crate::handlers::hospital_documents::submit_documents,
+        crate::handlers::hospital_documents::admin_list_documents,
+        crate::handlers::hospital_documents::admin_review_document,
         crate::handlers::shifts::get_shift,
         crate::handlers::shifts::express_interest,
         crate::handlers::shifts::apply_for_shift,
@@ -253,6 +262,13 @@ pub struct AppState {
             crate::handlers::platform::PlatformFeeResponse,
             crate::models::search::HospitalSearchResults,
             crate::models::search::HospitalSearchHit,
+            crate::models::registration::UploadDocumentRequest,
+            crate::models::registration::HospitalDocumentResponse,
+            crate::models::registration::ReviewDocumentRequest,
+            crate::models::registration::DocumentType,
+            crate::models::registration::IssuingAuthority,
+            crate::models::registration::SubmissionStatus,
+            crate::handlers::hospital_documents::SubmitForReviewResponse,
             crate::handlers::shifts::ErrorResponse,
             crate::handlers::shifts::ShiftListResponse,
             crate::handlers::shifts::ShiftApplicationsResponse,
@@ -647,6 +663,10 @@ pub fn create_router(
         crate::repositories::search::SearchRepository::new(pool.clone()),
     )));
 
+    let hospital_document_service = Arc::new(HospitalDocumentService::new(Arc::new(
+        crate::repositories::hospital_document::HospitalDocumentRepository::new(pool.clone()),
+    )));
+
     let video_service = Arc::new(VideoService::new(
         video_repo,
         shift_repo.clone(),
@@ -703,6 +723,7 @@ pub fn create_router(
         consultation_note_service,
         video_service,
         search_service,
+        hospital_document_service,
     };
 
     let api_router = Router::new()
@@ -881,6 +902,32 @@ pub fn create_router(
         .route(
             "/api/v1/search",
             get(search::hospital_search).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+            ]))),
+        )
+        // Legal verification documents. The route guard cannot know which
+        // hospital {hospital_id} refers to, so HospitalDocumentService checks it
+        // against the token — these are licence files and director IDs.
+        .route(
+            "/api/v1/hospitals/{hospital_id}/documents",
+            post(hospital_documents::upload_document)
+                .get(hospital_documents::list_documents)
+                .route_layer(from_fn(require_role(&[
+                    UserRole::HospitalAdmin,
+                    UserRole::SuperAdmin,
+                ]))),
+        )
+        .route(
+            "/api/v1/hospitals/{hospital_id}/documents/submit",
+            post(hospital_documents::submit_documents).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/hospitals/{hospital_id}/documents/{document_id}",
+            delete(hospital_documents::delete_document).route_layer(from_fn(require_role(&[
                 UserRole::HospitalAdmin,
                 UserRole::SuperAdmin,
             ]))),
@@ -1453,6 +1500,19 @@ fn admin_dashboard_routes() -> Router<AppState> {
             "/api/v1/admin/hospitals/{hospital_id}",
             get(admin::get_hospital_detail)
                 .route_layer(from_fn(require_permission(P::ViewHospitals))),
+        )
+        // Document review. Reading is ViewHospitals, like the detail view it
+        // complements; deciding is VerifyHospitals, the same permission that
+        // gates approving the hospital itself.
+        .route(
+            "/api/v1/admin/hospitals/{hospital_id}/documents",
+            get(hospital_documents::admin_list_documents)
+                .route_layer(from_fn(require_permission(P::ViewHospitals))),
+        )
+        .route(
+            "/api/v1/admin/hospitals/{hospital_id}/documents/{document_id}",
+            patch(hospital_documents::admin_review_document)
+                .route_layer(from_fn(require_permission(P::VerifyHospitals))),
         )
         .route(
             "/api/v1/admin/workers/{clinician_id}",
