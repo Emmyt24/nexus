@@ -314,7 +314,7 @@ async fn the_preview_shows_the_fee_and_the_workers_net() {
 // 3 — the settings boundary.
 
 #[tokio::test]
-async fn a_flat_fee_at_or_above_the_minimum_shift_rate_is_rejected() {
+async fn a_flat_fee_at_or_above_the_minimum_shift_rate_is_allowed_but_warned() {
     let Some(pool) = test_pool().await else { return };
     let svc = admin_service(&pool);
     let admin_user_id = seed_user(&pool, "super_admin", None).await;
@@ -325,14 +325,18 @@ async fn a_flat_fee_at_or_above_the_minimum_shift_rate_is_rejected() {
             .await
             .unwrap();
 
-    // A fee that swallows the smallest legal shift leaves net = 0, which the
-    // payout pipeline then rejects as "below minimum payout" on every such
-    // shift, burning the retry budget. Catch it at the boundary instead.
-    let result = svc
+    // This used to be a hard 400. It is now accepted with a warning, because the
+    // threshold it was keyed to — platform_settings.min_hourly_rate_kobo — is
+    // read by nothing else in the codebase (validate_request enforces a
+    // hardcoded ₦100 floor instead), so rejecting against it blocked legitimate
+    // configurations while still admitting fees that zero the real smallest
+    // shift. The clamp in compute_platform_fee is the actual guarantee.
+    let flat_naira = min_rate_kobo / 100;
+    let updated = svc
         .update_settings(
             UpdatePlatformSettings {
                 platform_fee_mode: Some("flat".into()),
-                platform_fee_flat_naira: Some(min_rate_kobo / 100),
+                platform_fee_flat_naira: Some(flat_naira),
                 platform_fee_percent: None,
                 platform_fee_cap_kobo: None,
                 worker_broadcast_radius_km: None,
@@ -348,31 +352,18 @@ async fn a_flat_fee_at_or_above_the_minimum_shift_rate_is_rejected() {
             },
             admin_user_id,
         )
-        .await;
+        .await
+        .expect("a large flat fee is permitted, with a warning logged");
 
-    assert!(
-        matches!(result, Err(AppError::BadRequest(_))),
-        "expected a 400, got {result:?}"
-    );
+    assert_eq!(updated.platform_fee_flat_naira, flat_naira);
 
-    // And nothing changed.
-    let stored: String = sqlx::query_scalar(
-        "SELECT platform_fee_mode FROM platform_settings WHERE singleton = 'global'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let stored_flat: i64 = sqlx::query_scalar(
-        "SELECT platform_fee_flat_naira FROM platform_settings WHERE singleton = 'global'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_ne!(
-        (stored.as_str(), stored_flat),
-        ("flat", min_rate_kobo / 100),
-        "the rejected update must not have been persisted"
-    );
+    // The safety property that actually matters: however large the fee, a
+    // clinician's net never goes below zero.
+    let cfg = read_platform_fee_config(&pool).await;
+    let tiny_gross = 20_000; // ₦200, the smallest two-hour shift at the ₦100 floor
+    let fee = compute_platform_fee(tiny_gross, &cfg);
+    assert_eq!(fee, tiny_gross, "the fee is clamped to the gross");
+    assert_eq!(tiny_gross - fee, 0, "net is zero, never negative");
 }
 
 #[tokio::test]
@@ -421,4 +412,41 @@ async fn percent_mode_still_charges_ten_percent() {
     assert_eq!(cfg.mode, PlatformFeeMode::Percent, "got {cfg:?}");
     // The flat figure is stored but must be ignored in percent mode.
     assert_eq!(compute_platform_fee(1_000_000, &cfg), 100_000);
+}
+
+/// Review finding #2: the migration must not re-price the live settings row.
+///
+/// The column default is `flat` so a fresh install gets the primary mode, but
+/// the pre-existing singleton row is pinned to `percent` by 20240064 so a deploy
+/// cannot silently cut the fee from 10% of gross to a placeholder ₦500. An admin
+/// opts in with one PUT.
+#[tokio::test]
+async fn the_migration_leaves_the_existing_settings_row_on_percent() {
+    let Some(pool) = test_pool().await else { return };
+
+    // Re-run the pin exactly as the migration does, from the pre-migration
+    // state, and confirm it lands on percent rather than flat.
+    sqlx::query(
+        "UPDATE platform_settings SET platform_fee_mode = 'flat', \
+         platform_fee_flat_naira = 500 WHERE singleton = 'global'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE platform_settings SET platform_fee_mode = 'percent' \
+         WHERE singleton = 'global' AND platform_fee_mode = 'flat' \
+           AND platform_fee_flat_naira = 500",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let cfg = read_platform_fee_config(&pool).await;
+    assert_eq!(
+        cfg.mode,
+        PlatformFeeMode::Percent,
+        "an untouched production row must keep its percentage pricing"
+    );
 }

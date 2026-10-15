@@ -262,14 +262,15 @@ async fn the_admin_who_posted_the_shift_can_rate_the_worker() {
 }
 
 #[tokio::test]
-async fn a_second_admin_at_the_same_hospital_can_also_rate_the_worker() {
+async fn a_colleague_may_submit_the_hospitals_rating() {
     let Some(pool) = test_pool().await else { return };
     let svc = shift_service(&pool);
     let f = seed_fixture(&pool).await;
 
     // Before the tenant fix this 403'd: the check compared `shift.created_by`
     // against the caller, so a colleague passed `require_role` and was then
-    // refused by the service.
+    // refused by the service. Any admin at the owning hospital may be the one
+    // who files it.
     let rating = svc
         .rate_worker(
             f.shift_id,
@@ -284,6 +285,77 @@ async fn a_second_admin_at_the_same_hospital_can_also_rate_the_worker() {
         .expect("a colleague at the same hospital should be able to rate");
 
     assert_eq!(rating.score, 4);
+}
+
+/// The counterpart to the test above, and the reason 20240067 exists.
+///
+/// Widening the authorization to "any admin at this hospital" made the old
+/// `UNIQUE (shift_id, rater_user_id, ratee_kind)` useless as a duplicate guard:
+/// five admins meant five legitimate raters and five rows, all averaged into
+/// `clinicians.rating` out of one shift's work. The hospital gets one vote,
+/// whoever casts it.
+#[tokio::test]
+async fn a_colleague_cannot_stack_a_second_rating_on_the_same_shift() {
+    let Some(pool) = test_pool().await else { return };
+    let svc = shift_service(&pool);
+    let f = seed_fixture(&pool).await;
+
+    svc.rate_worker(f.shift_id, &admin_claims(&f), worker_rating(5))
+        .await
+        .expect("the first rating should succeed");
+
+    let second = svc
+        .rate_worker(
+            f.shift_id,
+            &claims(
+                f.colleague_user_id,
+                UserRole::HospitalAdmin,
+                Some(f.hospital_id),
+            ),
+            worker_rating(1),
+        )
+        .await;
+
+    assert!(
+        matches!(second, Err(ShiftServiceError::DuplicateRating)),
+        "a second admin must not be able to add another vote; got {second:?}"
+    );
+
+    // And the clinician's public rating reflects one vote, not two.
+    let (rating, count): (Option<f32>, Option<i32>) =
+        sqlx::query_as("SELECT rating, rating_count FROM clinicians WHERE id = $1")
+            .bind(f.clinician_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, Some(1), "one shift, one rating");
+    assert!((rating.unwrap() - 5.0).abs() < 0.05);
+}
+
+/// A super admin is not a second voter either.
+#[tokio::test]
+async fn a_super_admin_cannot_add_a_rating_on_top_of_the_hospitals() {
+    let Some(pool) = test_pool().await else { return };
+    let svc = shift_service(&pool);
+    let f = seed_fixture(&pool).await;
+
+    svc.rate_worker(f.shift_id, &admin_claims(&f), worker_rating(4))
+        .await
+        .unwrap();
+
+    let platform = seed_user(&pool, "super_admin", None).await;
+    let second = svc
+        .rate_worker(
+            f.shift_id,
+            &claims(platform, UserRole::SuperAdmin, None),
+            worker_rating(1),
+        )
+        .await;
+
+    assert!(
+        matches!(second, Err(ShiftServiceError::DuplicateRating)),
+        "got {second:?}"
+    );
 }
 
 #[tokio::test]
@@ -922,4 +994,71 @@ async fn a_worker_can_read_any_hospitals_rating_feed() {
         .expect("hospital feedback is marketplace information");
 
     assert_eq!(feed.total, 1);
+}
+
+/// #7 from review: the SQL lets the clear win, so a client that always
+/// serialises both fields would silently lose its new text and still get a 200.
+#[tokio::test]
+async fn sending_a_comment_and_clear_comment_together_is_refused() {
+    let Some(pool) = test_pool().await else { return };
+    let svc = shift_service(&pool);
+    let f = seed_fixture(&pool).await;
+
+    let rating = svc
+        .rate_worker(f.shift_id, &admin_claims(&f), worker_rating(3))
+        .await
+        .unwrap();
+
+    let result = svc
+        .edit_rating(
+            rating.id,
+            f.creator_user_id,
+            EditRatingRequest {
+                score: None,
+                comment: Some("revised text".to_string()),
+                dimensions: None,
+                clear_comment: true,
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(ShiftServiceError::ValidationError(_))),
+        "got {result:?}"
+    );
+
+    // The original comment is untouched.
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT comment FROM shift_ratings WHERE id = $1")
+            .bind(rating.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored.as_deref(), Some("Punctual and professional."));
+}
+
+/// #1 from review: `completed_at` has to survive the round trip through
+/// `get_by_id`, or the window anchor silently falls back to `updated_at` and the
+/// fix does nothing. This asserts the column is actually read, independently of
+/// the window behaviour it drives.
+#[tokio::test]
+async fn completed_at_is_read_back_from_the_database() {
+    let Some(pool) = test_pool().await else { return };
+    let completed = Utc::now() - Duration::days(3);
+    let f = seed_fixture_completed_at(&pool, completed).await;
+
+    let repo = ShiftRepository::new(pool.clone());
+    let shift = repo
+        .get_by_id(f.shift_id)
+        .await
+        .expect("get_by_id should succeed")
+        .expect("the shift should exist");
+
+    let got = shift
+        .completed_at
+        .expect("completed_at must be selected, not defaulted to None");
+    assert!(
+        (got - completed).num_seconds().abs() < 2,
+        "expected {completed}, got {got}"
+    );
 }

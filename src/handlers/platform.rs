@@ -14,7 +14,7 @@
 use axum::{extract::State, Json};
 
 use crate::routes::AppState;
-use crate::services::payout_service::read_platform_fee_config;
+use crate::services::payout_service::try_read_platform_fee_config;
 use crate::utils::errors::AppResult;
 
 /// The platform fee, as a hospital needs to see it before creating a shift.
@@ -45,7 +45,8 @@ pub struct PlatformFeeResponse {
     responses(
         (status = 200, description = "Current platform fee configuration", body = PlatformFeeResponse),
         (status = 401, description = "Missing or invalid bearer token", body = crate::handlers::shifts::ErrorResponse),
-        (status = 403, description = "Role may not read platform configuration", body = crate::handlers::shifts::ErrorResponse)
+        (status = 403, description = "Role may not read platform configuration", body = crate::handlers::shifts::ErrorResponse),
+        (status = 500, description = "Fee configuration could not be read", body = crate::handlers::shifts::ErrorResponse)
     ),
     tag = "platform",
     summary = "Read the platform fee",
@@ -56,7 +57,11 @@ pub struct PlatformFeeResponse {
     security(("bearerAuth" = []))
 )]
 pub async fn get_platform_fee(State(state): State<AppState>) -> AppResult<Json<PlatformFeeResponse>> {
-    let cfg = read_platform_fee_config(&state.pool).await;
+    // The fallible read. A hospital is about to price a shift against this, so
+    // answering 200 with a guessed `percent, 10%` because one query failed is
+    // worse than answering 500 — the lenient fallback exists for the payout
+    // pipeline, which retries.
+    let cfg = try_read_platform_fee_config(&state.pool).await?;
     Ok(Json(PlatformFeeResponse {
         mode: cfg.mode.as_str().to_string(),
         platform_fee_flat_naira: cfg.flat_naira,

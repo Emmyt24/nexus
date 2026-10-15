@@ -24,16 +24,12 @@ CREATE INDEX IF NOT EXISTS idx_patients_hospital_search
 CREATE INDEX IF NOT EXISTS idx_shifts_hospital_scheduled
     ON shifts (hospital_id, scheduled_start DESC);
 
--- The clinician search tests "has this hospital ever dealt with this person",
--- which probes applications and interests by clinician. Both already have a
--- shift_id index; these cover the other direction.
-CREATE INDEX IF NOT EXISTS idx_shift_applications_clinician
-    ON shift_applications (clinician_id);
-CREATE INDEX IF NOT EXISTS idx_shift_interests_clinician
-    ON shift_interests (clinician_id);
+-- The clinician search probes applications and interests by clinician_id, but
+-- both already have exactly that index — idx_shift_applications_clinician_id
+-- (20240021:27) and idx_shift_interests_clinician_id (20240012:107). Adding our
+-- own would have been a second identical B-tree on each table: maintained on
+-- every write, for no planner benefit. Nothing to add here.
 
 -- Rollback:
---   DROP INDEX IF EXISTS idx_shift_interests_clinician;
---   DROP INDEX IF EXISTS idx_shift_applications_clinician;
 --   DROP INDEX IF EXISTS idx_shifts_hospital_scheduled;
 --   DROP INDEX IF EXISTS idx_patients_hospital_search;

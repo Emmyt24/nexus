@@ -1368,7 +1368,8 @@ impl ShiftRepository {
                    s.grand_total_kobo, s.shift_label, s.job_description,
                    s.draft_quality_score, s.notes, s.created_by,
                    s.broadcast_consent_confirmed, s.matched_clinicians_at_publish,
-                   s.broadcast_at, s.billing_triggered_at, s.created_at, s.updated_at,
+                   s.broadcast_at, s.billing_triggered_at, s.completed_at,
+                   s.created_at, s.updated_at,
                    h.name AS hospital_name
             FROM shifts s
             JOIN hospitals h ON s.hospital_id = h.id
@@ -1870,7 +1871,7 @@ impl ShiftRepository {
                 s.shift_label, s.job_description, s.draft_quality_score, s.notes,
                 s.created_by, s.broadcast_consent_confirmed, s.matched_clinicians_at_publish,
                 s.broadcast_at, s.billing_triggered_at, s.attachment_urls,
-                s.created_at, s.updated_at
+                s.completed_at, s.created_at, s.updated_at
             FROM shifts s
             LEFT JOIN hospitals h ON s.hospital_id = h.id
             WHERE s.id = $1
@@ -1902,7 +1903,8 @@ impl ShiftRepository {
                 s.effective_rate_kobo_per_hour, s.grand_total_kobo,
                 s.shift_label, s.job_description, s.draft_quality_score, s.notes,
                 s.created_by, s.broadcast_consent_confirmed, s.matched_clinicians_at_publish,
-                s.broadcast_at, s.billing_triggered_at, s.created_at, s.updated_at
+                s.broadcast_at, s.billing_triggered_at, s.completed_at,
+                s.created_at, s.updated_at
             FROM shifts s
             LEFT JOIN hospitals h ON s.hospital_id = h.id
             WHERE ($1::shift_status IS NULL OR s.status = $1)
@@ -2207,7 +2209,8 @@ impl ShiftRepository {
                 s.effective_rate_kobo_per_hour, s.grand_total_kobo,
                 s.shift_label, s.job_description, s.draft_quality_score, s.notes,
                 s.created_by, s.broadcast_consent_confirmed, s.matched_clinicians_at_publish,
-                s.broadcast_at, s.billing_triggered_at, s.created_at, s.updated_at
+                s.broadcast_at, s.billing_triggered_at, s.completed_at,
+                s.created_at, s.updated_at
             FROM shifts s
             LEFT JOIN hospitals h ON s.hospital_id = h.id
             WHERE s.hospital_id = $1

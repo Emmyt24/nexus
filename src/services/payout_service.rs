@@ -113,35 +113,56 @@ pub fn split_payout_config(gross_kobo: i64, cfg: &PlatformFeeConfig) -> (i64, i6
     (gross_kobo, fee, gross_kobo - fee)
 }
 
-/// Read the admin-configured platform fee from `platform_settings`.
+/// Read the admin-configured platform fee from `platform_settings`, failing if
+/// it cannot be read.
 ///
 /// Shared by the payout pipeline and by shift creation/preview so there is one
-/// definition of the fee, not two that can drift. On a read failure this logs
-/// and returns the pre-flat 10% default rather than silently charging nothing —
-/// a DB blip must not become a free-payout window.
-pub async fn read_platform_fee_config(pool: &PgPool) -> PlatformFeeConfig {
-    let row: Result<Option<(String, i64, f64, Option<i64>)>, sqlx::Error> = sqlx::query_as(
+/// definition of the fee, not two that can drift.
+///
+/// Use this wherever the answer is *recorded* — above all `create_shift`, which
+/// snapshots the result onto `shifts.platform_fee_kobo` permanently. A single
+/// statement timeout there would otherwise bake a guessed fee into a shift
+/// forever: with a configured flat fee of ₦500, a lenient fallback to the legacy
+/// 10% locks ₦10,000 out of a ₦100,000 shift's payout, silently and
+/// irreversibly. Failing the request is recoverable; a wrong snapshot is not.
+pub async fn try_read_platform_fee_config(
+    pool: &PgPool,
+) -> Result<PlatformFeeConfig, sqlx::Error> {
+    let row: Option<(String, i64, f64, Option<i64>)> = sqlx::query_as(
         "SELECT platform_fee_mode, platform_fee_flat_naira, \
          platform_fee_percent::DOUBLE PRECISION, platform_fee_cap_kobo \
          FROM platform_settings WHERE singleton = 'global'",
     )
     .fetch_optional(pool)
-    .await;
+    .await?;
 
     match row {
-        Ok(Some((mode, flat_naira, percent, cap_kobo))) => PlatformFeeConfig {
+        Some((mode, flat_naira, percent, cap_kobo)) => Ok(PlatformFeeConfig {
             mode: PlatformFeeMode::from_db(&mode),
             flat_naira,
             percent,
             cap_kobo,
-        },
-        Ok(None) => {
-            tracing::warn!("platform_settings row missing; falling back to the legacy 10% fee");
-            PlatformFeeConfig::legacy_percent_default()
-        }
+        }),
+        // The row is seeded by 20240048 and the primary key pins it to one row,
+        // so its absence is a broken database, not a state to paper over.
+        None => Err(sqlx::Error::RowNotFound),
+    }
+}
+
+/// As [`try_read_platform_fee_config`], but falls back to the legacy 10% on any
+/// failure.
+///
+/// Only safe where the result is *used once and not stored* — that is, the
+/// payout pipeline, where a bad tick is retried on the next scheduler pass and
+/// charging the historical 10% is better than charging nothing. Do not use this
+/// on a path that writes the fee down.
+pub async fn read_platform_fee_config(pool: &PgPool) -> PlatformFeeConfig {
+    match try_read_platform_fee_config(pool).await {
+        Ok(cfg) => cfg,
         Err(e) => {
             tracing::error!(
-                "failed to read platform fee settings, falling back to the legacy 10% fee: {e}"
+                "failed to read platform fee settings, falling back to the legacy 10% fee \
+                 for this payout only: {e}"
             );
             PlatformFeeConfig::legacy_percent_default()
         }

@@ -298,20 +298,7 @@ impl ShiftService {
             return Err(ShiftServiceError::TooManyActiveShifts);
         }
 
-        // STAT shifts get an automatic +20% bonus when none is set.
-        if request.priority == ShiftPriority::Stat
-            && request.stat_bonus_kobo.unwrap_or(0) == 0
-            && request.urgency_bonus_pct.is_none()
-        {
-            let base = match request.pay_type {
-                crate::models::shift::PayType::HourlyRate => request
-                    .rate_kobo_per_hour
-                    .unwrap_or(0)
-                    .saturating_mul(request.duration_hours as i64),
-                crate::models::shift::PayType::FixedRate => request.fixed_rate_kobo.unwrap_or(0),
-            };
-            request.stat_bonus_kobo = Some(base / 5); // +20%
-        }
+        Self::apply_stat_auto_bonus_to(&mut request);
 
         // Check for duplicate shifts
         self.check_duplicate_shift(hospital_id, &request).await?;
@@ -326,7 +313,7 @@ impl ShiftService {
         // re-price work already agreed — including work the hospital accepted on
         // the strength of the net figure `preview_shift` showed it.
         let (_, _, preview_gross) = self.calculate_preview_compensation(&request);
-        let platform_fee_kobo = self.platform_fee_for_gross(preview_gross).await;
+        let platform_fee_kobo = self.platform_fee_for_gross(preview_gross).await?;
 
         let mut tx = self.pool.begin().await?;
 
@@ -2048,6 +2035,15 @@ impl ShiftService {
             .validate()
             .map_err(|e| ShiftServiceError::ValidationError(e.to_string()))?;
 
+        // Sending both is contradictory, and the SQL resolves it by letting the
+        // clear win — so a client that always serialises every field would have
+        // its new text discarded and still get a 200. Say so instead.
+        if request.clear_comment && request.comment.is_some() {
+            return Err(ShiftServiceError::ValidationError(
+                "send either `comment` or `clear_comment`, not both".to_string(),
+            ));
+        }
+
         let (existing, rater_user_id) = self
             .shift_repo
             .get_rating_for_edit(rating_id)
@@ -3079,6 +3075,32 @@ impl ShiftService {
     }
 
     /// Preview shift before publishing
+    /// STAT shifts get an automatic +20% bonus when none is set.
+    ///
+    /// Extracted so `preview_shift` can apply the same rule. It previously lived
+    /// inline in `create_shift` only, which is why a STAT shift's preview
+    /// under-reported its total — and, once the fee and the clinician's net
+    /// joined that response, under-reported those too.
+    fn apply_stat_auto_bonus_to(request: &mut CreateShiftRequest) {
+        if request.priority == ShiftPriority::Stat
+            && request.stat_bonus_kobo.unwrap_or(0) == 0
+            && request.urgency_bonus_pct.is_none()
+        {
+            let base = match request.pay_type {
+                crate::models::shift::PayType::HourlyRate => request
+                    .rate_kobo_per_hour
+                    .unwrap_or(0)
+                    .saturating_mul(request.duration_hours as i64),
+                crate::models::shift::PayType::FixedRate => request.fixed_rate_kobo.unwrap_or(0),
+            };
+            request.stat_bonus_kobo = Some(base / 5); // +20%
+        }
+    }
+
+    fn apply_stat_auto_bonus(&self, request: &mut CreateShiftRequest) {
+        Self::apply_stat_auto_bonus_to(request);
+    }
+
     /// The platform's cut of `gross_kobo`, from the live admin settings.
     ///
     /// Both the preview and `create_shift` go through here so the figure a
@@ -3094,9 +3116,18 @@ impl ShiftService {
     /// changing what preview reports for STAT shifts generally, which is a
     /// wider behavioural change than a fee belongs in. Flat mode, the default,
     /// is immune because a flat fee does not depend on the gross.
-    async fn platform_fee_for_gross(&self, gross_kobo: i64) -> i64 {
-        let cfg = crate::services::payout_service::read_platform_fee_config(&self.pool).await;
-        crate::services::payout_service::compute_platform_fee(gross_kobo, &cfg)
+    async fn platform_fee_for_gross(&self, gross_kobo: i64) -> Result<i64, ShiftServiceError> {
+        // The fallible read, not the lenient one: `create_shift` snapshots this
+        // onto the row permanently, so a transient failure that fell back to the
+        // legacy 10% would lock the wrong fee into a shift forever. Preview uses
+        // it too — showing a guessed figure the hospital then commits money
+        // against is the same defect one step earlier.
+        let cfg = crate::services::payout_service::try_read_platform_fee_config(&self.pool)
+            .await
+            .map_err(ShiftServiceError::DatabaseError)?;
+        Ok(crate::services::payout_service::compute_platform_fee(
+            gross_kobo, &cfg,
+        ))
     }
 
     pub async fn preview_shift(
@@ -3106,13 +3137,23 @@ impl ShiftService {
         // Validate the request first
         self.validate_request(request)?;
 
+        // Model what `create_shift` will actually do, including the STAT
+        // auto-bonus it applies when a STAT shift arrives with no explicit
+        // bonus. Without this the preview under-reports a STAT shift's total by
+        // 20% — it always did, but the fee and the clinician's net are now in
+        // this response too, so the hospital would be shown three wrong numbers
+        // and then be charged the right one.
+        let mut effective = request.clone();
+        self.apply_stat_auto_bonus(&mut effective);
+
         // Calculate compensation
-        let (base_amount, stat_bonus, grand_total) = self.calculate_preview_compensation(request);
+        let (base_amount, stat_bonus, grand_total) =
+            self.calculate_preview_compensation(&effective);
 
         // The fee the clinician will have deducted, and what they actually take
         // home. Shown here because this is the hospital's last look before it
         // commits money, and the same figure is snapshotted at create time.
-        let platform_fee_kobo = self.platform_fee_for_gross(grand_total).await;
+        let platform_fee_kobo = self.platform_fee_for_gross(grand_total).await?;
 
         // Generate preview
         Ok(ShiftPreview {

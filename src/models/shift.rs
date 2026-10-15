@@ -195,8 +195,16 @@ pub struct Shift {
     /// When the shift reached `completed`. Written where the status transition
     /// happens, and the anchor for the rating windows — `updated_at` moves on
     /// any write to the row, which silently slid those deadlines.
-    /// `#[sqlx(default)]` so column-list SELECTs that omit it still decode.
-    #[sqlx(default)]
+    ///
+    /// Deliberately **not** `#[sqlx(default)]`, unlike `hospital_name` and
+    /// `attachment_urls` above. This field gates whether a rating is accepted,
+    /// and `default` makes an omitted column decode as `None` rather than
+    /// erroring — which is exactly how the first version of this change shipped
+    /// a dead anchor: every explicit column list omitted `s.completed_at`, each
+    /// read silently fell back to `updated_at`, and the fix did nothing while
+    /// compiling and passing review. A loud decode error is the right failure
+    /// mode for a column an authorization window depends on. All five
+    /// `query_as::<_, Shift>` sites select it.
     pub completed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
