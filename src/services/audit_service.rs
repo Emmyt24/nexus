@@ -180,10 +180,3 @@ pub struct RegistrationDetails {
     pub email: String,
     pub registration_number: String,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Integration tests will be added in Task 10.5
-}

@@ -201,7 +201,9 @@ mod tests {
     fn a_json_round_trip_does_not_drift() {
         // Every realistic amount, including ones a float would mangle if the
         // value were stored as naira rather than kobo.
-        for kobo in [1, 7, 99, 100, 101, 696_640, 3_200_000, 6_966_400, 999_999_999_99] {
+        // 99_999_999_999 kobo is ₦999,999,999.99 — grouped as kobo, since that
+        // is the unit the loop variable is in.
+        for kobo in [1, 7, 99, 100, 101, 696_640, 3_200_000, 6_966_400, 99_999_999_999] {
             let json = serde_json::to_string(&Naira::from_kobo(kobo)).unwrap();
             let back: Naira = serde_json::from_str(&json).unwrap();
             assert_eq!(back.kobo(), kobo, "{kobo} kobo drifted through {json}");

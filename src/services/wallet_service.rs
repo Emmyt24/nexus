@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use chrono::Duration;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -37,7 +36,6 @@ pub struct WalletService {
     safehaven: Arc<SafeHavenClient>,
     pool: PgPool,
     callback_url: String,
-    deposit_validity: Duration,
 }
 
 impl WalletService {
@@ -48,7 +46,6 @@ impl WalletService {
             safehaven,
             pool,
             callback_url,
-            deposit_validity: Duration::hours(24),
         }
     }
 

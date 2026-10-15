@@ -657,7 +657,6 @@ pub struct RegistrationStatusResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     // Unit tests for validation logic
     #[test]
