@@ -103,9 +103,25 @@ fn admin_service(pool: &PgPool) -> AdminService {
     AdminService::new(Arc::new(AdminRepository::new(pool.clone())), email_outbox)
 }
 
-/// `platform_settings` is a single global row, so these tests mutate shared
-/// state. Each one sets every fee field it depends on rather than assuming what
-/// a previous test left behind.
+/// `platform_settings` is a single global row (`singleton = 'global'`, enforced
+/// by a CHECK), so every test here writes the same row. Setting each field a
+/// test depends on is not enough on its own: cargo runs these in parallel, so
+/// another test can flip the mode between this one's write and its read. That
+/// is exactly how `percent_mode_still_charges_ten_percent` failed — it set
+/// percent, read back flat.
+///
+/// So the fee tests take this lock for their whole body and are effectively
+/// serial. Poisoning is ignored deliberately: if one test panics while holding
+/// it, the rest should still run and report their own results rather than all
+/// failing with `PoisonError`.
+static FEE_SETTINGS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn fee_lock() -> std::sync::MutexGuard<'static, ()> {
+    FEE_SETTINGS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Set every fee field this suite cares about, so no test inherits a value from
+/// another. Call under [`fee_lock`].
 async fn set_fee(pool: &PgPool, mode: &str, flat_naira: i64, percent: f64) {
     sqlx::query(
         "UPDATE platform_settings SET platform_fee_mode = $1, \
@@ -214,6 +230,7 @@ fn shift_request() -> CreateShiftRequest {
 #[tokio::test]
 async fn a_flat_fee_set_in_naira_is_read_back_and_charged_in_kobo() {
     let Some(pool) = test_pool().await else { return };
+    let _fee_guard = fee_lock();
     set_fee(&pool, "flat", 500, 10.0).await;
 
     let cfg = read_platform_fee_config(&pool).await;
@@ -231,6 +248,7 @@ async fn a_flat_fee_set_in_naira_is_read_back_and_charged_in_kobo() {
 #[tokio::test]
 async fn flat_is_the_default_mode_on_a_fresh_database() {
     let Some(pool) = test_pool().await else { return };
+    let _fee_guard = fee_lock();
 
     // Read the column default rather than whatever another test last wrote.
     let default_mode: String = sqlx::query_scalar(
@@ -252,6 +270,7 @@ async fn flat_is_the_default_mode_on_a_fresh_database() {
 #[tokio::test]
 async fn a_later_fee_change_does_not_re_price_an_existing_shift() {
     let Some(pool) = test_pool().await else { return };
+    let _fee_guard = fee_lock();
     set_fee(&pool, "flat", 500, 10.0).await;
 
     let hospital_id = seed_hospital(&pool).await;
@@ -294,6 +313,7 @@ async fn a_later_fee_change_does_not_re_price_an_existing_shift() {
 #[tokio::test]
 async fn the_preview_shows_the_fee_and_the_workers_net() {
     let Some(pool) = test_pool().await else { return };
+    let _fee_guard = fee_lock();
     set_fee(&pool, "flat", 500, 10.0).await;
 
     let preview = shift_service(&pool)
@@ -316,6 +336,7 @@ async fn the_preview_shows_the_fee_and_the_workers_net() {
 #[tokio::test]
 async fn a_flat_fee_at_or_above_the_minimum_shift_rate_is_allowed_but_warned() {
     let Some(pool) = test_pool().await else { return };
+    let _fee_guard = fee_lock();
     let svc = admin_service(&pool);
     let admin_user_id = seed_user(&pool, "super_admin", None).await;
 
@@ -369,6 +390,7 @@ async fn a_flat_fee_at_or_above_the_minimum_shift_rate_is_allowed_but_warned() {
 #[tokio::test]
 async fn an_unknown_fee_mode_is_rejected() {
     let Some(pool) = test_pool().await else { return };
+    let _fee_guard = fee_lock();
     let svc = admin_service(&pool);
     let admin_user_id = seed_user(&pool, "super_admin", None).await;
 
@@ -406,6 +428,7 @@ async fn an_unknown_fee_mode_is_rejected() {
 #[tokio::test]
 async fn percent_mode_still_charges_ten_percent() {
     let Some(pool) = test_pool().await else { return };
+    let _fee_guard = fee_lock();
     set_fee(&pool, "percent", 500, 10.0).await;
 
     let cfg = read_platform_fee_config(&pool).await;
@@ -423,6 +446,7 @@ async fn percent_mode_still_charges_ten_percent() {
 #[tokio::test]
 async fn the_migration_leaves_the_existing_settings_row_on_percent() {
     let Some(pool) = test_pool().await else { return };
+    let _fee_guard = fee_lock();
 
     // Re-run the pin exactly as the migration does, from the pre-migration
     // state, and confirm it lands on percent rather than flat.
