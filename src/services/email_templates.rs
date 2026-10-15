@@ -435,6 +435,33 @@ pub fn handover_appeal_raised(role_title: &str, note: Option<&str>) -> EmailCont
 
 /// Sent to the hospital when a shift offer to a clinician expires
 
+/// Sent to the hospital when a shift's scheduled end passed with no clock-in and
+/// the grace period ran out. Mentions the refund explicitly: the escrow is
+/// released in the same sweep, and a hospital seeing the money reappear without
+/// explanation would reasonably file a support ticket.
+pub fn shift_no_show(role_title: &str) -> EmailContent {
+    let subject = "Shift Closed - No Clock-In - NexusCare".to_string();
+    let text_body = format!(
+        "The shift for {} ended without the worker clocking in, so it has been closed as a no-show.\nAny amount held for this shift has been returned to your wallet balance.\n\nNexusCare",
+        role_title
+    );
+    let html_body = wrap_html(
+        "Shift Closed - No Clock-In",
+        &format!(
+            "<p style=\"margin:0 0 12px 0;\">The shift for <strong>{}</strong> ended without the worker clocking in, so it has been closed as a no-show.</p>
+             <p style=\"margin:0 0 12px 0;\">Any amount held for this shift has been returned to your wallet balance.</p>
+             <p style=\"margin:0;\">NexusCare</p>",
+            role_title
+        ),
+    );
+
+    EmailContent {
+        subject,
+        text_body,
+        html_body,
+    }
+}
+
 pub fn shift_offer_expired(role_title: &str) -> EmailContent {
     let subject = "Shift Offer Expired - NexusCare".to_string();
     let text_body = format!(

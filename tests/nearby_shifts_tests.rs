@@ -152,7 +152,7 @@ async fn virtual_shift_included_without_distance() {
     // A successful decode here proves the `AS "col: _"` aliases are gone
     // (Defect 3): with them, FromRow would fail with ColumnNotFound.
     let rows = repo
-        .list_nearby_shifts(clinician_id, Some((6.5244, 3.3792)), 5.0, 50, 0)
+        .list_nearby_shifts(clinician_id, Some((6.5244, 3.3792)), 5.0, 50, 0, false)
         .await
         .expect("list_nearby_shifts should decode successfully");
 
@@ -209,7 +209,7 @@ async fn no_origin_returns_virtual_shifts_without_error() {
     let service = build_shift_service(&pool);
 
     let result = service
-        .list_nearby_shifts_for_worker(user_id, None, 5.0, 50, 0)
+        .list_nearby_shifts_for_worker(user_id, None, 5.0, 50, 0, false)
         .await
         .expect("no origin must succeed, not error");
 

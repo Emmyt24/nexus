@@ -21,8 +21,8 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::handlers::{
     admin, auth, clinician_registration, consultation_notes, distance, earnings, emails, health,
-    here_maps, hospitals, identity, location, notifications, patient_records, patients, pipeline,
-    registration, shifts, uploads, video, wallet, webhooks,
+    here_maps, hospital_documents, hospitals, identity, location, notifications, patient_records,
+    patients, pipeline, platform, registration, search, shifts, uploads, video, wallet, webhooks,
 };
 use crate::repositories::{
     admin::AdminRepository, audit::AuditRepository, billing::BillingRepository,
@@ -45,7 +45,9 @@ use crate::services::{
     patient_prediction_service::PatientPredictionService,
     patient_record_service::PatientRecordService,
     payout_service::PayoutService, push_service::PushService,
+    hospital_document_service::HospitalDocumentService,
     registration_service::RegistrationService, safehaven::SafeHavenClient,
+    search_service::SearchService,
     shift_service::ShiftService, video_service::VideoService, wallet_service::WalletService,
 };
 
@@ -73,6 +75,8 @@ pub struct AppState {
     pub patient_record_repo: Arc<PatientRecordRepository>,
     pub patient_record_service: Arc<PatientRecordService>,
     pub video_service: Arc<VideoService>,
+    pub search_service: Arc<SearchService>,
+    pub hospital_document_service: Arc<HospitalDocumentService>,
 }
 
 #[derive(OpenApi)]
@@ -127,6 +131,17 @@ pub struct AppState {
         crate::handlers::shifts::create_shift,
         crate::handlers::shifts::list_shifts,
         crate::handlers::shifts::preview_shift,
+        // Platform configuration readable by hospitals/workers
+        crate::handlers::platform::get_platform_fee,
+        // Hospital-scoped search
+        crate::handlers::search::hospital_search,
+        // Hospital legal verification documents
+        crate::handlers::hospital_documents::upload_document,
+        crate::handlers::hospital_documents::list_documents,
+        crate::handlers::hospital_documents::delete_document,
+        crate::handlers::hospital_documents::submit_documents,
+        crate::handlers::hospital_documents::admin_list_documents,
+        crate::handlers::hospital_documents::admin_review_document,
         crate::handlers::shifts::get_shift,
         crate::handlers::shifts::express_interest,
         crate::handlers::shifts::apply_for_shift,
@@ -145,6 +160,8 @@ pub struct AppState {
         crate::handlers::shifts::rate_worker,
         crate::handlers::shifts::rate_hospital,
         crate::handlers::shifts::edit_rating,
+        crate::handlers::shifts::list_clinician_ratings,
+        crate::handlers::shifts::list_hospital_ratings,
         crate::handlers::shifts::list_nearby_shifts,
         crate::handlers::shifts::list_my_applications,
         crate::handlers::shifts::withdraw_interest,
@@ -260,6 +277,20 @@ pub struct AppState {
             crate::handlers::registration::ListHospitalsQuery,
             // Shifts
             crate::handlers::shifts::ShiftPreviewResponse,
+            crate::models::shift::RatingFeed,
+            crate::models::shift::RatingFeedItem,
+            crate::handlers::platform::PlatformFeeResponse,
+            // The money type every amount on the wire resolves to.
+            crate::utils::money::Naira,
+            crate::models::search::HospitalSearchResults,
+            crate::models::search::HospitalSearchHit,
+            crate::models::registration::UploadDocumentRequest,
+            crate::models::registration::HospitalDocumentResponse,
+            crate::models::registration::ReviewDocumentRequest,
+            crate::models::registration::DocumentType,
+            crate::models::registration::IssuingAuthority,
+            crate::models::registration::SubmissionStatus,
+            crate::handlers::hospital_documents::SubmitForReviewResponse,
             crate::handlers::shifts::ErrorResponse,
             crate::handlers::shifts::ShiftListResponse,
             crate::handlers::shifts::ShiftApplicationsResponse,
@@ -526,11 +557,24 @@ pub struct AppState {
         (name = "earnings", description = "Worker earnings — totals + transaction history"),
         (name = "identity", description = "BVN/NIN identity verification and bank list"),
         (name = "notifications", description = "Device push-token registration and the in-app notification center"),
-        (name = "emails", description = "Generic frontend-templated transactional email relay")
+        (name = "emails", description = "Generic frontend-templated transactional email relay"),
+        (name = "platform", description = "Platform-wide configuration readable by hospitals and workers"),
+        (name = "search", description = "Hospital-scoped search across shifts, clinicians, patients and handovers")
     ),
     modifiers(&SecurityAddon)
 )]
-struct ApiDoc;
+pub struct ApiDoc;
+
+/// The generated OpenAPI document.
+///
+/// There is no spec file in this repository — the contract is produced from the
+/// `#[utoipa::path]` attributes at runtime and served at `/api/openapi.json`.
+/// This accessor exists so it can also be dumped without booting the server and
+/// a database (`cargo run --bin openapi`), which is what makes the spec
+/// reviewable in a diff and checkable in CI.
+pub fn openapi_spec() -> utoipa::openapi::OpenApi {
+    <ApiDoc as utoipa::OpenApi>::openapi()
+}
 
 /// Swagger UI security wiring — adds the `bearerAuth` scheme so the
 struct SecurityAddon;
@@ -673,6 +717,15 @@ pub fn create_router(
     // GET /consult, so VideoService reads this repo (and nothing mutates the
     // queue through it — that is PatientRecordService's job).
     let patient_record_repo = Arc::new(PatientRecordRepository::new(pool.clone()));
+
+    let search_service = Arc::new(SearchService::new(Arc::new(
+        crate::repositories::search::SearchRepository::new(pool.clone()),
+    )));
+
+    let hospital_document_service = Arc::new(HospitalDocumentService::new(Arc::new(
+        crate::repositories::hospital_document::HospitalDocumentRepository::new(pool.clone()),
+    )));
+
     let video_service = Arc::new(VideoService::new(
         video_repo.clone(),
         patient_record_repo.clone(),
@@ -749,6 +802,8 @@ pub fn create_router(
         patient_record_repo,
         patient_record_service,
         video_service,
+        search_service,
+        hospital_document_service,
     };
 
     let api_router = Router::new()
@@ -908,6 +963,55 @@ pub fn create_router(
                 UserRole::SuperAdmin,
             ]))),
         )
+        // The fee a hospital needs before it commits money to a shift.
+        // `GET /admin/settings` is ManageSettings (super_admin only), so this is
+        // the hospital-readable slice of it. Workers can read it too: it is
+        // deducted from their pay.
+        .route(
+            "/api/v1/platform/fee",
+            get(platform::get_platform_fee).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::HealthWorker,
+                UserRole::SuperAdmin,
+            ]))),
+        )
+        // Hospital-scoped search. The tenant is taken from the token inside
+        // SearchService, not from a parameter — a `hospital_id` argument here
+        // would be a cross-tenant read with a legitimate role attached, which
+        // the route guard cannot detect. Platform staff use /admin/search.
+        .route(
+            "/api/v1/search",
+            get(search::hospital_search).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+            ]))),
+        )
+        // Legal verification documents. The route guard cannot know which
+        // hospital {hospital_id} refers to, so HospitalDocumentService checks it
+        // against the token — these are licence files and director IDs.
+        .route(
+            "/api/v1/hospitals/{hospital_id}/documents",
+            post(hospital_documents::upload_document)
+                .get(hospital_documents::list_documents)
+                .route_layer(from_fn(require_role(&[
+                    UserRole::HospitalAdmin,
+                    UserRole::SuperAdmin,
+                ]))),
+        )
+        .route(
+            "/api/v1/hospitals/{hospital_id}/documents/submit",
+            post(hospital_documents::submit_documents).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/hospitals/{hospital_id}/documents/{document_id}",
+            delete(hospital_documents::delete_document).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::SuperAdmin,
+            ]))),
+        )
         .route("/api/v1/shifts/{shift_id}", get(shifts::get_shift))
         .route(
             "/api/v1/shifts/{shift_id}/interest",
@@ -998,6 +1102,29 @@ pub fn create_router(
                 .route_layer(from_fn(require_role(&[UserRole::HealthWorker]))),
         )
         .route("/api/v1/ratings/{rating_id}", patch(shifts::edit_rating))
+        // The read side of ratings. Comments were persisted and never
+        // returned, so neither party could see what was said about them.
+        // Authenticated but not tenant-scoped: both sides of the marketplace
+        // need these to choose each other, and the aggregate is already public
+        // on the worker/hospital detail endpoints.
+        .route(
+            "/api/v1/clinicians/{clinician_id}/ratings",
+            get(shifts::list_clinician_ratings).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::HealthWorker,
+                UserRole::SuperAdmin,
+                UserRole::OperationsAdmin,
+            ]))),
+        )
+        .route(
+            "/api/v1/hospitals/{hospital_id}/ratings",
+            get(shifts::list_hospital_ratings).route_layer(from_fn(require_role(&[
+                UserRole::HospitalAdmin,
+                UserRole::HealthWorker,
+                UserRole::SuperAdmin,
+                UserRole::OperationsAdmin,
+            ]))),
+        )
         .route(
             "/api/v1/worker/shifts/nearby",
             get(shifts::list_nearby_shifts)
@@ -1525,6 +1652,19 @@ fn admin_dashboard_routes() -> Router<AppState> {
             get(admin::get_hospital_detail)
                 .route_layer(from_fn(require_permission(P::ViewHospitals))),
         )
+        // Document review. Reading is ViewHospitals, like the detail view it
+        // complements; deciding is VerifyHospitals, the same permission that
+        // gates approving the hospital itself.
+        .route(
+            "/api/v1/admin/hospitals/{hospital_id}/documents",
+            get(hospital_documents::admin_list_documents)
+                .route_layer(from_fn(require_permission(P::ViewHospitals))),
+        )
+        .route(
+            "/api/v1/admin/hospitals/{hospital_id}/documents/{document_id}",
+            patch(hospital_documents::admin_review_document)
+                .route_layer(from_fn(require_permission(P::VerifyHospitals))),
+        )
         .route(
             "/api/v1/admin/workers/{clinician_id}",
             get(admin::get_worker_detail)
@@ -1548,4 +1688,355 @@ fn admin_dashboard_routes() -> Router<AppState> {
             get(admin::global_search)
                 .route_layer(from_fn(require_permission(P::ViewHospitals))),
         )
+}
+
+#[cfg(test)]
+mod openapi_tests {
+    use super::*;
+    use utoipa::OpenApi;
+
+    /// Adding an endpoint here is a four-step change: the handler attribute, the
+    /// `.route(...)`, the entry in `paths(...)`, and the DTO in
+    /// `components(schemas(...))`. Miss the third and the route is invisible in
+    /// the spec while compiling perfectly — which is what commit `b3eca25`
+    /// existed to fix, for four routes at once. CI runs neither the tests nor
+    /// any spec check, so these assertions are the only thing standing between
+    /// a forgotten registration and a frontend that cannot see the endpoint.
+    ///
+    /// No database needed: the document is generated from the attribute macros.
+    fn spec() -> serde_json::Value {
+        serde_json::to_value(ApiDoc::openapi()).expect("the OpenAPI document should serialise")
+    }
+
+    #[test]
+    fn every_registered_route_appears_in_the_spec() {
+        let spec = spec();
+        let paths = spec["paths"].as_object().expect("paths object");
+
+        for (path, method) in [
+            ("/api/v1/platform/fee", "get"),
+            ("/api/v1/search", "get"),
+            ("/api/v1/clinicians/{clinician_id}/ratings", "get"),
+            ("/api/v1/hospitals/{hospital_id}/ratings", "get"),
+            ("/api/v1/shifts/preview", "post"),
+        ] {
+            let item = paths
+                .get(path)
+                .unwrap_or_else(|| panic!("{path} is missing from the OpenAPI spec"));
+            assert!(
+                item.get(method).is_some(),
+                "{path} is in the spec but has no {method} operation"
+            );
+        }
+    }
+
+    /// `e2f913b` fixed two handlers that referenced `bearer_auth` while the
+    /// registered scheme is `bearerAuth`. A name that does not resolve produces
+    /// a document Swagger renders without an auth button, silently.
+    #[test]
+    fn every_security_requirement_names_a_registered_scheme() {
+        let spec = spec();
+        let registered: Vec<String> = spec["components"]["securitySchemes"]
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            registered.contains(&"bearerAuth".to_string()),
+            "bearerAuth should be registered, found {registered:?}"
+        );
+
+        let mut checked = 0;
+        for (path, item) in spec["paths"].as_object().expect("paths object") {
+            for (method, op) in item.as_object().expect("path item object") {
+                let Some(requirements) = op.get("security").and_then(|s| s.as_array()) else {
+                    continue;
+                };
+                for requirement in requirements {
+                    for name in requirement.as_object().expect("security requirement").keys() {
+                        assert!(
+                            registered.contains(name),
+                            "{method} {path} requires security scheme '{name}', \
+                             which is not registered; registered are {registered:?}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 0, "no security requirements were found to check");
+    }
+
+    /// A `$ref` to a schema that was never added to `components(schemas(...))`
+    /// renders as an empty box in Swagger and breaks client generation.
+    #[test]
+    fn no_schema_reference_is_dangling() {
+        let spec = spec();
+        let known: Vec<String> = spec["components"]["schemas"]
+            .as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default();
+
+        let mut refs = Vec::new();
+        collect_refs(&spec, &mut refs);
+        assert!(!refs.is_empty(), "expected the spec to contain $refs");
+
+        let mut dangling: Vec<&String> = refs
+            .iter()
+            .filter(|r| {
+                r.strip_prefix("#/components/schemas/")
+                    .map(|name| !known.contains(&name.to_string()))
+                    .unwrap_or(true)
+            })
+            .collect();
+        dangling.sort();
+        dangling.dedup();
+
+        assert!(
+            dangling.is_empty(),
+            "these $refs resolve to nothing: {dangling:?}"
+        );
+    }
+
+    fn collect_refs(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    if k == "$ref" {
+                        if let Some(s) = v.as_str() {
+                            out.push(s.to_string());
+                        }
+                    } else {
+                        collect_refs(v, out);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    collect_refs(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The new schemas have to be in `components`, not merely referenced.
+    #[test]
+    fn the_new_response_schemas_are_registered() {
+        let spec = spec();
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("schemas object");
+
+        for name in [
+            "PlatformFeeResponse",
+            "HospitalSearchResults",
+            "HospitalSearchHit",
+            "RatingFeed",
+            "RatingFeedItem",
+            "ShiftPreviewResponse",
+        ] {
+            assert!(
+                schemas.contains_key(name),
+                "{name} is not in components.schemas"
+            );
+        }
+    }
+
+    /// Every operation needs a summary and a description.
+    ///
+    /// Scoped to the routes this branch added, not the whole spec: the existing
+    /// surface has gaps that are not this branch's to fix, and a test that fails
+    /// for pre-existing reasons gets ignored.
+    #[test]
+    fn the_new_operations_are_fully_described() {
+        let spec = spec();
+        for (path, method) in [
+            ("/api/v1/platform/fee", "get"),
+            ("/api/v1/search", "get"),
+            ("/api/v1/clinicians/{clinician_id}/ratings", "get"),
+            ("/api/v1/hospitals/{hospital_id}/ratings", "get"),
+            ("/api/v1/hospitals/{hospital_id}/documents", "post"),
+            ("/api/v1/hospitals/{hospital_id}/documents", "get"),
+            ("/api/v1/hospitals/{hospital_id}/documents/submit", "post"),
+            ("/api/v1/hospitals/{hospital_id}/documents/{document_id}", "delete"),
+            ("/api/v1/admin/hospitals/{hospital_id}/documents", "get"),
+            ("/api/v1/admin/hospitals/{hospital_id}/documents/{document_id}", "patch"),
+        ] {
+            let op = &spec["paths"][path][method];
+            assert!(
+                op.get("summary").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()),
+                "{method} {path} has no summary"
+            );
+            assert!(
+                op.get("description").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()),
+                "{method} {path} has no description"
+            );
+            assert!(
+                op["responses"].as_object().is_some_and(|r| r.len() >= 2),
+                "{method} {path} documents fewer than two responses"
+            );
+        }
+    }
+
+    /// A query field added to a `params(...)` list written out by hand is
+    /// invisible in the spec until it is added there too — the attribute does
+    /// not read the struct. `require_qualification_match` shipped missing for
+    /// exactly that reason.
+    #[test]
+    fn hand_written_query_params_match_their_handler() {
+        let spec = spec();
+        let names: Vec<&str> = spec["paths"]["/api/v1/worker/shifts/nearby"]["get"]["parameters"]
+            .as_array()
+            .expect("nearby should declare parameters")
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+
+        for expected in [
+            "lat",
+            "lng",
+            "accuracy_meters",
+            "radius_km",
+            "limit",
+            "offset",
+            "require_qualification_match",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "nearby query param '{expected}' is in NearbyShiftsQuery but not in the spec; \
+                 found {names:?}"
+            );
+        }
+    }
+
+    /// Request bodies have to resolve, or a client generator produces a method
+    /// that takes nothing.
+    #[test]
+    fn the_new_request_bodies_resolve_to_registered_schemas() {
+        let spec = spec();
+        for (path, method, schema) in [
+            (
+                "/api/v1/hospitals/{hospital_id}/documents",
+                "post",
+                "UploadDocumentRequest",
+            ),
+            (
+                "/api/v1/admin/hospitals/{hospital_id}/documents/{document_id}",
+                "patch",
+                "ReviewDocumentRequest",
+            ),
+        ] {
+            let got = spec["paths"][path][method]["requestBody"]["content"]
+                ["application/json"]["schema"]["$ref"]
+                .as_str()
+                .unwrap_or_default();
+            assert_eq!(
+                got,
+                format!("#/components/schemas/{schema}"),
+                "{method} {path} request body"
+            );
+            assert!(
+                spec["components"]["schemas"][schema].is_object(),
+                "{schema} is referenced but not registered"
+            );
+        }
+    }
+
+    /// Every amount on the wire is naira, and says so in its name.
+    ///
+    /// The unit used to differ per field — one naira field among kobo ones —
+    /// which is the shape that eventually ships a 100x error. The ledger is kobo
+    /// throughout and the API is naira throughout, with `utils::money::Naira`
+    /// converting at the boundary. No wire field may be named `*_kobo`.
+    ///
+    /// This had an allowlist of 59 fields while the conversion was in progress.
+    /// The allowlist is gone because the list is empty: there is nothing left to
+    /// exempt, so a single kobo field reappearing is now a failure rather than a
+    /// line someone adds to a worklist.
+    #[test]
+    fn no_amount_on_the_wire_is_denominated_in_kobo() {
+        let spec = spec();
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("schemas object");
+
+        let mut offenders = Vec::new();
+        for (name, schema) in schemas {
+            let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+                continue;
+            };
+            for prop in props.keys() {
+                if prop.contains("kobo") {
+                    offenders.push(format!("{name}.{prop}"));
+                }
+            }
+        }
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "amounts on the wire are naira — these publish kobo: {offenders:?}"
+        );
+    }
+
+    /// And a `*_naira` field must actually be the `Naira` type.
+    ///
+    /// The name alone is a comment. Without this, a field could be renamed from
+    /// `amount_kobo` to `amount_naira` while still carrying a kobo integer —
+    /// which is strictly worse than before, because the name now asserts
+    /// something false. `Naira` is the only type that does the conversion, so
+    /// every naira-named amount must resolve to its schema.
+    #[test]
+    fn every_naira_field_carries_the_naira_type() {
+        let spec = spec();
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("schemas object");
+
+        // `Naira` renders as a $ref, and an `Option<Naira>` as a oneOf of null
+        // and that $ref. Anything else — a bare integer, a string — is a field
+        // whose name promises a conversion that is not happening.
+        fn refers_to_naira(v: &serde_json::Value) -> bool {
+            if v.get("$ref").and_then(|r| r.as_str()) == Some("#/components/schemas/Naira") {
+                return true;
+            }
+            v.get("oneOf")
+                .and_then(|o| o.as_array())
+                .map(|variants| variants.iter().any(refers_to_naira))
+                .unwrap_or(false)
+        }
+
+        let mut offenders = Vec::new();
+        for (name, schema) in schemas {
+            let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+                continue;
+            };
+            for (prop, def) in props {
+                // `platform_fee_percent` is a percentage, not an amount, and
+                // `*_naira_per_hour` is a rate — both are still amounts of money
+                // and both are `Naira`. Only names containing `naira` are checked.
+                if prop.contains("naira") && !refers_to_naira(def) {
+                    offenders.push(format!("{name}.{prop}"));
+                }
+            }
+        }
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "these fields are named naira but are not the Naira type: {offenders:?}"
+        );
+    }
+
+    /// The fee surface specifically, since it is the one that was inconsistent.
+    #[test]
+    fn the_fee_response_names_its_unit() {
+        let spec = spec();
+        let props = spec["components"]["schemas"]["PlatformFeeResponse"]["properties"]
+            .as_object()
+            .expect("PlatformFeeResponse properties");
+        assert!(
+            props.contains_key("platform_fee_flat_naira"),
+            "the flat fee field must carry its unit in the name, got {:?}",
+            props.keys().collect::<Vec<_>>()
+        );
+    }
 }

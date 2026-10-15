@@ -3,6 +3,7 @@ use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::models::registration::RegistrationStatus;
+use crate::utils::money::Naira;
 use crate::models::shift::{
     CreateShiftRequest, PayType, Shift, ShiftApplication, ShiftApplicationStatus, ShiftPriority,
     ShiftStatus, ShiftType,
@@ -36,6 +37,9 @@ pub struct EligibleClinicianRow {
 }
 
 /// Raw row backing the "Shifts Near You" query. Distance and final
+///
+/// Kobo, as the columns store it. `NearbyShiftCard` is the naira form that goes
+/// on the wire; this one never leaves the repository.
 #[derive(Debug, Clone, FromRow)]
 pub struct NearbyShiftRow {
     pub shift_id: Uuid,
@@ -724,16 +728,32 @@ impl ShiftRepository {
         .fetch_one(&mut **tx)
         .await?;
 
-        sqlx::query(
+        // Guarded on `in_progress` so a late or retried clock-out cannot
+        // resurrect a shift that has already reached a terminal state. The
+        // service checks the status first, but that is a read-then-write and
+        // loses the race; this is the authority. Compare the comment on
+        // `accept_offer_tx`, and `record_clockin_if_absent_tx` below.
+        //
+        // `completed_at` is set here because this is the only place a clock-out
+        // completes a shift. It is what the rating windows are measured from, so
+        // it must not be left to `updated_at`.
+        let completed = sqlx::query(
             r#"
             UPDATE shifts
-               SET status = 'completed', updated_at = NOW()
-             WHERE id = $1
+               SET status       = 'completed',
+                   completed_at = COALESCE(completed_at, NOW()),
+                   updated_at   = NOW()
+             WHERE id = $1 AND status = 'in_progress'
             "#,
         )
         .bind(shift_id)
         .execute(&mut **tx)
         .await?;
+
+        if completed.rows_affected() == 0 {
+            // Someone else moved this shift out of `in_progress` first.
+            return Err(sqlx::Error::RowNotFound);
+        }
 
         Ok(id)
     }
@@ -789,6 +809,7 @@ impl ShiftRepository {
         score: i16,
         dimensions: Option<&serde_json::Value>,
         comment: Option<&str>,
+        is_anonymous: bool,
         window_closes_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<crate::models::shift::RatingResponse, sqlx::Error> {
         sqlx::query_as::<_, crate::models::shift::RatingResponse>(
@@ -800,8 +821,8 @@ impl ShiftRepository {
             )
             VALUES (
                 $1, $2, $3, $4::rating_ratee_kind,
-                $5, $6, $7, TRUE,
-                NOW() + INTERVAL '48 hours', $8
+                $5, $6, $7, $8,
+                NOW() + INTERVAL '48 hours', $9
             )
             RETURNING
                 id, shift_id, ratee_id, ratee_kind::text AS ratee_kind,
@@ -816,6 +837,7 @@ impl ShiftRepository {
         .bind(score)
         .bind(dimensions)
         .bind(comment)
+        .bind(is_anonymous)
         .bind(window_closes_at)
         .fetch_one(&mut **tx)
         .await
@@ -823,19 +845,24 @@ impl ShiftRepository {
 
     /// Edit a rating within the 48h window. Caller validates the
 
+    /// `clear_comment` exists because the `COALESCE` pattern used for the other
+    /// fields makes NULL mean "leave unchanged", so a comment could be rewritten
+    /// but never withdrawn. Someone who regrets what they wrote needs to be able
+    /// to remove it inside the edit window, not just replace it with a space.
     pub async fn update_rating(
         &self,
         rating_id: Uuid,
         score: Option<i16>,
         dimensions: Option<&serde_json::Value>,
         comment: Option<&str>,
+        clear_comment: bool,
     ) -> Result<crate::models::shift::RatingResponse, sqlx::Error> {
         sqlx::query_as::<_, crate::models::shift::RatingResponse>(
             r#"
             UPDATE shift_ratings
                SET score      = COALESCE($2, score),
                    dimensions = COALESCE($3, dimensions),
-                   comment    = COALESCE($4, comment),
+                   comment    = CASE WHEN $5 THEN NULL ELSE COALESCE($4, comment) END,
                    updated_at = NOW()
              WHERE id = $1
              RETURNING
@@ -848,6 +875,7 @@ impl ShiftRepository {
         .bind(score)
         .bind(dimensions)
         .bind(comment)
+        .bind(clear_comment)
         .fetch_one(&self.pool)
         .await
     }
@@ -949,6 +977,19 @@ impl ShiftRepository {
     /// The bounding-box predicate is an index-friendly prefilter; correctness
     /// comes from the exact haversine `<= radius_km` gate that follows it.
     #[allow(clippy::too_many_arguments)]
+    /// `require_qualification_match` restricts results to shifts whose every
+    /// `shift_requirements` row is matched by one of this clinician's
+    /// `clinician_qualifications`.
+    ///
+    /// Opt-in, not the default. Requirements are free text with no taxonomy, so
+    /// a hospital writing "Valid medical license" and a clinician who typed
+    /// "Medical License (MDCN)" do not match, and making this mandatory would
+    /// empty most workers' feeds. The comparison is case-insensitive substring
+    /// containment, matching the ranking logic in
+    /// `ShiftService::rank_interested_clinicians` rather than the stricter exact
+    /// equality in `match_qualifications` — two semantics for one concept
+    /// already exist in this codebase, and the looser one is the right default
+    /// for a discovery filter.
     pub async fn list_nearby_shifts(
         &self,
         clinician_id: Uuid,
@@ -956,6 +997,7 @@ impl ShiftRepository {
         radius_km: f64,
         limit: i64,
         offset: i64,
+        require_qualification_match: bool,
     ) -> Result<Vec<NearbyShiftRow>, sqlx::Error> {
         // Split the optional origin into nullable binds; the `$2::double
         // precision` casts in the CTE handle NULL binds correctly.
@@ -1001,6 +1043,30 @@ impl ShiftRepository {
             LEFT JOIN hospital_locations hl ON hl.hospital_id = h.id
             CROSS JOIN origin o
             WHERE s.status = 'open'
+              -- Opt-in qualification fit: no requirement of this shift is left
+              -- unmatched by one of the clinician's qualifications. Expressed as
+              -- "no unmatched requirement exists" rather than a count
+              -- comparison so a shift with no requirements still qualifies.
+              AND (
+                  -- $7, not $6: $6 is already OFFSET below. The ::boolean
+                  -- cast is load-bearing too — without it Postgres infers the
+                  -- bind as bigint and rejects the statement with "argument of
+                  -- NOT must be type boolean". Neither mistake is visible to a
+                  -- compile, because these queries are runtime-checked.
+                  NOT $7::boolean
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM shift_requirements sr
+                      WHERE sr.shift_id = s.id
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM clinician_qualifications cq
+                            WHERE cq.clinician_id = $1
+                              AND LOWER(cq.qualification) LIKE
+                                  '%' || LOWER(sr.qualification) || '%'
+                        )
+                  )
+              )
               AND NOT EXISTS (
                   SELECT 1 FROM shift_dismissals sd
                   WHERE sd.shift_id = s.id AND sd.clinician_id = $1
@@ -1046,6 +1112,7 @@ impl ShiftRepository {
         .bind(radius_km)
         .bind(limit)
         .bind(offset)
+        .bind(require_qualification_match)
         .fetch_all(&self.pool)
         .await
     }
@@ -1344,7 +1411,8 @@ impl ShiftRepository {
                    s.grand_total_kobo, s.shift_label, s.job_description,
                    s.draft_quality_score, s.notes, s.created_by,
                    s.broadcast_consent_confirmed, s.matched_clinicians_at_publish,
-                   s.broadcast_at, s.billing_triggered_at, s.created_at, s.updated_at,
+                   s.broadcast_at, s.billing_triggered_at, s.completed_at,
+                   s.created_at, s.updated_at,
                    h.name AS hospital_name
             FROM shifts s
             JOIN hospitals h ON s.hospital_id = h.id
@@ -1367,6 +1435,129 @@ impl ShiftRepository {
     }
 
     /// Sweep step: flip every offered assignment whose
+
+    /// Claim shifts past `scheduled_end + grace` whose clinician **did** clock in
+    /// but never clocked out, completing them.
+    ///
+    /// The work happened, so the shift completes and the payout pipeline picks
+    /// it up as normal. `worked_minutes` is measured to `scheduled_end`, not to
+    /// `NOW()` — a clinician who forgets to clock out for two days did not work
+    /// for two days, and the hospital escrowed the scheduled amount.
+    /// `completed_at` is set to `scheduled_end` for the same reason, which also
+    /// starts the rating window from when the shift actually ended.
+    ///
+    /// Claimed in a single statement: the `status`/`clockout_at` predicates live
+    /// inside the `UPDATE`, so two concurrent sweeps (or two Render instances)
+    /// cannot both take the same row. Compare `expire_due_offers` below. A
+    /// read-then-write here would double-process.
+    pub async fn close_timed_out_worked_shifts(
+        &self,
+        grace_minutes: i32,
+    ) -> Result<Vec<(Uuid, Uuid, Option<Uuid>, String)>, sqlx::Error> {
+        sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, String)>(
+            r#"
+            WITH due AS (
+                SELECT s.id, a.clockin_at
+                FROM shifts s
+                JOIN shift_attendance a ON a.shift_id = s.id
+                WHERE s.status = 'in_progress'
+                  AND s.scheduled_end < NOW() - make_interval(mins => $1)
+                  AND a.clockin_at  IS NOT NULL
+                  AND a.clockout_at IS NULL
+            ),
+            attended AS (
+                UPDATE shift_attendance a
+                   SET clockout_at    = s.scheduled_end,
+                       clockout_method = 'manual',
+                       worked_minutes = GREATEST(
+                           0,
+                           (EXTRACT(EPOCH FROM (s.scheduled_end - due.clockin_at)) / 60)::INTEGER
+                       ),
+                       updated_at     = NOW()
+                  FROM due
+                  JOIN shifts s ON s.id = due.id
+                 WHERE a.shift_id = due.id
+                   AND a.clockout_at IS NULL
+                RETURNING a.shift_id
+            ),
+            closed AS (
+                UPDATE shifts s
+                   SET status       = 'completed',
+                       completed_at = COALESCE(s.completed_at, s.scheduled_end),
+                       updated_at   = NOW()
+                  FROM attended
+                 WHERE s.id = attended.shift_id
+                   AND s.status = 'in_progress'
+                RETURNING s.id, s.hospital_id, s.assigned_clinician_id, s.role_title
+            )
+            SELECT id, hospital_id, assigned_clinician_id, role_title FROM closed
+            "#,
+        )
+        .bind(grace_minutes)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Claim shifts past `scheduled_end + grace` whose clinician never clocked
+    /// in, marking them `no_show`.
+    ///
+    /// Returns `grand_total_kobo` as well, because the caller has to release the
+    /// escrow this shift is still holding — nobody worked, so the hospital's
+    /// money must go back. `no_show` and `shift_attendance.missed` are both
+    /// pre-existing and previously unwritten (20240001, 20240024).
+    ///
+    /// `assigned`, `upcoming` and `in_progress` are all claimable: a shift can
+    /// reach `in_progress` without an attendance row via the virtual clock-in
+    /// path, and one that is still `assigned` well past its end was never
+    /// started at all.
+    pub async fn close_timed_out_unworked_shifts(
+        &self,
+        grace_minutes: i32,
+    ) -> Result<Vec<(Uuid, Uuid, Option<Uuid>, String, Option<i64>)>, sqlx::Error> {
+        sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, String, Option<i64>)>(
+            r#"
+            WITH missed AS (
+                UPDATE shifts s
+                   SET status       = 'no_show',
+                       completed_at = COALESCE(s.completed_at, s.scheduled_end),
+                       updated_at   = NOW()
+                 WHERE s.status IN ('assigned', 'upcoming', 'in_progress')
+                   AND s.scheduled_end < NOW() - make_interval(mins => $1)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM shift_attendance a
+                       WHERE a.shift_id = s.id AND a.clockin_at IS NOT NULL
+                   )
+                RETURNING s.id, s.hospital_id, s.assigned_clinician_id,
+                          s.role_title, s.grand_total_kobo
+            )
+            SELECT id, hospital_id, assigned_clinician_id, role_title, grand_total_kobo
+            FROM missed
+            "#,
+        )
+        .bind(grace_minutes)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Flag the attendance row of a shift the sweep marked `no_show`.
+    ///
+    /// Separate from the claim because most no-shows have no attendance row at
+    /// all; this only touches the ones that do (a clock-in approval request was
+    /// raised, say) and is harmless when there is none.
+    pub async fn mark_attendance_missed_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        shift_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE shift_attendance SET missed = TRUE, updated_at = NOW() \
+             WHERE shift_id = $1 AND clockin_at IS NULL",
+        )
+        .bind(shift_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
 
     pub async fn expire_due_offers(&self) -> Result<Vec<(Uuid, Uuid, Uuid, String)>, sqlx::Error> {
         sqlx::query_as::<_, (Uuid, Uuid, Uuid, String)>(
@@ -1535,6 +1726,64 @@ impl ShiftRepository {
     /// Average score (1–5) and count of submitted ratings for a hospital
     /// (SCRUM-25 / US-09 AC-05). Returns `(None, 0)` when the hospital has no
     /// ratings yet.
+    /// A page of ratings written *about* `ratee_id`, newest first, with the
+    /// aggregate over the whole set.
+    ///
+    /// The rater's name is resolved in SQL and returned only when the rating is
+    /// not anonymous, so an anonymous rater's identity never leaves the
+    /// database. Doing that filtering in Rust would mean selecting the name and
+    /// trusting every caller to drop it.
+    pub async fn list_ratings_for(
+        &self,
+        ratee_kind: &str,
+        ratee_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<crate::models::shift::RatingFeedItem>, Option<f64>, i64), sqlx::Error> {
+        let items = sqlx::query_as::<_, crate::models::shift::RatingFeedItem>(
+            r#"
+            SELECT r.id,
+                   r.shift_id,
+                   s.role_title AS shift_role_title,
+                   r.score,
+                   r.dimensions,
+                   r.comment,
+                   CASE WHEN r.is_anonymous THEN NULL
+                        ELSE NULLIF(TRIM(COALESCE(u.first_name, '') || ' ' ||
+                                         COALESCE(u.last_name, '')), '')
+                   END AS rater_name,
+                   r.created_at
+            FROM shift_ratings r
+            LEFT JOIN shifts s ON s.id = r.shift_id
+            LEFT JOIN users  u ON u.id = r.rater_user_id
+            WHERE r.ratee_kind = $1::rating_ratee_kind
+              AND r.ratee_id   = $2
+            ORDER BY r.created_at DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(ratee_kind)
+        .bind(ratee_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let (average, total) = sqlx::query_as::<_, (Option<f64>, i64)>(
+            r#"
+            SELECT AVG(score)::float8, COUNT(*)
+            FROM shift_ratings
+            WHERE ratee_kind = $1::rating_ratee_kind AND ratee_id = $2
+            "#,
+        )
+        .bind(ratee_kind)
+        .bind(ratee_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok((items, average, total))
+    }
+
     pub async fn hospital_rating_summary(
         &self,
         hospital_id: Uuid,
@@ -1665,12 +1914,17 @@ impl ShiftRepository {
         .await
     }
 
+    /// `platform_fee_kobo` is the fee the hospital was shown at preview time and
+    /// is snapshotted onto the row, so a later settings change cannot re-price
+    /// work already agreed. The caller computes it — the fee configuration is a
+    /// service-layer concern. See `migrations/20240064_platform_fee_mode.sql`.
     pub async fn create(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         hospital_id: Uuid,
         created_by: Uuid,
         request: CreateShiftRequest,
+        platform_fee_kobo: Option<i64>,
     ) -> Result<Shift, sqlx::Error> {
         let id = Uuid::new_v4();
         let scheduled_end =
@@ -1688,12 +1942,12 @@ impl ShiftRepository {
                 pay_type, rate_kobo_per_hour, fixed_rate_kobo, stat_bonus_kobo,
                 effective_rate_kobo_per_hour, grand_total_kobo,
                 shift_label, job_description, notes, created_by, broadcast_consent_confirmed,
-                attachment_urls, created_at, updated_at
+                attachment_urls, platform_fee_kobo, created_at, updated_at
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                 $11, $12, $13, $14, $15, $16, $17, $18, $19,
-                $20, $21, $22, $23, $24, $25, NOW(), NOW()
+                $20, $21, $22, $23, $24, $25, $26, NOW(), NOW()
             )
             "#,
         )
@@ -1711,9 +1965,9 @@ impl ShiftRepository {
         .bind(request.duration_hours)
         .bind(scheduled_end)
         .bind(&request.pay_type)
-        .bind(request.rate_kobo_per_hour)
-        .bind(request.fixed_rate_kobo)
-        .bind(request.stat_bonus_kobo)
+        .bind(request.rate_naira_per_hour.map(Naira::kobo))
+        .bind(request.fixed_rate_naira.map(Naira::kobo))
+        .bind(request.stat_bonus_naira.map(Naira::kobo))
         .bind(effective_rate)
         .bind(grand_total)
         .bind(&request.shift_label)
@@ -1728,6 +1982,7 @@ impl ShiftRepository {
                 .map(|u| serde_json::Value::String(u.clone()))
                 .collect(),
         ))
+        .bind(platform_fee_kobo)
         .execute(&mut **tx)
         .await?;
 
@@ -1782,7 +2037,7 @@ impl ShiftRepository {
                 s.shift_label, s.job_description, s.draft_quality_score, s.notes,
                 s.created_by, s.broadcast_consent_confirmed, s.matched_clinicians_at_publish,
                 s.broadcast_at, s.billing_triggered_at, s.attachment_urls,
-                s.created_at, s.updated_at
+                s.completed_at, s.created_at, s.updated_at
             FROM shifts s
             LEFT JOIN hospitals h ON s.hospital_id = h.id
             WHERE s.id = $1
@@ -1814,7 +2069,8 @@ impl ShiftRepository {
                 s.effective_rate_kobo_per_hour, s.grand_total_kobo,
                 s.shift_label, s.job_description, s.draft_quality_score, s.notes,
                 s.created_by, s.broadcast_consent_confirmed, s.matched_clinicians_at_publish,
-                s.broadcast_at, s.billing_triggered_at, s.created_at, s.updated_at
+                s.broadcast_at, s.billing_triggered_at, s.completed_at,
+                s.created_at, s.updated_at
             FROM shifts s
             LEFT JOIN hospitals h ON s.hospital_id = h.id
             WHERE ($1::shift_status IS NULL OR s.status = $1)
@@ -2119,7 +2375,8 @@ impl ShiftRepository {
                 s.effective_rate_kobo_per_hour, s.grand_total_kobo,
                 s.shift_label, s.job_description, s.draft_quality_score, s.notes,
                 s.created_by, s.broadcast_consent_confirmed, s.matched_clinicians_at_publish,
-                s.broadcast_at, s.billing_triggered_at, s.created_at, s.updated_at
+                s.broadcast_at, s.billing_triggered_at, s.completed_at,
+                s.created_at, s.updated_at
             FROM shifts s
             LEFT JOIN hospitals h ON s.hospital_id = h.id
             WHERE s.hospital_id = $1
@@ -2218,16 +2475,21 @@ impl ShiftRepository {
         Ok(())
     }
 
+    /// Returns `(effective_rate_kobo, grand_total_kobo)`.
+    ///
+    /// Kobo throughout: these feed `*_kobo` columns and the escrow hold, and an
+    /// exact integer minor unit is the only representation that cannot drift.
+    /// `Naira` is unwrapped on the way in and never re-wrapped here.
     fn calculate_compensation(&self, request: &CreateShiftRequest) -> (Option<i64>, Option<i64>) {
         let base_amount = match request.pay_type {
             PayType::HourlyRate => request
-                .rate_kobo_per_hour
-                .map(|rate| (rate as f64 * request.duration_hours as f64) as i64),
-            PayType::FixedRate => request.fixed_rate_kobo,
+                .rate_naira_per_hour
+                .map(|rate| (rate.kobo() as f64 * request.duration_hours as f64) as i64),
+            PayType::FixedRate => request.fixed_rate_naira.map(Naira::kobo),
         };
 
         let effective_rate = match request.pay_type {
-            PayType::HourlyRate => request.rate_kobo_per_hour.map(|rate| {
+            PayType::HourlyRate => request.rate_naira_per_hour.map(Naira::kobo).map(|rate| {
                 if let Some(bonus_pct) = request.urgency_bonus_pct {
                     rate + (rate * bonus_pct as i64 / 100)
                 } else {
@@ -2238,7 +2500,7 @@ impl ShiftRepository {
         };
 
         let grand_total = base_amount.map(|base| {
-            let stat_bonus = request.stat_bonus_kobo.unwrap_or(0);
+            let stat_bonus = request.stat_bonus_naira.map(Naira::kobo).unwrap_or(0);
             base + stat_bonus
         });
 

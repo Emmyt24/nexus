@@ -6,6 +6,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::models::admin::*;
+use crate::utils::money::Naira;
 
 pub struct AdminRepository {
     pool: PgPool,
@@ -81,7 +82,7 @@ impl AdminRepository {
             active_workers,
             active_shifts,
             shifts_completed_30d,
-            platform_revenue_30d_kobo,
+            platform_revenue_30d_naira: Naira::from_kobo(platform_revenue_30d_kobo),
             active_disputes,
             pending_hospital_verifications,
             pending_worker_verifications,
@@ -345,12 +346,15 @@ impl AdminRepository {
         sqlx::query_as::<_, PlatformSettings>(
             r#"
             SELECT
+                platform_fee_mode,
+                platform_fee_flat_kobo,
                 platform_fee_percent::DOUBLE PRECISION        AS platform_fee_percent,
                 platform_fee_cap_kobo,
                 worker_broadcast_radius_km::DOUBLE PRECISION  AS worker_broadcast_radius_km,
                 stat_bonus_percent::DOUBLE PRECISION          AS stat_bonus_percent,
                 urgent_bonus_percent::DOUBLE PRECISION        AS urgent_bonus_percent,
                 clock_in_grace_minutes,
+                shift_close_grace_minutes,
                 auto_clock_out_hours,
                 handover_edit_window_hours,
                 dispute_filing_window_hours,
@@ -387,7 +391,10 @@ impl AdminRepository {
                 min_hourly_rate_kobo        = COALESCE($10, min_hourly_rate_kobo),
                 max_recording_minutes       = COALESCE($11, max_recording_minutes),
                 platform_fee_cap_kobo       = COALESCE($12, platform_fee_cap_kobo),
-                updated_by = $13,
+                platform_fee_mode           = COALESCE($13, platform_fee_mode),
+                platform_fee_flat_kobo     = COALESCE($14, platform_fee_flat_kobo),
+                shift_close_grace_minutes   = COALESCE($15, shift_close_grace_minutes),
+                updated_by = $16,
                 updated_at = NOW()
             WHERE singleton = 'global'
             "#,
@@ -401,9 +408,12 @@ impl AdminRepository {
         .bind(p.handover_edit_window_hours)
         .bind(p.dispute_filing_window_hours)
         .bind(p.max_active_shifts_per_hospital)
-        .bind(p.min_hourly_rate_kobo)
+        .bind(p.min_hourly_rate_naira.map(Naira::kobo))
         .bind(p.max_recording_minutes)
-        .bind(p.platform_fee_cap_kobo)
+        .bind(p.platform_fee_cap_naira.map(Naira::kobo))
+        .bind(p.platform_fee_mode.as_deref())
+        .bind(p.platform_fee_flat_naira.map(Naira::kobo))
+        .bind(p.shift_close_grace_minutes)
         .bind(updated_by)
         .execute(&self.pool)
         .await?;

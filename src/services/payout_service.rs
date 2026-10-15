@@ -9,6 +9,7 @@ use crate::repositories::clinician::ClinicianRepository;
 use crate::repositories::wallet::WalletRepository;
 use crate::services::encryption::EncryptionService;
 use crate::services::safehaven::{SafeHavenClient, SafeHavenError, TransferStatus};
+use crate::utils::money::Naira;
 
 pub const PLATFORM_FEE_NUMERATOR: i64 = 1;
 pub const PLATFORM_FEE_DENOMINATOR: i64 = 10;
@@ -35,18 +36,153 @@ pub fn split_payout(gross_kobo: i64) -> (i64, i64, i64) {
     (gross_kobo, fee, net)
 }
 
-/// `(gross, fee, net)` using an admin-configured fee percent and optional cap:
-/// `fee = min(round(gross * percent / 100), cap)`. Falls back to the same
-/// behaviour as `split_payout` when percent = 10 and no cap.
-pub fn split_payout_with(gross_kobo: i64, fee_percent: f64, cap_kobo: Option<i64>) -> (i64, i64, i64) {
-    let pct = fee_percent.clamp(0.0, 100.0);
-    let mut fee = ((gross_kobo as f64) * pct / 100.0).round() as i64;
-    if let Some(cap) = cap_kobo {
-        fee = fee.min(cap.max(0));
+/// How the platform fee is derived. Flat is the primary mode; percent is the
+/// legacy one, kept because shifts created before the flat rollout settle on it.
+///
+/// Stored as TEXT in `platform_settings.platform_fee_mode`, not a Postgres enum
+/// — see `migrations/20240064_platform_fee_mode.sql`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformFeeMode {
+    Flat,
+    Percent,
+}
+
+impl PlatformFeeMode {
+    /// Anything unrecognised reads as `Percent`, the pre-flat behaviour: a
+    /// garbled settings row must not silently drop the fee to a flat ₦0.
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "flat" => Self::Flat,
+            _ => Self::Percent,
+        }
     }
-    fee = fee.clamp(0, gross_kobo);
-    let net = gross_kobo - fee;
-    (gross_kobo, fee, net)
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Percent => "percent",
+        }
+    }
+}
+
+/// The admin-configured fee, as stored. All kobo, like everything else in this
+/// module — the naira the admin types is converted at the HTTP boundary by
+/// `utils::money::Naira`, not here.
+#[derive(Debug, Clone, Copy)]
+pub struct PlatformFeeConfig {
+    pub mode: PlatformFeeMode,
+    pub flat_kobo: i64,
+    pub percent: f64,
+    pub cap_kobo: Option<i64>,
+}
+
+impl PlatformFeeConfig {
+    /// The pre-flat default: 10% of gross, uncapped. Used only when the settings
+    /// row cannot be read.
+    pub fn legacy_percent_default() -> Self {
+        Self {
+            mode: PlatformFeeMode::Percent,
+            flat_kobo: 0,
+            percent: (PLATFORM_FEE_NUMERATOR as f64 / PLATFORM_FEE_DENOMINATOR as f64) * 100.0,
+            cap_kobo: None,
+        }
+    }
+}
+
+/// The platform's cut of `gross_kobo`, in kobo.
+///
+/// This is the **only** place naira becomes kobo. `flat_kobo * 100` is exact,
+/// and the result is clamped into `[0, gross]` so a flat fee larger than a small
+/// shift can never produce a negative net — it takes the whole gross instead.
+pub fn compute_platform_fee(gross_kobo: i64, cfg: &PlatformFeeConfig) -> i64 {
+    let fee = match cfg.mode {
+        PlatformFeeMode::Flat => cfg.flat_kobo,
+        PlatformFeeMode::Percent => {
+            let pct = cfg.percent.clamp(0.0, 100.0);
+            let mut fee = ((gross_kobo as f64) * pct / 100.0).round() as i64;
+            if let Some(cap) = cfg.cap_kobo {
+                fee = fee.min(cap.max(0));
+            }
+            fee
+        }
+    };
+    fee.clamp(0, gross_kobo.max(0))
+}
+
+/// `(gross, fee, net)` for a configured fee, flat or percent.
+pub fn split_payout_config(gross_kobo: i64, cfg: &PlatformFeeConfig) -> (i64, i64, i64) {
+    let fee = compute_platform_fee(gross_kobo, cfg);
+    (gross_kobo, fee, gross_kobo - fee)
+}
+
+/// Read the admin-configured platform fee from `platform_settings`, failing if
+/// it cannot be read.
+///
+/// Shared by the payout pipeline and by shift creation/preview so there is one
+/// definition of the fee, not two that can drift.
+///
+/// Use this wherever the answer is *recorded* — above all `create_shift`, which
+/// snapshots the result onto `shifts.platform_fee_kobo` permanently. A single
+/// statement timeout there would otherwise bake a guessed fee into a shift
+/// forever: with a configured flat fee of ₦500, a lenient fallback to the legacy
+/// 10% locks ₦10,000 out of a ₦100,000 shift's payout, silently and
+/// irreversibly. Failing the request is recoverable; a wrong snapshot is not.
+pub async fn try_read_platform_fee_config(
+    pool: &PgPool,
+) -> Result<PlatformFeeConfig, sqlx::Error> {
+    let row: Option<(String, i64, f64, Option<i64>)> = sqlx::query_as(
+        "SELECT platform_fee_mode, platform_fee_flat_kobo, \
+         platform_fee_percent::DOUBLE PRECISION, platform_fee_cap_kobo \
+         FROM platform_settings WHERE singleton = 'global'",
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    match row {
+        Some((mode, flat_kobo, percent, cap_kobo)) => Ok(PlatformFeeConfig {
+            mode: PlatformFeeMode::from_db(&mode),
+            flat_kobo,
+            percent,
+            cap_kobo,
+        }),
+        // The row is seeded by 20240048 and the primary key pins it to one row,
+        // so its absence is a broken database, not a state to paper over.
+        None => Err(sqlx::Error::RowNotFound),
+    }
+}
+
+/// As [`try_read_platform_fee_config`], but falls back to the legacy 10% on any
+/// failure.
+///
+/// Only safe where the result is *used once and not stored* — that is, the
+/// payout pipeline, where a bad tick is retried on the next scheduler pass and
+/// charging the historical 10% is better than charging nothing. Do not use this
+/// on a path that writes the fee down.
+pub async fn read_platform_fee_config(pool: &PgPool) -> PlatformFeeConfig {
+    match try_read_platform_fee_config(pool).await {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::error!(
+                "failed to read platform fee settings, falling back to the legacy 10% fee \
+                 for this payout only: {e}"
+            );
+            PlatformFeeConfig::legacy_percent_default()
+        }
+    }
+}
+
+/// `(gross, fee, net)` for a percent + optional cap. Retained for callers that
+/// only know a percentage; new code should use [`split_payout_config`].
+pub fn split_payout_with(gross_kobo: i64, fee_percent: f64, cap_kobo: Option<i64>) -> (i64, i64, i64) {
+    split_payout_config(
+        gross_kobo,
+        &PlatformFeeConfig {
+            mode: PlatformFeeMode::Percent,
+            flat_kobo: 0,
+            percent: fee_percent,
+            cap_kobo,
+        },
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +202,9 @@ struct PayableShift {
     clinician_id: Uuid,
     grand_total_kobo: Option<i64>,
     role_title: String,
+    /// Fee agreed when the shift was created. NULL on shifts predating the
+    /// snapshot column, which settle on the live settings instead.
+    platform_fee_kobo: Option<i64>,
 }
 
 pub struct PayoutService {
@@ -117,7 +256,8 @@ impl PayoutService {
                    s.hospital_id,
                    s.assigned_clinician_id AS clinician_id,
                    s.grand_total_kobo,
-                   s.role_title
+                   s.role_title,
+                   s.platform_fee_kobo
             FROM shifts s
             JOIN shift_handovers h ON h.shift_id = s.id
             WHERE s.status = 'completed'
@@ -147,28 +287,23 @@ impl PayoutService {
         Ok(rows)
     }
 
-    /// Read the admin-configured platform fee percent + optional cap. Falls
-    /// back to the hardcoded 10% / no-cap if the settings row is missing.
-    async fn platform_fee_config(&self) -> (f64, Option<i64>) {
-        let row: Option<(f64, Option<i64>)> = sqlx::query_as(
-            "SELECT platform_fee_percent::DOUBLE PRECISION, platform_fee_cap_kobo \
-             FROM platform_settings WHERE singleton = 'global'",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .ok()
-        .flatten();
-        row.unwrap_or((
-            (PLATFORM_FEE_NUMERATOR as f64 / PLATFORM_FEE_DENOMINATOR as f64) * 100.0,
-            None,
-        ))
+    /// See [`read_platform_fee_config`].
+    pub async fn platform_fee_config(&self) -> PlatformFeeConfig {
+        read_platform_fee_config(&self.pool).await
     }
 
     async fn process_one(&self, p: &PayableShift) -> Result<bool, PayoutServiceError> {
         let gross = p.grand_total_kobo.unwrap_or(0);
-        // Apply the admin-configured fee percent + cap at transfer time.
-        let (fee_percent, cap_kobo) = self.platform_fee_config().await;
-        let (gross, fee, net) = split_payout_with(gross, fee_percent, cap_kobo);
+        // Prefer the fee snapshotted when the shift was created — that is the
+        // number the hospital was shown in the preview. Only fall back to the
+        // live settings for shifts created before the snapshot column existed.
+        let (gross, fee, net) = match p.platform_fee_kobo {
+            Some(snapshot) => {
+                let fee = snapshot.clamp(0, gross.max(0));
+                (gross, fee, gross - fee)
+            }
+            None => split_payout_config(gross, &self.platform_fee_config().await),
+        };
 
         let min_payout = min_payout_kobo();
         if net < min_payout {
@@ -508,9 +643,14 @@ impl PayoutService {
                         clinician_id: r.clinician_id.unwrap_or_default(),
                         grand_total_kobo: r.grand_total_kobo,
                         role_title: r.role_title.clone(),
+                        // Refunding reverses the whole gross hold; the fee split
+                        // is irrelevant here, so it is not carried.
+                        platform_fee_kobo: None,
                     };
+                    // A refund releases the full gross, not the net. This used to
+                    // round-trip through `split_payout` to recover `gross`, which
+                    // read as if the 10% model mattered here. It does not.
                     let gross = r.grand_total_kobo.unwrap_or(0);
-                    let (gross, _fee, _net) = split_payout(gross);
                     self.refund_payout(&p, r.id, gross, "transfer reported failed by SafeHaven")
                         .await?;
                     settled += 1;
@@ -613,8 +753,10 @@ impl PayoutService {
                     clinician_id: r.clinician_id.unwrap_or_default(),
                     grand_total_kobo: r.grand_total_kobo,
                     role_title: r.role_title.clone(),
+                    platform_fee_kobo: None,
                 };
-                let (gross, _f, _n) = split_payout(r.grand_total_kobo.unwrap_or(0));
+                // As above: the refund reverses the gross hold.
+                let gross = r.grand_total_kobo.unwrap_or(0);
                 self.refund_payout(
                     &p,
                     payout_id,
@@ -636,7 +778,7 @@ impl PayoutService {
             r#"
             SELECT s.id AS shift_id, s.hospital_id,
                    s.assigned_clinician_id AS clinician_id,
-                   s.grand_total_kobo, s.role_title
+                   s.grand_total_kobo, s.role_title, s.platform_fee_kobo
             FROM shifts s
             JOIN shift_handovers h ON h.shift_id = s.id
             WHERE s.id = $1
@@ -678,7 +820,8 @@ struct PendingTransfer {
 pub struct PayoutRow {
     pub id: Uuid,
     pub shift_id: Option<Uuid>,
-    pub amount_kobo: i64,
+    #[sqlx(rename = "amount_kobo")]
+    pub amount_naira: Naira,
     pub status: String,
     pub provider_reference: Option<String>,
     pub provider_transaction_id: Option<String>,
@@ -730,5 +873,107 @@ mod tests {
         // Invariant: gross == fee + net for arbitrary inputs.
         let (g, f, n) = split_payout_with(777_777, 7.5, Some(40_000));
         assert_eq!(g, f + n);
+    }
+
+    /// `kobo`, like the stored column. ₦500 is 50_000.
+    fn flat(kobo: i64) -> PlatformFeeConfig {
+        PlatformFeeConfig {
+            mode: PlatformFeeMode::Flat,
+            flat_kobo: kobo,
+            percent: 10.0,
+            cap_kobo: None,
+        }
+    }
+
+    /// A flat fee is taken exactly as configured, with no scaling anywhere in
+    /// the path. The naira an admin types is converted once, at the HTTP
+    /// boundary, so nothing here multiplies or divides.
+    #[test]
+    fn a_flat_fee_is_taken_exactly_as_configured() {
+        // ₦500 flat (50_000 kobo) on a ₦10,000 gross → ₦9,500 net.
+        let (gross, fee, net) = split_payout_config(1_000_000, &flat(50_000));
+        assert_eq!(gross, 1_000_000);
+        assert_eq!(fee, 50_000, "the configured kobo amount, unscaled");
+        assert_eq!(net, 950_000);
+        assert_eq!(gross, fee + net);
+    }
+
+    #[test]
+    fn flat_fee_is_independent_of_gross() {
+        // Unlike percent, the same flat fee applies whatever the shift is worth.
+        assert_eq!(compute_platform_fee(1_000_000, &flat(50_000)), 50_000);
+        assert_eq!(compute_platform_fee(9_000_000, &flat(50_000)), 50_000);
+    }
+
+    #[test]
+    fn flat_fee_larger_than_gross_takes_the_gross_not_more() {
+        // ₦500 flat against a ₦100 shift: the fee cannot exceed the gross, or
+        // net goes negative and the clinician owes the platform money.
+        let (gross, fee, net) = split_payout_config(10_000, &flat(50_000));
+        assert_eq!(gross, 10_000);
+        assert_eq!(fee, 10_000);
+        assert_eq!(net, 0);
+        assert!(net >= 0, "net must never be negative");
+    }
+
+    #[test]
+    fn flat_zero_takes_nothing() {
+        // A promotional ₦0 is legitimate and must not error or misbehave.
+        assert_eq!(split_payout_config(1_000_000, &flat(0)), (1_000_000, 0, 1_000_000));
+    }
+
+    #[test]
+    fn flat_mode_ignores_percent_and_cap() {
+        let cfg = PlatformFeeConfig {
+            mode: PlatformFeeMode::Flat,
+            flat_kobo: 50_000,
+            percent: 90.0,
+            cap_kobo: Some(1),
+        };
+        // Neither the 90% nor the ₦0.01 cap applies in flat mode.
+        assert_eq!(compute_platform_fee(1_000_000, &cfg), 50_000);
+    }
+
+    #[test]
+    fn percent_mode_is_unchanged_by_the_flat_rollout() {
+        let cfg = PlatformFeeConfig {
+            mode: PlatformFeeMode::Percent,
+            flat_kobo: 99_999_900,
+            percent: 10.0,
+            cap_kobo: None,
+        };
+        // The flat amount is ignored, and the result still matches the old path.
+        assert_eq!(compute_platform_fee(6_966_400, &cfg), 696_640);
+        assert_eq!(split_payout_config(6_966_400, &cfg), split_payout(6_966_400));
+    }
+
+    #[test]
+    fn unknown_stored_mode_falls_back_to_percent_not_free() {
+        // A garbled settings value must not read as flat ₦0 and silently stop
+        // charging. Percent is the safe interpretation.
+        assert_eq!(PlatformFeeMode::from_db("flat"), PlatformFeeMode::Flat);
+        assert_eq!(PlatformFeeMode::from_db("percent"), PlatformFeeMode::Percent);
+        assert_eq!(PlatformFeeMode::from_db(""), PlatformFeeMode::Percent);
+        assert_eq!(PlatformFeeMode::from_db("FLAT"), PlatformFeeMode::Percent);
+        assert_eq!(PlatformFeeMode::from_db("gibberish"), PlatformFeeMode::Percent);
+    }
+
+    #[test]
+    fn mode_round_trips_through_its_string_form() {
+        for mode in [PlatformFeeMode::Flat, PlatformFeeMode::Percent] {
+            assert_eq!(PlatformFeeMode::from_db(mode.as_str()), mode);
+        }
+    }
+
+    #[test]
+    fn absurd_flat_fee_cannot_overflow() {
+        // Clamped to gross, so even an absurd configured fee cannot overflow.
+        assert_eq!(compute_platform_fee(1_000_000, &flat(i64::MAX)), 1_000_000);
+    }
+
+    #[test]
+    fn negative_gross_yields_no_fee() {
+        // Defensive: grand_total_kobo is CHECK (>= 0), but the helper is public.
+        assert_eq!(compute_platform_fee(-5, &flat(50_000)), 0);
     }
 }

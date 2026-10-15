@@ -15,13 +15,14 @@ use crate::routes::AppState;
 use crate::utils::{
     errors::{AppError, AppResult},
     extract_claims,
+    money::Naira,
 };
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct EarningsSummary {
-    pub total_earned_kobo: i64,
-    pub this_month_kobo: i64,
-    pub pending_kobo: i64,
+    pub total_earned_naira: Naira,
+    pub this_month_naira: Naira,
+    pub pending_naira: Naira,
     pub transactions: Vec<EarningsTransaction>,
     pub total_transactions: i64,
     pub page: i64,
@@ -32,7 +33,8 @@ pub struct EarningsSummary {
 pub struct EarningsTransaction {
     pub id: Uuid,
     pub shift_id: Option<Uuid>,
-    pub amount_kobo: i64,
+    #[sqlx(rename = "amount_kobo")]
+    pub amount_naira: Naira,
     pub status: String,
     pub hospital_name: Option<String>,
     pub role_title: Option<String>,
@@ -160,9 +162,9 @@ pub async fn get_earnings(
     .map_err(AppError::Database)?;
 
     Ok(Json(EarningsSummary {
-        total_earned_kobo,
-        this_month_kobo,
-        pending_kobo,
+        total_earned_naira: Naira::from_kobo(total_earned_kobo),
+        this_month_naira: Naira::from_kobo(this_month_kobo),
+        pending_naira: Naira::from_kobo(pending_kobo),
         transactions,
         total_transactions,
         page,

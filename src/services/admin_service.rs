@@ -10,6 +10,7 @@ use crate::repositories::admin::AdminRepository;
 use crate::services::email_outbox_service::EmailOutboxService;
 use crate::services::email_templates;
 use crate::utils::errors::AppError;
+use crate::utils::money::Naira;
 
 pub struct AdminService {
     repo: Arc<AdminRepository>,
@@ -57,7 +58,7 @@ impl AdminService {
         let by_priority = self.repo.revenue_by_priority().await?;
         let by_status = self.repo.revenue_by_status().await?;
         Ok(RevenueBreakdown {
-            total_revenue_kobo,
+            total_revenue_naira: Naira::from_kobo(total_revenue_kobo),
             by_priority,
             by_status,
         })
@@ -118,9 +119,9 @@ impl AdminService {
                     .into(),
             ));
         }
-        if req.resolution == "partial_refund" && req.resolution_amount_kobo.is_none() {
+        if req.resolution == "partial_refund" && req.resolution_amount_naira.is_none() {
             return Err(AppError::BadRequest(
-                "resolution_amount_kobo is required for partial_refund".into(),
+                "resolution_amount_naira is required for partial_refund".into(),
             ));
         }
 
@@ -128,7 +129,7 @@ impl AdminService {
             .resolve_dispute(
                 id,
                 &req.resolution,
-                req.resolution_amount_kobo,
+                req.resolution_amount_naira.map(Naira::kobo),
                 req.admin_notes.as_deref(),
                 admin_user_id,
             )
@@ -152,7 +153,72 @@ impl AdminService {
                 ));
             }
         }
-        Ok(self.repo.update_settings(&p, admin_user_id).await?)
+
+        if let Some(mode) = p.platform_fee_mode.as_deref() {
+            if !matches!(mode, "flat" | "percent") {
+                return Err(AppError::BadRequest(
+                    "platform_fee_mode must be 'flat' or 'percent'".into(),
+                ));
+            }
+        }
+
+        if let Some(flat) = p.platform_fee_flat_naira {
+            let flat_kobo = flat.kobo();
+            if flat_kobo < 0 {
+                return Err(AppError::BadRequest(
+                    "the flat platform fee must not be negative".into(),
+                ));
+            }
+
+            // A flat fee can exceed a small shift's gross. That is *safe* —
+            // `compute_platform_fee` clamps the fee to the gross so the net can
+            // never go negative — but it is rarely intended, and its real
+            // consequence is downstream: `PayoutService::process_one` compares
+            // `min_payout_kobo()` against the net, so a fee that zeroes the net
+            // sends every such payout into the "below minimum" bucket and burns
+            // the 3-failure retry budget.
+            //
+            // This is a warning rather than a rejection, deliberately. The
+            // obvious threshold to reject against is
+            // `platform_settings.min_hourly_rate_kobo`, but that setting is read
+            // by nothing else in the codebase — `validate_request` enforces a
+            // hardcoded `MIN_HOURLY_KOBO` of ₦100 instead. Keying a hard 400 to
+            // a value the rest of the system ignores would reject legitimate
+            // configurations (a ₦2,000 flat fee on a ₦64,000 shift is ~3%) while
+            // still admitting a fee that zeroes the genuinely smallest shift.
+            // Until that setting is actually honoured, the clamp is the
+            // guarantee and this is advice.
+            let current = self.repo.get_settings().await?;
+            // Both sides are unwrapped to kobo, so there is no conversion to
+            // get wrong: `Naira` holds kobo and only renders naira on the wire.
+            let advertised_min_kobo = p
+                .min_hourly_rate_naira
+                .unwrap_or(current.min_hourly_rate_naira)
+                .kobo();
+            if advertised_min_kobo > 0 && flat_kobo >= advertised_min_kobo {
+                tracing::warn!(
+                    flat_kobo,
+                    advertised_min_hourly_kobo = advertised_min_kobo,
+                    "flat platform fee is at or above the advertised minimum hourly rate; \
+                     payouts on the smallest shifts will net zero and fail the minimum-payout \
+                     check"
+                );
+            }
+        }
+
+        let settings = self.repo.update_settings(&p, admin_user_id).await?;
+
+        // A flat ₦0 is a legitimate promotional config, so it is not rejected —
+        // but "deliberately free" and "forgot to set the amount" look identical
+        // in the data, and the difference is the platform's entire revenue.
+        if settings.platform_fee_mode == "flat" && settings.platform_fee_flat_naira.kobo() == 0 {
+            tracing::warn!(
+                admin_user_id = %admin_user_id,
+                "platform fee saved as flat ₦0 — no fee will be taken on any payout"
+            );
+        }
+
+        Ok(settings)
     }
 
     /// §7 Report generation. Reports are produced asynchronously in the full

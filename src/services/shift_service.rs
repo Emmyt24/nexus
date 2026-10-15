@@ -4,10 +4,12 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::models::shift::{CreateShiftRequest, Shift, ShiftPriority, ShiftStatus, ShiftType};
+use crate::models::user::{Claims, UserRole};
 use crate::repositories::shift::ShiftRepository;
 use crate::services::email_outbox_service::EmailOutboxService;
 use crate::services::email_templates;
 use crate::services::notification_service::NotificationService;
+use crate::utils::money::Naira;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShiftServiceError {
@@ -297,20 +299,7 @@ impl ShiftService {
             return Err(ShiftServiceError::TooManyActiveShifts);
         }
 
-        // STAT shifts get an automatic +20% bonus when none is set.
-        if request.priority == ShiftPriority::Stat
-            && request.stat_bonus_kobo.unwrap_or(0) == 0
-            && request.urgency_bonus_pct.is_none()
-        {
-            let base = match request.pay_type {
-                crate::models::shift::PayType::HourlyRate => request
-                    .rate_kobo_per_hour
-                    .unwrap_or(0)
-                    .saturating_mul(request.duration_hours as i64),
-                crate::models::shift::PayType::FixedRate => request.fixed_rate_kobo.unwrap_or(0),
-            };
-            request.stat_bonus_kobo = Some(base / 5); // +20%
-        }
+        Self::apply_stat_auto_bonus_to(&mut request);
 
         // Check for duplicate shifts
         self.check_duplicate_shift(hospital_id, &request).await?;
@@ -320,12 +309,25 @@ impl ShiftService {
         let equipment = std::mem::take(&mut request.equipment);
         let requirements = std::mem::take(&mut request.requirements);
 
+        // Snapshot the fee before the transaction opens. Payout settles days or
+        // weeks later, and recomputing from the settings then would let an admin
+        // re-price work already agreed — including work the hospital accepted on
+        // the strength of the net figure `preview_shift` showed it.
+        let (_, _, preview_gross) = self.calculate_preview_compensation(&request);
+        let platform_fee_kobo = self.platform_fee_for_gross(preview_gross).await?;
+
         let mut tx = self.pool.begin().await?;
 
         // Create shift
         let shift = self
             .shift_repo
-            .create(&mut tx, hospital_id, created_by, request)
+            .create(
+                &mut tx,
+                hospital_id,
+                created_by,
+                request,
+                Some(platform_fee_kobo),
+            )
             .await?;
 
         // F1-F12 / F1-F13 / F1-F14 — persist atomically within the same tx.
@@ -351,7 +353,7 @@ impl ShiftService {
         }
 
         // hospital must have wallet funds covering the gross
-        let gross = shift.grand_total_kobo.unwrap_or(0);
+        let gross = shift.grand_total_naira.map(Naira::kobo).unwrap_or(0);
         if gross > 0 {
             self.wallet_service
                 .try_hold_in_tx(&mut tx, hospital_id, Some(shift.id), gross)
@@ -1692,10 +1694,24 @@ impl ShiftService {
         let worked_minutes = now.signed_duration_since(clockin_at).num_minutes().max(0) as i32;
 
         let mut tx = self.pool.begin().await?;
-        let attendance_id = self
+        // `record_clockout_tx` is guarded on `in_progress` and reports
+        // `RowNotFound` when it loses that race — the status check above is a
+        // read-then-write and cannot be the authority. Translate it into the
+        // same 409 the pre-check produces rather than letting a lost race
+        // surface as a 500.
+        let attendance_id = match self
             .shift_repo
             .record_clockout_tx(&mut tx, shift_id, worked_minutes)
-            .await?;
+            .await
+        {
+            Ok(id) => id,
+            Err(sqlx::Error::RowNotFound) => {
+                return Err(ShiftServiceError::InvalidStatus(
+                    "Shift is no longer in progress; it may already have been closed".to_string(),
+                ));
+            }
+            Err(e) => return Err(ShiftServiceError::DatabaseError(e)),
+        };
         tx.commit().await?;
 
         Ok(ClockoutResponse {
@@ -1787,10 +1803,76 @@ impl ShiftService {
 
     /// Hospital rates the assigned worker
 
+    /// A page of ratings written about a clinician or a hospital.
+    ///
+    /// `ratee_kind` is validated here rather than taken from the caller as a
+    /// free string: it is interpolated into a Postgres enum cast, and the two
+    /// read endpoints each know which kind they are asking for.
+    ///
+    /// Not tenant-scoped — a rating is marketplace information, and the
+    /// aggregate behind it is already on `GET /workers/{id}` and
+    /// `GET /hospitals/{id}`. What this adds is the *comments*, so it is scoped
+    /// by who has a reason to read them:
+    ///
+    ///  * A hospital's feed is open to any authenticated caller. A clinician
+    ///    deciding whether to accept a shift there needs it, which is the whole
+    ///    point of BR-F1-49.
+    ///  * A clinician's feed is open to hospitals and platform staff, but a
+    ///    health worker may only read **their own**. Written performance
+    ///    feedback about one clinician is not something a competing clinician
+    ///    has any business reading, and the route guard cannot tell the two
+    ///    cases apart.
+    ///
+    /// The rater's identity stays hidden either way unless they waived
+    /// anonymity.
+    pub async fn list_ratings(
+        &self,
+        claims: &Claims,
+        ratee_kind: &str,
+        ratee_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<crate::models::shift::RatingFeed, ShiftServiceError> {
+        if !matches!(ratee_kind, "clinician" | "hospital") {
+            return Err(ShiftServiceError::ValidationError(
+                "ratee_kind must be 'clinician' or 'hospital'".to_string(),
+            ));
+        }
+
+        if ratee_kind == "clinician" && claims.role == UserRole::HealthWorker {
+            let own = self
+                .shift_repo
+                .find_clinician_id_for_user(
+                    Uuid::parse_str(&claims.sub).map_err(|_| ShiftServiceError::NotAuthorized)?,
+                )
+                .await?
+                .ok_or(ShiftServiceError::NoClinicianProfile)?;
+            if own != ratee_id {
+                return Err(ShiftServiceError::NotAuthorized);
+            }
+        }
+
+        let limit = limit.clamp(1, 100);
+        let offset = offset.max(0);
+
+        let (items, average, total) = self
+            .shift_repo
+            .list_ratings_for(ratee_kind, ratee_id, limit, offset)
+            .await?;
+
+        Ok(crate::models::shift::RatingFeed {
+            average,
+            total,
+            items,
+        })
+    }
+
+    /// Takes `&Claims` rather than a bare user id because the authorization here
+    /// is a *tenant* check, which needs the caller's role and hospital.
     pub async fn rate_worker(
         &self,
         shift_id: Uuid,
-        requester_user_id: Uuid,
+        claims: &Claims,
         request: crate::models::shift::RateWorkerRequest,
     ) -> Result<crate::models::shift::RatingResponse, ShiftServiceError> {
         use validator::Validate;
@@ -1798,14 +1880,27 @@ impl ShiftService {
             .validate()
             .map_err(|e| ShiftServiceError::ValidationError(e.to_string()))?;
 
+        let requester_user_id = Uuid::parse_str(&claims.sub)
+            .map_err(|_| ShiftServiceError::NotAuthorized)?;
+
         let shift = self
             .shift_repo
             .get_by_id(shift_id)
             .await?
             .ok_or(ShiftServiceError::NotFound(shift_id))?;
 
-        if shift.created_by != requester_user_id {
-            return Err(ShiftServiceError::NotAuthorized);
+        // The hospital rates the worker, not the individual who happened to post
+        // the shift. This used to compare `shift.created_by` against the caller,
+        // which 403'd a second admin at the same hospital — simultaneously too
+        // narrow and not a tenant check at all.
+        match claims.role {
+            UserRole::SuperAdmin => {}
+            UserRole::HospitalAdmin => {
+                if claims_hospital_id(claims) != Some(shift.hospital_id) {
+                    return Err(ShiftServiceError::NotAuthorized);
+                }
+            }
+            _ => return Err(ShiftServiceError::NotAuthorized),
         }
         if shift.status != ShiftStatus::Completed {
             return Err(ShiftServiceError::InvalidStatus(
@@ -1816,8 +1911,11 @@ impl ShiftService {
             ShiftServiceError::InvalidStatus("Shift has no assigned clinician to rate".to_string())
         })?;
 
-        // 7-day submission window after completion. We use the
-        let window_closes_at = shift.updated_at + Duration::days(7);
+        // 7-day submission window from completion (BR-F1-46). Anchored to
+        // `completed_at`, not `updated_at`: the latter moves on any write to the
+        // row, which silently slid this deadline. `updated_at` remains the
+        // fallback for shifts completed before that column existed.
+        let window_closes_at = shift.completed_at.unwrap_or(shift.updated_at) + Duration::days(7);
         if Utc::now() > window_closes_at {
             return Err(ShiftServiceError::RatingWindowClosed);
         }
@@ -1834,6 +1932,7 @@ impl ShiftService {
                 request.score,
                 None,
                 request.comment.as_deref(),
+                request.is_anonymous,
                 window_closes_at,
             )
             .await
@@ -1886,7 +1985,8 @@ impl ShiftService {
             ));
         }
 
-        let window_closes_at = shift.updated_at + Duration::days(7);
+        // Same anchor as `rate_worker` — see the comment there.
+        let window_closes_at = shift.completed_at.unwrap_or(shift.updated_at) + Duration::days(7);
         if Utc::now() > window_closes_at {
             return Err(ShiftServiceError::RatingWindowClosed);
         }
@@ -1907,6 +2007,7 @@ impl ShiftService {
                 request.score,
                 Some(&dims_json),
                 request.comment.as_deref(),
+                request.is_anonymous,
                 window_closes_at,
             )
             .await
@@ -1934,6 +2035,15 @@ impl ShiftService {
         request
             .validate()
             .map_err(|e| ShiftServiceError::ValidationError(e.to_string()))?;
+
+        // Sending both is contradictory, and the SQL resolves it by letting the
+        // clear win — so a client that always serialises every field would have
+        // its new text discarded and still get a 200. Say so instead.
+        if request.clear_comment && request.comment.is_some() {
+            return Err(ShiftServiceError::ValidationError(
+                "send either `comment` or `clear_comment`, not both".to_string(),
+            ));
+        }
 
         let (existing, rater_user_id) = self
             .shift_repo
@@ -1964,6 +2074,7 @@ impl ShiftService {
                 request.score,
                 dims_json.as_ref(),
                 request.comment.as_deref(),
+                request.clear_comment,
             )
             .await?;
 
@@ -1987,6 +2098,8 @@ impl ShiftService {
     /// neither is available a [`ShiftServiceError::LocationRequired`] is returned
     /// so the caller can prompt for location access. Filtering, sorting and
     /// paging are performed in SQL — see [`ShiftRepository::list_nearby_shifts`].
+    /// `require_qualification_match` is opt-in — see
+    /// [`ShiftRepository::list_nearby_shifts`] for why it is not the default.
     pub async fn list_nearby_shifts_for_worker(
         &self,
         worker_user_id: Uuid,
@@ -1994,6 +2107,7 @@ impl ShiftService {
         radius_km: f64,
         limit: i64,
         offset: i64,
+        require_qualification_match: bool,
     ) -> Result<NearbyShiftsResult, ShiftServiceError> {
         use crate::models::shift::NearbyShiftCard;
 
@@ -2019,7 +2133,14 @@ impl ShiftService {
 
         let rows = self
             .shift_repo
-            .list_nearby_shifts(clinician_id, origin_coords, radius_km, limit, offset)
+            .list_nearby_shifts(
+                clinician_id,
+                origin_coords,
+                radius_km,
+                limit,
+                offset,
+                require_qualification_match,
+            )
             .await?;
 
         // Rows arrive already filtered, ranked and paged; map them 1:1.
@@ -2036,9 +2157,9 @@ impl ShiftService {
                 scheduled_start: r.scheduled_start,
                 duration_hours: r.duration_hours,
                 pay_type: r.pay_type,
-                rate_kobo_per_hour: r.rate_kobo_per_hour,
-                fixed_rate_kobo: r.fixed_rate_kobo,
-                stat_bonus_kobo: r.stat_bonus_kobo,
+                rate_naira_per_hour: Naira::from_kobo_opt(r.rate_kobo_per_hour),
+                fixed_rate_naira: Naira::from_kobo_opt(r.fixed_rate_kobo),
+                stat_bonus_naira: Naira::from_kobo_opt(r.stat_bonus_kobo),
                 distance_km: r.distance_km,
                 interest_expressed: r.interest_expressed,
             })
@@ -2235,7 +2356,7 @@ impl ShiftService {
         }
 
         // release the escrowed funds back into the hospital's
-        let gross = shift.grand_total_kobo.unwrap_or(0);
+        let gross = shift.grand_total_naira.map(Naira::kobo).unwrap_or(0);
         if gross > 0 {
             if let Err(e) = self
                 .wallet_service
@@ -2432,7 +2553,7 @@ impl ShiftService {
         const MIN_FIXED_KOBO: i64 = 10_000; // ₦100
         match request.pay_type {
             crate::models::shift::PayType::HourlyRate => {
-                let rate = request.rate_kobo_per_hour.ok_or_else(|| {
+                let rate = request.rate_naira_per_hour.map(Naira::kobo).ok_or_else(|| {
                     ShiftServiceError::ValidationError(
                         "Hourly rate is required for hourly pay type".to_string(),
                     )
@@ -2444,7 +2565,7 @@ impl ShiftService {
                 }
             }
             crate::models::shift::PayType::FixedRate => {
-                let rate = request.fixed_rate_kobo.ok_or_else(|| {
+                let rate = request.fixed_rate_naira.map(Naira::kobo).ok_or_else(|| {
                     ShiftServiceError::ValidationError(
                         "Fixed rate is required for fixed pay type".to_string(),
                     )
@@ -2556,6 +2677,166 @@ impl ShiftService {
     }
 
     /// One iteration of the offer-expiry sweep. Flips every
+
+    /// Minutes of grace after `scheduled_end` before the sweep closes a shift.
+    ///
+    /// Read from `platform_settings` rather than hardcoded. Ten of the twelve
+    /// settings in that table are already written by the admin API and read by
+    /// nothing; a third dead grace period would be worse than none. Falls back
+    /// to 15 — the value the FRS uses for late clock-in — if the row cannot be
+    /// read, since refusing to sweep leaves escrow and clinicians stuck.
+    async fn shift_close_grace_minutes(&self) -> i32 {
+        match sqlx::query_scalar::<_, i32>(
+            "SELECT shift_close_grace_minutes FROM platform_settings WHERE singleton = 'global'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        {
+            Ok(Some(m)) => m.max(0),
+            Ok(None) => 15,
+            Err(e) => {
+                tracing::error!("could not read shift_close_grace_minutes, using 15: {e}");
+                15
+            }
+        }
+    }
+
+    /// Close out shifts whose scheduled end has passed and whose grace period
+    /// has run out. Returns how many were closed.
+    ///
+    /// Two branches, because the two cases owe opposite things:
+    ///
+    ///  * **Clocked in, never clocked out** → the shift completes. The work
+    ///    happened, so the payout pipeline should pay it. Nothing is refunded.
+    ///  * **Never clocked in** → `no_show`, and the escrow goes back to the
+    ///    hospital. Nobody worked; the money must not sit in `held_kobo`
+    ///    forever, which is what happens today because `cancel_shift` refuses
+    ///    anything past `upcoming`.
+    ///
+    /// Each branch claims its rows in one atomic statement, so this is safe to
+    /// run on more than one instance. Per-row failures are logged and skipped
+    /// rather than aborting the tick, following `rebroadcast_due_shifts`.
+    pub async fn close_timed_out_shifts(&self) -> Result<usize, ShiftServiceError> {
+        let grace = self.shift_close_grace_minutes().await;
+        let mut closed = 0usize;
+
+        // 1 — worked but not closed out. Completing is all that is needed; the
+        // payout pipeline requires an approved handover, so the clinician is
+        // nudged to file one rather than silently losing the money.
+        for (shift_id, hospital_id, clinician_id, role_title) in self
+            .shift_repo
+            .close_timed_out_worked_shifts(grace)
+            .await?
+        {
+            closed += 1;
+            tracing::info!(
+                "Shift {shift_id} ({role_title}) timed out with a clock-in and was completed \
+                 at its scheduled end (hospital {hospital_id})"
+            );
+
+            if self.shift_repo.get_handover(shift_id).await.ok().flatten().is_none() {
+                if let Some(cid) = clinician_id {
+                    self.notify_clinician_handover_outstanding(shift_id, cid, &role_title)
+                        .await;
+                }
+            }
+        }
+
+        // 2 — never started. Release the hold, then flag attendance if a row
+        // exists at all.
+        for (shift_id, hospital_id, _clinician_id, role_title, grand_total_kobo) in self
+            .shift_repo
+            .close_timed_out_unworked_shifts(grace)
+            .await?
+        {
+            closed += 1;
+
+            let mut tx = match self.pool.begin().await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    tracing::error!(
+                        "shift {shift_id} marked no_show but its escrow could not be \
+                         released (begin failed): {e}"
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(e) = self.shift_repo.mark_attendance_missed_tx(&mut tx, shift_id).await {
+                tracing::error!("could not flag attendance as missed for shift {shift_id}: {e}");
+            }
+
+            let hold = grand_total_kobo.unwrap_or(0);
+            if hold > 0 {
+                if let Err(e) = self
+                    .wallet_service
+                    .release_hold_in_tx(&mut tx, hospital_id, Some(shift_id), hold)
+                    .await
+                {
+                    // Loud: the status is already committed by the claim above,
+                    // so a failure here leaves money held against a dead shift.
+                    tracing::error!(
+                        "shift {shift_id} is no_show but releasing its {hold} kobo hold \
+                         failed: {e}"
+                    );
+                    continue;
+                }
+            }
+
+            if let Err(e) = tx.commit().await {
+                tracing::error!("escrow release for no_show shift {shift_id} failed: {e}");
+                continue;
+            }
+
+            tracing::info!(
+                "Shift {shift_id} ({role_title}) timed out with no clock-in, marked no_show, \
+                 {hold} kobo released to hospital {hospital_id}"
+            );
+
+            self.notify_hospital_no_show(hospital_id, &role_title).await;
+        }
+
+        Ok(closed)
+    }
+
+    /// Best-effort nudge; a missing email must not fail the sweep.
+    async fn notify_clinician_handover_outstanding(
+        &self,
+        shift_id: Uuid,
+        clinician_id: Uuid,
+        role_title: &str,
+    ) {
+        // Push targets a `users.id`, so resolve it the way the rest of this
+        // service does.
+        let Ok(Some(user_id)) = self.shift_repo.get_clinician_user_id(clinician_id).await else {
+            tracing::warn!("no user behind clinician {clinician_id}; skipping handover nudge");
+            return;
+        };
+
+        self.push
+            .notify_best_effort(
+                user_id,
+                "handover_outstanding",
+                "Handover still needed",
+                &format!(
+                    "Your {role_title} shift was closed automatically. File the handover so \
+                     payment can be released."
+                ),
+                serde_json::json!({ "shift_id": shift_id }),
+            )
+            .await;
+    }
+
+    async fn notify_hospital_no_show(&self, hospital_id: Uuid, role_title: &str) {
+        if let Ok(Some((_, hospital_email))) =
+            self.shift_repo.get_hospital_contact(hospital_id).await
+        {
+            let content = email_templates::shift_no_show(role_title);
+            if let Err(e) = self.email_outbox.enqueue_email(&hospital_email, &content).await {
+                tracing::warn!("could not queue no-show email: {e}");
+            }
+        }
+    }
 
     pub async fn expire_due_offers(&self) -> Result<usize, ShiftServiceError> {
         let expired = self.shift_repo.expire_due_offers().await?;
@@ -2965,6 +3246,65 @@ impl ShiftService {
     }
 
     /// Preview shift before publishing
+    /// STAT shifts get an automatic +20% bonus when none is set.
+    ///
+    /// Extracted so `preview_shift` can apply the same rule. It previously lived
+    /// inline in `create_shift` only, which is why a STAT shift's preview
+    /// under-reported its total — and, once the fee and the clinician's net
+    /// joined that response, under-reported those too.
+    fn apply_stat_auto_bonus_to(request: &mut CreateShiftRequest) {
+        if request.priority == ShiftPriority::Stat
+            && request.stat_bonus_naira.map(Naira::kobo).unwrap_or(0) == 0
+            && request.urgency_bonus_pct.is_none()
+        {
+            let base_kobo = match request.pay_type {
+                crate::models::shift::PayType::HourlyRate => request
+                    .rate_naira_per_hour
+                    .map(Naira::kobo)
+                    .unwrap_or(0)
+                    .saturating_mul(request.duration_hours as i64),
+                crate::models::shift::PayType::FixedRate => {
+                    request.fixed_rate_naira.map(Naira::kobo).unwrap_or(0)
+                }
+            };
+            // +20%, taken in kobo so the bonus on an odd total keeps its kobo.
+            request.stat_bonus_naira = Some(Naira::from_kobo(base_kobo / 5));
+        }
+    }
+
+    fn apply_stat_auto_bonus(&self, request: &mut CreateShiftRequest) {
+        Self::apply_stat_auto_bonus_to(request);
+    }
+
+    /// The platform's cut of `gross_kobo`, from the live admin settings.
+    ///
+    /// Both the preview and `create_shift` go through here so the figure a
+    /// hospital is shown is the figure that gets snapshotted onto the shift.
+    /// The naira → kobo conversion lives in `payout_service`, not here.
+    ///
+    /// Known gap, in **percent mode only**: `preview_shift` does not apply the
+    /// STAT auto-bonus that `create_shift` adds at line ~313, so for a STAT
+    /// shift the preview's gross is lower than the created shift's and a
+    /// percentage fee previews low. That divergence predates this method —
+    /// `calculate_preview_compensation` and the repository's
+    /// `calculate_compensation` have always disagreed — and fixing it means
+    /// changing what preview reports for STAT shifts generally, which is a
+    /// wider behavioural change than a fee belongs in. Flat mode, the default,
+    /// is immune because a flat fee does not depend on the gross.
+    async fn platform_fee_for_gross(&self, gross_kobo: i64) -> Result<i64, ShiftServiceError> {
+        // The fallible read, not the lenient one: `create_shift` snapshots this
+        // onto the row permanently, so a transient failure that fell back to the
+        // legacy 10% would lock the wrong fee into a shift forever. Preview uses
+        // it too — showing a guessed figure the hospital then commits money
+        // against is the same defect one step earlier.
+        let cfg = crate::services::payout_service::try_read_platform_fee_config(&self.pool)
+            .await
+            .map_err(ShiftServiceError::DatabaseError)?;
+        Ok(crate::services::payout_service::compute_platform_fee(
+            gross_kobo, &cfg,
+        ))
+    }
+
     pub async fn preview_shift(
         &self,
         request: &CreateShiftRequest,
@@ -2972,8 +3312,23 @@ impl ShiftService {
         // Validate the request first
         self.validate_request(request)?;
 
+        // Model what `create_shift` will actually do, including the STAT
+        // auto-bonus it applies when a STAT shift arrives with no explicit
+        // bonus. Without this the preview under-reports a STAT shift's total by
+        // 20% — it always did, but the fee and the clinician's net are now in
+        // this response too, so the hospital would be shown three wrong numbers
+        // and then be charged the right one.
+        let mut effective = request.clone();
+        self.apply_stat_auto_bonus(&mut effective);
+
         // Calculate compensation
-        let (base_amount, stat_bonus, grand_total) = self.calculate_preview_compensation(request);
+        let (base_amount, stat_bonus, grand_total) =
+            self.calculate_preview_compensation(&effective);
+
+        // The fee the clinician will have deducted, and what they actually take
+        // home. Shown here because this is the hospital's last look before it
+        // commits money, and the same figure is snapshotted at create time.
+        let platform_fee_kobo = self.platform_fee_for_gross(grand_total).await?;
 
         // Generate preview
         Ok(ShiftPreview {
@@ -2987,6 +3342,8 @@ impl ShiftService {
             base_amount_kobo: base_amount,
             stat_bonus_kobo: stat_bonus,
             grand_total_kobo: grand_total,
+            platform_fee_kobo,
+            worker_net_kobo: grand_total - platform_fee_kobo,
             virtual_link: if request.shift_type == ShiftType::Virtual {
                 Some(consult_deep_link(None))
             } else {
@@ -2999,25 +3356,32 @@ impl ShiftService {
         })
     }
 
+    /// Returns `(base_kobo, stat_bonus_kobo, grand_total_kobo)`.
     fn calculate_preview_compensation(&self, request: &CreateShiftRequest) -> (i64, i64, i64) {
         use crate::models::shift::PayType;
 
         let base_amount = match request.pay_type {
             PayType::HourlyRate => request
-                .rate_kobo_per_hour
-                .map(|rate| (rate as f64 * request.duration_hours as f64) as i64)
+                .rate_naira_per_hour
+                .map(|rate| (rate.kobo() as f64 * request.duration_hours as f64) as i64)
                 .unwrap_or(0),
-            PayType::FixedRate => request.fixed_rate_kobo.unwrap_or(0),
+            PayType::FixedRate => request.fixed_rate_naira.map(Naira::kobo).unwrap_or(0),
         };
 
-        let stat_bonus = request.stat_bonus_kobo.unwrap_or(0);
+        let stat_bonus = request.stat_bonus_naira.map(Naira::kobo).unwrap_or(0);
         let grand_total = base_amount + stat_bonus;
 
         (base_amount, stat_bonus, grand_total)
     }
 }
 
-/// Shift preview response
+/// The computed preview, in kobo.
+///
+/// Internal: this is the arithmetic, not the response. `ShiftPreviewResponse`
+/// is the naira form the handler converts it into, and nothing serialises this
+/// struct to a client. Kept in kobo so the fee, the bonus and the net are exact
+/// integers all the way through — `compute_platform_fee` works in kobo and a
+/// percentage fee is routinely fractional in naira.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ShiftPreview {
     pub role_title: String,
@@ -3030,6 +3394,11 @@ pub struct ShiftPreview {
     pub base_amount_kobo: i64,
     pub stat_bonus_kobo: i64,
     pub grand_total_kobo: i64,
+    /// Platform fee in kobo, deducted from the clinician's pay (FRS BR-F1-42).
+    /// The hospital still escrows `grand_total_kobo`.
+    pub platform_fee_kobo: i64,
+    /// `grand_total_kobo - platform_fee_kobo` — what the clinician receives.
+    pub worker_net_kobo: i64,
     pub virtual_link: Option<String>,
     pub estimated_matches: i32,
 }
@@ -3139,4 +3508,16 @@ mod consult_deep_link_tests {
         let link = with_base_url(Some("https://app.example.test"), || consult_deep_link(None));
         assert_eq!(link, "https://app.example.test/consults/preview");
     }
+}
+
+/// `Claims.hospital_id` is a string on the wire; parse it once.
+///
+/// Mirrors the helper of the same name in `video_service`, deliberately rather
+/// than sharing it: both are three lines, and a shared one would couple the
+/// shift domain to the video domain for no gain.
+fn claims_hospital_id(claims: &Claims) -> Option<Uuid> {
+    claims
+        .hospital_id
+        .as_deref()
+        .and_then(|id| Uuid::parse_str(id).ok())
 }

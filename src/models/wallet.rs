@@ -5,9 +5,16 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use utoipa::ToSchema;
 use uuid::Uuid;
-use validator::Validate;
+use validator::{Validate, ValidationError};
+
+use crate::utils::money::Naira;
 
 /// Mirror of the `hospital_wallets` row.
+///
+/// Kobo, deliberately: this is the ledger side of the boundary. Every balance
+/// and hold is arithmetic, and an exact minor-unit integer is the only form
+/// that cannot drift. [`WalletSummary`] is the naira form that goes on the
+/// wire.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct Wallet {
     pub hospital_id: Uuid,
@@ -29,8 +36,10 @@ pub struct WalletLedgerEntry {
     pub id: Uuid,
     pub hospital_id: Uuid,
     pub kind: String,
-    pub delta_balance_kobo: i64,
-    pub delta_held_kobo: i64,
+    #[sqlx(rename = "delta_balance_kobo")]
+    pub delta_balance_naira: Naira,
+    #[sqlx(rename = "delta_held_kobo")]
+    pub delta_held_naira: Naira,
     pub shift_id: Option<Uuid>,
     pub provider_reference: Option<String>,
     pub notes: Option<String>,
@@ -42,7 +51,8 @@ pub struct WalletLedgerEntry {
 pub struct WalletDepositRequest {
     pub id: Uuid,
     pub hospital_id: Uuid,
-    pub amount_kobo: i64,
+    #[sqlx(rename = "amount_kobo")]
+    pub amount_naira: Naira,
     pub virtual_account_number: String,
     pub virtual_bank_code: Option<String>,
     pub virtual_account_name: Option<String>,
@@ -50,7 +60,8 @@ pub struct WalletDepositRequest {
     pub external_reference: String,
     pub status: String,
     pub received_at: Option<DateTime<Utc>>,
-    pub received_amount_kobo: Option<i64>,
+    #[sqlx(rename = "received_amount_kobo")]
+    pub received_amount_naira: Option<Naira>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -60,16 +71,31 @@ pub struct WalletDepositRequest {
 /// Body for `POST /api/v1/wallet/deposits`.
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct CreateDepositRequest {
-    /// Amount in kobo (e.g. 10_000_000 = ₦100,000). Minimum ₦1,000.
-    #[validate(range(min = 100_000, message = "Minimum deposit is ₦1,000"))]
-    pub amount_kobo: i64,
+    /// Amount in **naira** (e.g. 100000 = ₦100,000). Minimum ₦1,000.
+    ///
+    /// Validated by a custom function rather than `range`: the stored value is
+    /// kobo, so a `range` bound here would be read as a naira bound by anyone
+    /// editing it and as a kobo bound by `validator`. Comparing kobo to kobo
+    /// leaves nothing to misread.
+    #[validate(custom(function = "min_deposit"))]
+    pub amount_naira: Naira,
+}
+
+/// ₦1,000, the smallest deposit SafeHaven is worth a virtual account for.
+fn min_deposit(amount: &Naira) -> Result<(), ValidationError> {
+    if amount.kobo() < 100_000 {
+        return Err(
+            ValidationError::new("min_deposit").with_message("Minimum deposit is ₦1,000".into())
+        );
+    }
+    Ok(())
 }
 
 /// Response for `POST /api/v1/wallet/deposits` and `GET /api/v1/wallet/deposits`.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DepositResponse {
     pub deposit_id: Uuid,
-    pub amount_kobo: i64,
+    pub amount_naira: Naira,
     pub virtual_account_number: String,
     pub virtual_bank_code: Option<String>,
     pub virtual_account_name: Option<String>,
@@ -81,7 +107,7 @@ impl From<WalletDepositRequest> for DepositResponse {
     fn from(r: WalletDepositRequest) -> Self {
         Self {
             deposit_id: r.id,
-            amount_kobo: r.amount_kobo,
+            amount_naira: r.amount_naira,
             virtual_account_number: r.virtual_account_number,
             virtual_bank_code: r.virtual_bank_code,
             virtual_account_name: r.virtual_account_name,
@@ -105,16 +131,16 @@ pub struct DepositInstructions {
     pub account_name: Option<String>,
     /// The amount the hospital intends to deposit (echoed; informational —
     /// crediting is based on whatever is actually received).
-    pub amount_kobo: i64,
+    pub amount_naira: Naira,
     pub instructions: String,
 }
 
 /// Body for `POST /api/v1/wallet/withdraw`.
 #[derive(Debug, Clone, Deserialize, Validate, ToSchema)]
 pub struct WithdrawRequest {
-    /// Amount in kobo to withdraw (e.g. 10_000 = ₦100). Minimum ₦100.
-    #[validate(range(min = 10_000, message = "Minimum withdrawal is ₦100"))]
-    pub amount_kobo: i64,
+    /// Amount in **naira** to withdraw (e.g. 100 = ₦100). Minimum ₦100.
+    #[validate(custom(function = "min_withdrawal"))]
+    pub amount_naira: Naira,
     /// Destination NUBAN account number (10 digits).
     #[validate(length(min = 10, max = 10, message = "account_number must be 10 digits"))]
     pub account_number: String,
@@ -125,14 +151,24 @@ pub struct WithdrawRequest {
     pub narration: Option<String>,
 }
 
+/// ₦100, the smallest transfer worth the provider's fee.
+fn min_withdrawal(amount: &Naira) -> Result<(), ValidationError> {
+    if amount.kobo() < 10_000 {
+        return Err(
+            ValidationError::new("min_withdrawal").with_message("Minimum withdrawal is ₦100".into())
+        );
+    }
+    Ok(())
+}
+
 /// Response for `POST /api/v1/wallet/withdraw`.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct WithdrawResponse {
     pub withdrawal_id: Uuid,
     /// Net amount sent to the beneficiary account.
-    pub amount_kobo: i64,
-    /// SafeHaven transfer fee charged on top of `amount_kobo` (also debited).
-    pub fee_kobo: i64,
+    pub amount_naira: Naira,
+    /// SafeHaven transfer fee charged on top of `amount_naira` (also debited).
+    pub fee_naira: Naira,
     pub account_number: String,
     /// Resolved account holder name (from name-enquiry).
     pub account_name: String,
@@ -148,7 +184,8 @@ pub struct WithdrawResponse {
 #[derive(Debug, Clone, FromRow, Serialize, ToSchema)]
 pub struct WithdrawalRow {
     pub id: Uuid,
-    pub amount_kobo: i64,
+    #[sqlx(rename = "amount_kobo")]
+    pub amount_naira: Naira,
     pub status: String,
     pub provider_reference: Option<String>,
     pub provider_transaction_id: Option<String>,
@@ -160,10 +197,10 @@ pub struct WithdrawalRow {
 /// Response for `GET /api/v1/wallet`.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct WalletSummary {
-    pub balance_kobo: i64,
-    pub held_kobo: i64,
-    /// Sum of `balance_kobo + held_kobo` — total funds at SafeHaven we're
-    pub total_kobo: i64,
+    pub balance_naira: Naira,
+    pub held_naira: Naira,
+    /// Sum of `balance_naira + held_naira` — total funds at SafeHaven we're
+    pub total_naira: Naira,
     pub safehaven_account_number: Option<String>,
     pub safehaven_bank_code: Option<String>,
     pub safehaven_account_name: Option<String>,
@@ -182,9 +219,9 @@ impl From<&Wallet> for WalletSummary {
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false);
         Self {
-            balance_kobo: w.balance_kobo,
-            held_kobo: w.held_kobo,
-            total_kobo: w.balance_kobo + w.held_kobo,
+            balance_naira: Naira::from_kobo(w.balance_kobo),
+            held_naira: Naira::from_kobo(w.held_kobo),
+            total_naira: Naira::from_kobo(w.balance_kobo + w.held_kobo),
             safehaven_account_number: w.safehaven_account_number.clone(),
             safehaven_bank_code: w.safehaven_bank_code.clone(),
             safehaven_account_name: w.safehaven_account_name.clone(),

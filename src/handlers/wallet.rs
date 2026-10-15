@@ -151,7 +151,7 @@ pub async fn create_deposit(
     let hospital_id = hospital_id_from_claims(&headers)?;
     let instructions = state
         .wallet_service
-        .deposit_instructions(hospital_id, payload.amount_kobo)
+        .deposit_instructions(hospital_id, payload.amount_naira.kobo())
         .await
         .map_err(map_wallet_error)?;
     Ok((StatusCode::OK, Json(instructions)))
@@ -243,7 +243,7 @@ pub async fn withdraw(
         .wallet_service
         .withdraw(
             hospital_id,
-            payload.amount_kobo,
+            payload.amount_naira.kobo(),
             &payload.bank_code,
             &payload.account_number,
             payload.narration.as_deref(),

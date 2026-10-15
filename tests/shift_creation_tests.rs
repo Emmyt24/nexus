@@ -3,8 +3,9 @@ use nexuscare_backend::models::shift::{
     CreateShiftRequest, PayType, RoleCategory, ShiftPriority, ShiftType,
 };
 use nexuscare_backend::repositories::shift::ShiftRepository;
+use nexuscare_backend::utils::money::Naira;
 use nexuscare_backend::services::notification_service::NotificationService;
-use nexuscare_backend::services::shift_service::{ShiftService, ShiftServiceError};
+use nexuscare_backend::services::shift_service::ShiftService;
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -25,9 +26,9 @@ fn create_valid_shift_request() -> CreateShiftRequest {
         scheduled_start: start,
         duration_hours: 8.0,
         pay_type: PayType::HourlyRate,
-        rate_kobo_per_hour: Some(800_000), // ₦8,000/hr
-        fixed_rate_kobo: None,
-        stat_bonus_kobo: None,
+        rate_naira_per_hour: Some(Naira::from_kobo(800_000)), // ₦8,000/hr
+        fixed_rate_naira: None,
+        stat_bonus_naira: None,
         shift_label: Some("Night Shift: Emergency".to_string()),
         job_description: Some("Cover the night shift in the ED.".to_string()),
         tasks: vec!["Triage incoming patients".to_string()],
@@ -65,7 +66,7 @@ mod shift_creation_tests {
         assert_eq!(request.role_title, "Emergency Doctor");
         assert_eq!(request.duration_hours, 8.0);
         assert!(request.broadcast_consent_confirmed);
-        assert!(request.rate_kobo_per_hour.is_some());
+        assert!(request.rate_naira_per_hour.is_some());
     }
 
     /// AC-02: Missing Required Field - Role title empty
@@ -83,10 +84,10 @@ mod shift_creation_tests {
     fn test_missing_hourly_rate() {
         let mut request = create_valid_shift_request();
         request.pay_type = PayType::HourlyRate;
-        request.rate_kobo_per_hour = None;
+        request.rate_naira_per_hour = None;
 
         // This should fail validation
-        assert!(request.rate_kobo_per_hour.is_none());
+        assert!(request.rate_naira_per_hour.is_none());
     }
 
     /// AC-03: STAT Shift Logic - Start time within one hour
@@ -95,11 +96,11 @@ mod shift_creation_tests {
         let mut request = create_valid_shift_request();
         request.priority = ShiftPriority::Stat;
         request.scheduled_start = Utc::now() + Duration::minutes(30);
-        request.stat_bonus_kobo = Some(500_000); // ₦5,000 bonus
+        request.stat_bonus_naira = Some(Naira::from_kobo(500_000)); // ₦5,000 bonus
 
         let time_until_start = request.scheduled_start.signed_duration_since(Utc::now());
         assert!(time_until_start <= Duration::hours(1));
-        assert!(request.stat_bonus_kobo.is_some());
+        assert!(request.stat_bonus_naira.is_some());
     }
 
     /// AC-03: STAT Shift Logic - Start time beyond one hour should fail
@@ -108,7 +109,7 @@ mod shift_creation_tests {
         let mut request = create_valid_shift_request();
         request.priority = ShiftPriority::Stat;
         request.scheduled_start = Utc::now() + Duration::hours(2);
-        request.stat_bonus_kobo = Some(500_000);
+        request.stat_bonus_naira = Some(Naira::from_kobo(500_000));
 
         let time_until_start = request.scheduled_start.signed_duration_since(Utc::now());
         assert!(time_until_start > Duration::hours(1));
@@ -120,11 +121,11 @@ mod shift_creation_tests {
         let mut request = create_valid_shift_request();
         request.priority = ShiftPriority::Stat;
         request.scheduled_start = Utc::now() + Duration::minutes(30);
-        request.stat_bonus_kobo = None;
+        request.stat_bonus_naira = None;
         request.urgency_bonus_pct = None;
 
         // Should fail validation - STAT requires bonus
-        assert!(request.stat_bonus_kobo.is_none() && request.urgency_bonus_pct.is_none());
+        assert!(request.stat_bonus_naira.is_none() && request.urgency_bonus_pct.is_none());
     }
 
     /// AC-04: Virtual Shift Creation - No distance restriction
@@ -153,7 +154,7 @@ mod shift_creation_tests {
         let request = create_valid_shift_request();
 
         let base_amount =
-            request.rate_kobo_per_hour.unwrap() as f64 * request.duration_hours as f64;
+            request.rate_naira_per_hour.unwrap().kobo() as f64 * request.duration_hours as f64;
         let expected_base = 6_400_000; // 800,000 * 8 = ₦64,000
 
         assert_eq!(base_amount as i64, expected_base);
@@ -165,11 +166,11 @@ mod shift_creation_tests {
         let mut request = create_valid_shift_request();
         request.priority = ShiftPriority::Stat;
         request.scheduled_start = Utc::now() + Duration::minutes(30);
-        request.stat_bonus_kobo = Some(500_000); // ₦5,000
+        request.stat_bonus_naira = Some(Naira::from_kobo(500_000)); // ₦5,000
 
         let base_amount =
-            request.rate_kobo_per_hour.unwrap() as f64 * request.duration_hours as f64;
-        let grand_total = base_amount as i64 + request.stat_bonus_kobo.unwrap();
+            request.rate_naira_per_hour.unwrap().kobo() as f64 * request.duration_hours as f64;
+        let grand_total = base_amount as i64 + request.stat_bonus_naira.unwrap().kobo();
         let expected_total = 6_900_000; // ₦64,000 + ₦5,000 = ₦69,000
 
         assert_eq!(grand_total, expected_total);
@@ -206,12 +207,12 @@ mod shift_creation_tests {
     fn test_fixed_rate_pay_type() {
         let mut request = create_valid_shift_request();
         request.pay_type = PayType::FixedRate;
-        request.rate_kobo_per_hour = None;
-        request.fixed_rate_kobo = Some(5_000_000); // ₦50,000 fixed
+        request.rate_naira_per_hour = None;
+        request.fixed_rate_naira = Some(Naira::from_kobo(5_000_000)); // ₦50,000 fixed
 
         assert_eq!(request.pay_type, PayType::FixedRate);
-        assert!(request.fixed_rate_kobo.is_some());
-        assert_eq!(request.fixed_rate_kobo.unwrap(), 5_000_000);
+        assert!(request.fixed_rate_naira.is_some());
+        assert_eq!(request.fixed_rate_naira.unwrap().kobo(), 5_000_000);
     }
 
     /// Test urgent priority with bonus
@@ -266,14 +267,6 @@ mod shift_creation_tests {
         );
     }
 
-    /// Test hospital name is included in shift
-    #[test]
-    fn test_hospital_name_in_shift() {
-        // Verify that shifts include the hospital name
-        let hospital_name = Some("Lagos University Teaching Hospital".to_string());
-        assert!(hospital_name.is_some());
-        assert_eq!(hospital_name.unwrap(), "Lagos University Teaching Hospital");
-    }
 }
 
 #[cfg(test)]

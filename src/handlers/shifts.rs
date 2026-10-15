@@ -14,7 +14,7 @@ use crate::{
         EditRatingRequest, HandoverAppealRequest, HandoverResponse, HandoverRevisionRequest,
         MyApplicationEntry,
         NearbyShiftsResponse, RankedInterestedClinician, RateHospitalRequest, RateWorkerRequest,
-        RatingResponse, Shift, ShiftApplication, ShiftApplicationRequest, ShiftApplicationsQuery,
+        RatingFeed, RatingResponse, Shift, ShiftApplication, ShiftApplicationRequest, ShiftApplicationsQuery,
         ShiftDetailResponse,
         ShiftAssignRequest, ShiftCancelRequest, ShiftListQuery,
         ShiftOfferRequest, ShiftOfferResponse, ShiftRescheduleRequest, SubmitHandoverRequest,
@@ -25,6 +25,7 @@ use crate::{
     utils::{
         errors::{AppError, AppResult},
         extract_claims,
+        money::Naira,
     },
 };
 
@@ -38,9 +39,16 @@ pub struct ShiftPreviewResponse {
     pub priority: String,
     pub scheduled_start: String,
     pub duration_hours: f32,
-    pub base_amount_kobo: i64,
-    pub stat_bonus_kobo: i64,
-    pub grand_total_kobo: i64,
+    pub base_amount_naira: Naira,
+    pub stat_bonus_naira: Naira,
+    /// What the hospital escrows when the shift is created.
+    pub grand_total_naira: Naira,
+    /// Platform fee, deducted from the clinician's pay, not added to the
+    /// hospital's bill. Snapshotted onto the shift at creation, so this is the
+    /// figure that will actually settle (FRS BR-F1-42).
+    pub platform_fee_naira: Naira,
+    /// `grand_total_naira - platform_fee_naira` — what the clinician receives.
+    pub worker_net_naira: Naira,
     pub virtual_link: Option<String>,
     pub estimated_matches: i32,
 }
@@ -77,9 +85,12 @@ impl From<shift_service::ShiftPreview> for ShiftPreviewResponse {
             priority: format!("{:?}", preview.priority),
             scheduled_start: preview.scheduled_start.to_rfc3339(),
             duration_hours: preview.duration_hours,
-            base_amount_kobo: preview.base_amount_kobo,
-            stat_bonus_kobo: preview.stat_bonus_kobo,
-            grand_total_kobo: preview.grand_total_kobo,
+            // The service computes in kobo; naira is the wire unit.
+            base_amount_naira: Naira::from_kobo(preview.base_amount_kobo),
+            stat_bonus_naira: Naira::from_kobo(preview.stat_bonus_kobo),
+            grand_total_naira: Naira::from_kobo(preview.grand_total_kobo),
+            platform_fee_naira: Naira::from_kobo(preview.platform_fee_kobo),
+            worker_net_naira: Naira::from_kobo(preview.worker_net_kobo),
             virtual_link: preview.virtual_link,
             estimated_matches: preview.estimated_matches,
         }
@@ -837,12 +848,10 @@ pub async fn rate_worker(
     Json(payload): Json<RateWorkerRequest>,
 ) -> AppResult<(StatusCode, Json<RatingResponse>)> {
     let claims = extract_claims(&headers)?;
-    let requester_user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| AppError::Unauthorized("Invalid user ID in token".to_string()))?;
 
     let rating = state
         .shift_service
-        .rate_worker(shift_id, requester_user_id, payload)
+        .rate_worker(shift_id, &claims, payload)
         .await
         .map_err(map_shift_error)?;
 
@@ -884,6 +893,88 @@ pub async fn rate_hospital(
         .map_err(map_shift_error)?;
 
     Ok((StatusCode::CREATED, Json(rating)))
+}
+
+
+/// Query for a page of ratings.
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub struct RatingFeedQuery {
+    /// Page size, 1-100. Defaults to 20.
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// GET /api/v1/clinicians/{clinician_id}/ratings
+#[utoipa::path(
+    get,
+    path = "/api/v1/clinicians/{clinician_id}/ratings",
+    params(
+        ("clinician_id" = Uuid, Path, description = "Clinician being rated"),
+        RatingFeedQuery
+    ),
+    responses(
+        (status = 200, description = "Ratings written about this clinician", body = RatingFeed),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Role may not read ratings", body = ErrorResponse),
+        (status = 422, description = "Validation error", body = ErrorResponse)
+    ),
+    tag = "shifts",
+    summary = "List a clinician's ratings",
+    description = "Newest first, with the overall average and total across all ratings — not \
+                   just this page. `rater_name` is null for anonymous ratings, which is the \
+                   default (BR-F1-48). A health worker may only read their own feed; hospitals \
+                   and platform staff may read any clinician's.",
+    security(("bearerAuth" = []))
+)]
+pub async fn list_clinician_ratings(
+    State(state): State<AppState>,
+    Path(clinician_id): Path<Uuid>,
+    headers: HeaderMap,
+    Query(q): Query<RatingFeedQuery>,
+) -> AppResult<Json<RatingFeed>> {
+    let claims = extract_claims(&headers)?;
+    let feed = state
+        .shift_service
+        .list_ratings(&claims, "clinician", clinician_id, q.limit.unwrap_or(20), q.offset.unwrap_or(0))
+        .await
+        .map_err(map_shift_error)?;
+    Ok(Json(feed))
+}
+
+/// GET /api/v1/hospitals/{hospital_id}/ratings
+#[utoipa::path(
+    get,
+    path = "/api/v1/hospitals/{hospital_id}/ratings",
+    params(
+        ("hospital_id" = Uuid, Path, description = "Hospital being rated"),
+        RatingFeedQuery
+    ),
+    responses(
+        (status = 200, description = "Ratings written about this hospital", body = RatingFeed),
+        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
+        (status = 403, description = "Role may not read ratings", body = ErrorResponse),
+        (status = 422, description = "Validation error", body = ErrorResponse)
+    ),
+    tag = "shifts",
+    summary = "List a hospital's ratings",
+    description = "Newest first, with the overall average and total across all ratings. Items \
+                   carry the four sub-scores (staff support, equipment, communication, payment \
+                   timeliness) in `dimensions`. `rater_name` is null for anonymous ratings.",
+    security(("bearerAuth" = []))
+)]
+pub async fn list_hospital_ratings(
+    State(state): State<AppState>,
+    Path(hospital_id): Path<Uuid>,
+    headers: HeaderMap,
+    Query(q): Query<RatingFeedQuery>,
+) -> AppResult<Json<RatingFeed>> {
+    let claims = extract_claims(&headers)?;
+    let feed = state
+        .shift_service
+        .list_ratings(&claims, "hospital", hospital_id, q.limit.unwrap_or(20), q.offset.unwrap_or(0))
+        .await
+        .map_err(map_shift_error)?;
+    Ok(Json(feed))
 }
 
 /// PATCH /api/v1/ratings/{rating_id}
@@ -947,6 +1038,10 @@ pub struct NearbyShiftsQuery {
     pub limit: Option<i64>,
     /// Rows to skip for pagination (default 0).
     pub offset: Option<i64>,
+    /// When true, only return shifts whose every requirement is matched by one
+    /// of your saved qualifications. Off by default: requirements are free text
+    /// with no shared vocabulary, so an exact-fit filter would empty most feeds.
+    pub require_qualification_match: Option<bool>,
 }
 
 /// Normalized nearby-shift request: a validated origin plus paging.
@@ -1005,7 +1100,8 @@ impl NearbyShiftsQuery {
         ("accuracy_meters" = Option<f32>, Query, description = "Optional GPS accuracy in metres"),
         ("radius_km" = Option<f64>, Query, description = "Search radius in km (default 5, max 50)"),
         ("limit" = Option<i64>, Query, description = "Page size (default 50, max 100)"),
-        ("offset" = Option<i64>, Query, description = "Rows to skip (default 0)")
+        ("offset" = Option<i64>, Query, description = "Rows to skip (default 0)"),
+        ("require_qualification_match" = Option<bool>, Query, description = "Only return shifts whose every requirement is covered by one of your saved qualifications. Off by default: requirements are free text with no shared vocabulary, so an exact-fit filter would empty most feeds. A shift with no requirements always matches.")
     ),
     responses(
         (status = 200, description = "Open shifts within the radius, ranked by urgency then distance", body = NearbyShiftsResponse),
@@ -1015,7 +1111,7 @@ impl NearbyShiftsQuery {
     ),
     tag = "shifts",
     summary = "Shifts Near You (worker discovery)",
-    description = "Returns open shifts within `radius_km` of the worker, ranked by urgency (STAT first) then distance. Supply live `lat`/`lng` to refresh the worker's location; otherwise the last-known location is used. Virtual shifts are always included and carry no distance."
+    description = "Returns open shifts within `radius_km` of the worker, ranked by urgency (STAT first) then distance. Supply live `lat`/`lng` to refresh the worker's location; otherwise the last-known location is used. Virtual shifts are always included and carry no distance. Pass `require_qualification_match=true` to hide shifts whose requirements your saved qualifications do not cover — off by default, since requirements are free text and an exact-fit filter would empty most feeds."
 )]
 pub async fn list_nearby_shifts(
     State(state): State<AppState>,
@@ -1030,7 +1126,14 @@ pub async fn list_nearby_shifts(
 
     let result = state
         .shift_service
-        .list_nearby_shifts_for_worker(worker_user_id, origin, radius_km, limit, offset)
+        .list_nearby_shifts_for_worker(
+            worker_user_id,
+            origin,
+            radius_km,
+            limit,
+            offset,
+            query.require_qualification_match.unwrap_or(false),
+        )
         .await
         .map_err(map_shift_error)?;
     Ok(Json(NearbyShiftsResponse {
@@ -1559,6 +1662,7 @@ mod nearby_query_tests {
             radius_km,
             limit,
             offset,
+            require_qualification_match: None,
         }
     }
 

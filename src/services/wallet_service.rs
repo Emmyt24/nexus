@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use chrono::Duration;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -12,6 +11,7 @@ use crate::models::wallet::{
 };
 use crate::repositories::wallet::{WalletRepoError, WalletRepository};
 use crate::services::safehaven::{SafeHavenClient, SafeHavenError, TransferStatus};
+use crate::utils::money::Naira;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WalletServiceError {
@@ -36,7 +36,6 @@ pub struct WalletService {
     safehaven: Arc<SafeHavenClient>,
     pool: PgPool,
     callback_url: String,
-    deposit_validity: Duration,
 }
 
 impl WalletService {
@@ -47,7 +46,6 @@ impl WalletService {
             safehaven,
             pool,
             callback_url,
-            deposit_validity: Duration::hours(24),
         }
     }
 
@@ -221,7 +219,7 @@ impl WalletService {
             bank_name: "Safe Haven MFB".to_string(),
             bank_code: wallet.safehaven_bank_code.clone(),
             account_name: wallet.safehaven_account_name.clone(),
-            amount_kobo,
+            amount_naira: Naira::from_kobo(amount_kobo),
             instructions:
                 "Transfer the amount into the account above to fund your wallet. \
                  Your balance updates automatically once the transfer is received."
@@ -438,8 +436,8 @@ impl WalletService {
 
                 Ok(WithdrawResponse {
                     withdrawal_id,
-                    amount_kobo,
-                    fee_kobo,
+                    amount_naira: Naira::from_kobo(amount_kobo),
+                    fee_naira: Naira::from_kobo(fee_kobo),
                     account_number: account_number.to_string(),
                     account_name: resolved.account_name,
                     bank_code: bank_code.to_string(),
@@ -742,8 +740,8 @@ impl WalletService {
         Ok(ReconcileResult {
             transactions_scanned: scanned,
             deposits_credited: credited,
-            amount_credited_kobo: credited_kobo,
-            balance_kobo,
+            amount_credited_naira: Naira::from_kobo(credited_kobo),
+            balance_naira: Naira::from_kobo(balance_kobo),
         })
     }
 
@@ -904,7 +902,7 @@ impl WalletService {
             .get("amount")
             .and_then(|v| v.as_i64())
             .map(|n| n * 100)
-            .unwrap_or(deposit.amount_kobo);
+            .unwrap_or(deposit.amount_naira.kobo());
 
         let provider_reference = data
             .get("paymentReference")
@@ -1059,10 +1057,10 @@ pub struct ReconcileResult {
     pub transactions_scanned: i64,
     /// Previously-missed deposits credited during this run.
     pub deposits_credited: i64,
-    /// Total kobo credited during this run.
-    pub amount_credited_kobo: i64,
+    /// Total credited during this run.
+    pub amount_credited_naira: Naira,
     /// Wallet balance after reconciling.
-    pub balance_kobo: i64,
+    pub balance_naira: Naira,
 }
 
 #[derive(Debug, Clone)]
@@ -1113,13 +1111,71 @@ fn nested_or_top<'a>(
 }
 
 /// Convert a SafeHaven amount to kobo. SafeHaven sends transfer amounts in
-/// naira (possibly a decimal like `50` or `50.00`), so multiply by 100. Accepts
-/// numeric or string JSON.
+/// naira (possibly a decimal like `50` or `50.00`). Accepts numeric or string
+/// JSON.
+///
+/// The naira-to-kobo step goes through `Naira::from_naira_f64` rather than a
+/// local `* 100`, so this provider payload rounds by the same rule as every
+/// other amount entering the system. Two independent roundings is how the two
+/// sides of a reconciliation end up a kobo apart.
 fn amount_to_kobo(v: &serde_json::Value) -> i64 {
     let naira = match v {
         serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
         serde_json::Value::String(s) => s.trim().parse::<f64>().unwrap_or(0.0),
         _ => 0.0,
     };
-    (naira * 100.0).round() as i64
+    if !naira.is_finite() {
+        return 0;
+    }
+    Naira::from_naira_f64(naira).kobo()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `amount_to_kobo` parses money out of a provider payload, so every branch
+    /// of it is a potential 100x error on a real deposit. SafeHaven has been
+    /// observed sending all of these shapes.
+    #[test]
+    fn a_safehaven_amount_becomes_kobo() {
+        use serde_json::json;
+
+        // Naira in, kobo out — the whole point.
+        assert_eq!(amount_to_kobo(&json!(50)), 5_000);
+        assert_eq!(amount_to_kobo(&json!(50.00)), 5_000);
+        assert_eq!(amount_to_kobo(&json!(100_000)), 10_000_000);
+
+        // Strings, which SafeHaven uses interchangeably with numbers.
+        assert_eq!(amount_to_kobo(&json!("50")), 5_000);
+        assert_eq!(amount_to_kobo(&json!("50.00")), 5_000);
+        assert_eq!(amount_to_kobo(&json!(" 50.50 ")), 5_050);
+
+        // Kobo precision survives a decimal naira amount.
+        assert_eq!(amount_to_kobo(&json!(50.5)), 5_050);
+        assert_eq!(amount_to_kobo(&json!(0.01)), 1);
+
+        // Sub-kobo rounds to the nearest kobo, by the same rule as every other
+        // amount entering the system.
+        assert_eq!(amount_to_kobo(&json!(50.004)), 5_000);
+        assert_eq!(amount_to_kobo(&json!(50.006)), 5_001);
+    }
+
+    /// A malformed amount credits nothing rather than crediting garbage. The
+    /// caller treats 0 as "no amount found" and leaves the deposit pending for
+    /// the reconciler, which is the safe direction to fail in.
+    #[test]
+    fn an_unparseable_amount_is_zero_not_a_panic() {
+        use serde_json::json;
+
+        assert_eq!(amount_to_kobo(&json!(null)), 0);
+        assert_eq!(amount_to_kobo(&json!("")), 0);
+        assert_eq!(amount_to_kobo(&json!("not a number")), 0);
+        assert_eq!(amount_to_kobo(&json!({})), 0);
+        assert_eq!(amount_to_kobo(&json!([])), 0);
+        // A non-finite string parses as f64::INFINITY; the guard catches it
+        // before `as i64` saturates it into a nine-quintillion-kobo deposit.
+        assert_eq!(amount_to_kobo(&json!("inf")), 0);
+        assert_eq!(amount_to_kobo(&json!("NaN")), 0);
+    }
 }

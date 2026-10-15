@@ -138,25 +138,45 @@ async fn worker_completes_pending_prediction_via_mock_ml_client() {
     let patient_repo = Arc::new(PatientRepository::new(pool.clone()));
     let prediction_repo = Arc::new(PatientPredictionRepository::new(pool.clone()));
     let ml_client = Arc::new(MlClient::new(String::new())); // mock mode — no real ml-service needed
-    let (tx, mut rx) = tokio::sync::broadcast::channel::<PipelineEvent>(16);
+    let (tx, _) = tokio::sync::broadcast::channel::<PipelineEvent>(16);
+    let tx = Arc::new(tx);
 
     let service = PatientPredictionService::new(
         pool.clone(),
         patient_repo,
         prediction_repo,
         ml_client,
-        Arc::new(tx),
+        tx.clone(),
     );
+
+    // Drain whatever backlog other suites left in this shared database before
+    // creating the row under test.
+    //
+    // `fetch_pending` is `ORDER BY created_at ASC LIMIT batch_size`, so a batch
+    // takes the OLDEST pending rows. This test's row is always the newest, so
+    // once ten or more older rows had accumulated, one batch of ten never
+    // reached it and the `completed` assertion below failed on `pending`. That
+    // is not flakiness — it is deterministic once the database is busy enough,
+    // which is precisely when the whole suite runs against one database.
+    while service
+        .process_pending_batch(100, 3)
+        .await
+        .expect("draining the pending backlog failed")
+        > 0
+    {}
+
+    // Subscribe only now, so the drain's events are not in the channel the
+    // assertions below scan.
+    let mut rx = tx.subscribe();
 
     let (patient, prediction) = service
         .ingest_patient(hospital_id, user_id, sample_patient_request())
         .await
         .expect("ingest_patient failed");
 
-    // >=1 rather than ==1: other tests in this file share the same database
-    // and may leave their own pending rows for this batch to pick up too.
-    // The assertions below confirm THIS test's prediction specifically
-    // completed, which is what actually matters.
+    // >=1 rather than ==1: the sibling test shares this database and may land
+    // its own pending row in this batch. The assertions below confirm THIS
+    // test's prediction completed, which is what actually matters.
     let processed = service
         .process_pending_batch(10, 3)
         .await

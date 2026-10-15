@@ -69,7 +69,7 @@ impl LocationService {
         };
 
         // Step 2: Validate coordinates (already done in geocoding_client, but double-check)
-        self.validate_coordinates(&coordinates)?;
+        Self::validate_coordinates(&coordinates)?;
 
         // Step 3: Calculate 5km service radius (as per AC-02)
         let service_radius_km = 5.0;
@@ -95,8 +95,9 @@ impl LocationService {
     }
 
     /// Calculate service area based on coordinates and radius
+    /// Pure: takes no `&self`, so it needs no pool, no geocoding client and no
+    /// runtime to test.
     pub fn calculate_service_radius(
-        &self,
         coordinates: Coordinates,
         radius_km: f64,
     ) -> Result<ServiceArea, LocationServiceError> {
@@ -114,7 +115,8 @@ impl LocationService {
     }
 
     /// Validate coordinates are within valid ranges
-    fn validate_coordinates(&self, coords: &Coordinates) -> Result<(), LocationServiceError> {
+    /// Pure, as above.
+    fn validate_coordinates(coords: &Coordinates) -> Result<(), LocationServiceError> {
         if coords.latitude < -90.0 || coords.latitude > 90.0 {
             return Err(LocationServiceError::GeocodingFailed(
                 GeocodingError::InvalidCoordinates(format!(
@@ -148,64 +150,92 @@ pub struct ServiceArea {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_validate_coordinates() {
-        let geocoding_client = Arc::new(GeocodingClient::new(None));
-        let location_repo = Arc::new(LocationRepository::new(
-            sqlx::PgPool::connect("postgresql://localhost/test")
-                .await
-                .unwrap(),
-        ));
-        let service = LocationService::new(geocoding_client, location_repo);
+    // These two tests used to build a whole `LocationService` — which meant
+    // `PgPool::connect("postgresql://localhost/test").unwrap()` — in order to
+    // exercise two functions that never touch the database. That made them fail
+    // (or hang, depending on what is listening on 5432) on any machine without
+    // that exact database, which is every machine, so `cargo test --lib` could
+    // not come back green. The functions are pure; the pool was never the
+    // subject. Now they call the functions directly.
 
-        // Valid coordinates
+    #[test]
+    fn coordinates_outside_the_valid_ranges_are_rejected() {
         let valid = Coordinates {
             latitude: 6.5244,
             longitude: 3.3792,
         };
-        assert!(service.validate_coordinates(&valid).is_ok());
+        assert!(LocationService::validate_coordinates(&valid).is_ok());
 
-        // Invalid latitude
-        let invalid_lat = Coordinates {
-            latitude: 91.0,
-            longitude: 3.3792,
-        };
-        assert!(service.validate_coordinates(&invalid_lat).is_err());
+        // Latitude is bounded at ±90, longitude at ±180. Swapping the two is
+        // the classic coordinate bug, and a latitude of 181 is how it surfaces.
+        for bad in [
+            Coordinates { latitude: 91.0, longitude: 3.3792 },
+            Coordinates { latitude: -91.0, longitude: 3.3792 },
+            Coordinates { latitude: 6.5244, longitude: 181.0 },
+            Coordinates { latitude: 6.5244, longitude: -181.0 },
+        ] {
+            assert!(
+                LocationService::validate_coordinates(&bad).is_err(),
+                "{bad:?} is out of range and must be rejected"
+            );
+        }
 
-        // Invalid longitude
-        let invalid_lon = Coordinates {
-            latitude: 6.5244,
-            longitude: 181.0,
-        };
-        assert!(service.validate_coordinates(&invalid_lon).is_err());
+        // The bounds are inclusive, so the poles and the antimeridian are valid.
+        for edge in [
+            Coordinates { latitude: 90.0, longitude: 180.0 },
+            Coordinates { latitude: -90.0, longitude: -180.0 },
+        ] {
+            assert!(
+                LocationService::validate_coordinates(&edge).is_ok(),
+                "{edge:?} is on the boundary and must be accepted"
+            );
+        }
     }
 
-    #[tokio::test]
-    async fn test_calculate_service_radius() {
-        let geocoding_client = Arc::new(GeocodingClient::new(None));
-        let location_repo = Arc::new(LocationRepository::new(
-            sqlx::PgPool::connect("postgresql://localhost/test")
-                .await
-                .unwrap(),
-        ));
-        let service = LocationService::new(geocoding_client, location_repo);
+    proptest::proptest! {
+        /// The honest form of a property test that used to live in
+        /// `repositories::location` as `if P { prop_assert!(P) }` — it restated
+        /// its own precondition, so it could not fail, and it named itself
+        /// after coordinate validation while never calling any. This sweeps
+        /// past both bounds and holds the real function to the exact range.
+        #[test]
+        fn validation_accepts_exactly_the_valid_range(
+            latitude in -200.0f64..200.0,
+            longitude in -200.0f64..200.0,
+        ) {
+            let in_range = (-90.0..=90.0).contains(&latitude)
+                && (-180.0..=180.0).contains(&longitude);
+            let coords = Coordinates { latitude, longitude };
 
+            proptest::prop_assert_eq!(
+                LocationService::validate_coordinates(&coords).is_ok(),
+                in_range,
+                "({}, {}) should be {}",
+                latitude,
+                longitude,
+                if in_range { "accepted" } else { "rejected" }
+            );
+        }
+    }
+
+    #[test]
+    fn a_service_radius_must_be_within_one_hundred_km() {
         let coords = Coordinates {
             latitude: 6.5244,
             longitude: 3.3792,
         };
 
-        // Valid radius
-        let result = service.calculate_service_radius(coords.clone(), 5.0);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().radius_km, 5.0);
+        let area = LocationService::calculate_service_radius(coords.clone(), 5.0)
+            .expect("5km is a valid radius");
+        assert_eq!(area.radius_km, 5.0);
+        assert_eq!(area.center.latitude, coords.latitude);
+        assert_eq!(area.center.longitude, coords.longitude);
 
-        // Invalid radius (too small)
-        assert!(service
-            .calculate_service_radius(coords.clone(), 0.0)
-            .is_err());
-
-        // Invalid radius (too large)
-        assert!(service.calculate_service_radius(coords, 101.0).is_err());
+        // Zero is rejected rather than treated as "no limit", and 100 is the
+        // inclusive upper bound.
+        assert!(LocationService::calculate_service_radius(coords.clone(), 0.0).is_err());
+        assert!(LocationService::calculate_service_radius(coords.clone(), -1.0).is_err());
+        assert!(LocationService::calculate_service_radius(coords.clone(), 100.0).is_ok());
+        assert!(LocationService::calculate_service_radius(coords, 101.0).is_err());
     }
 }

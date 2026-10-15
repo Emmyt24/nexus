@@ -42,7 +42,7 @@ pub enum ActorType {
 // Enums
 
 /// The specific type of legal document being uploaded (Step 2 — Legal Verification).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, ToSchema)]
 #[sqlx(type_name = "document_type", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum DocumentType {
@@ -60,7 +60,7 @@ pub enum DocumentType {
 }
 
 /// The issuing authority for a legal document.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, ToSchema)]
 #[sqlx(type_name = "issuing_authority", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum IssuingAuthority {
@@ -73,7 +73,7 @@ pub enum IssuingAuthority {
 }
 
 /// Submission state of the legal verification step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, ToSchema)]
 #[sqlx(type_name = "submission_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum SubmissionStatus {
@@ -122,7 +122,7 @@ pub struct HospitalDocument {
 // Request / response types
 
 /// Payload for uploading a single legal document (Step 2).
-#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[derive(Debug, Clone, Serialize, Deserialize, Validate, ToSchema)]
 pub struct UploadDocumentRequest {
     pub document_type: DocumentType,
 
@@ -150,8 +150,22 @@ pub struct SubmitLegalStepRequest {
     pub submit: bool,
 }
 
+/// Compliance decision on a single document, written by platform staff.
+///
+/// `submission_status` is restricted to the two review outcomes plus
+/// `under_review`: a reviewer cannot push a document back to `draft`, which is
+/// the hospital's own state and would silently discard the review trail.
+#[derive(Debug, Clone, Serialize, Deserialize, Validate, ToSchema)]
+pub struct ReviewDocumentRequest {
+    pub submission_status: SubmissionStatus,
+    /// Required when rejecting — a rejection with no reason is unactionable for
+    /// the hospital, which has to re-upload something.
+    #[validate(length(max = 2000))]
+    pub review_notes: Option<String>,
+}
+
 /// Response returned after a document upload or update.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HospitalDocumentResponse {
     pub id: Uuid,
     pub hospital_id: Uuid,

@@ -256,26 +256,3 @@ impl HospitalRepository {
         Ok(count)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Unit tests will be added here
-}
-
-// Note: Full integration tests with database will be in Task 10.5
-#[cfg(test)]
-mod property_tests {
-    use super::*;
-    use proptest::prelude::*;
-
-    // Property 3: Unique hospital identifiers
-
-    #[test]
-    fn test_duplicate_email_detection() {
-        // This will be tested in integration tests with actual database
-    }
-
-    // Property 4: Registration data persistence round-trip
-}

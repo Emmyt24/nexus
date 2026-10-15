@@ -105,10 +105,3 @@ impl AuditRepository {
         Ok(entries)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Unit tests will be added here
-}
