@@ -2067,6 +2067,41 @@
         }
       }
     },
+    "/api/v1/clinicians/{clinician_id}/identity": {
+      "get": {
+        "tags": [
+          "identity"
+        ],
+        "summary": "Get clinician verified identity details",
+        "description": "An unverified clinician is a 200 with `verified: false`, not a 404. The name fields are omitted entirely rather than sent as null when unverified, so read `verified` first. Names come from the BVN/NIN record, title-cased. Takes no Authorization header.",
+        "operationId": "clinician_get_identity",
+        "parameters": [
+          {
+            "name": "clinician_id",
+            "in": "path",
+            "description": "Clinician unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Clinician identity status and names",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetIdentityResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
     "/api/v1/clinicians/{clinician_id}/identity/initiate": {
       "post": {
         "tags": [
@@ -2560,6 +2595,69 @@
         }
       }
     },
+    "/api/v1/consult/handoff/redeem": {
+      "post": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Redeem a \"Continue on phone\" code for a join token",
+        "description": "Takes no Authorization header: the single-use code stands in for one. Read it from the URL fragment and POST it here. Unknown, expired and spent codes all fail identically, so nothing can be probed. The response is the same shape as POST /consult/token, so the client reuses its generated types.",
+        "operationId": "redeem_handoff",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RedeemHandoffRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Join token minted for the companion device",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JoinConsultResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Unknown, expired or already-redeemed code",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The consultation has ended, or the shift left its window",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
     "/api/v1/consultation-notes/{id}": {
       "get": {
         "tags": [
@@ -2600,6 +2698,7 @@
           "consultation-notes"
         ],
         "summary": "Save the clinician's structured note fields",
+        "description": "Patches in place while the note's edit window is open. Once it closes, start a new note carrying `amends_note_id` — a locked clinical record is never rewritten.",
         "operationId": "update_note",
         "parameters": [
           {
@@ -2633,6 +2732,12 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Not your hospital's note, or not its author"
+          },
+          "409": {
+            "description": "The edit window has closed"
           }
         }
       }
@@ -3037,6 +3142,45 @@
         }
       }
     },
+    "/api/v1/hospitals/create": {
+      "post": {
+        "tags": [
+          "hospitals"
+        ],
+        "summary": "Create a hospital (legacy)",
+        "description": "Legacy endpoint kept for backward compatibility. New integrations should use POST /api/v1/hospitals/register, which also provisions the admin user and drives the OTP flow. Takes no Authorization header. The new hospital starts at verification_status `pending` and registration_step `profile_setup`; advance it with PATCH /api/v1/hospitals/{id}/advance-step.",
+        "operationId": "create_hospital",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateHospitalRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Hospital created, awaiting verification",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HospitalResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A hospital with this registration number or email already exists"
+          },
+          "422": {
+            "description": "Validation error"
+          }
+        },
+        "security": []
+      }
+    },
     "/api/v1/hospitals/register": {
       "post": {
         "tags": [
@@ -3378,6 +3522,41 @@
         ]
       }
     },
+    "/api/v1/hospitals/{hospital_id}/identity": {
+      "get": {
+        "tags": [
+          "identity"
+        ],
+        "summary": "Get hospital admin verified identity details",
+        "description": "An unverified hospital is a 200 with `verified: false`, not a 404 — absence of a verification is an ordinary state. The name fields are omitted entirely rather than sent as null when unverified, so read `verified` first. Takes no Authorization header.",
+        "operationId": "hospital_get_identity",
+        "parameters": [
+          {
+            "name": "hospital_id",
+            "in": "path",
+            "description": "Hospital unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Hospital identity status and names",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetIdentityResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
     "/api/v1/hospitals/{hospital_id}/identity/initiate": {
       "post": {
         "tags": [
@@ -3641,6 +3820,47 @@
             "description": "Hospital not found"
           }
         }
+      }
+    },
+    "/api/v1/hospitals/{id}/advance-step": {
+      "patch": {
+        "tags": [
+          "hospitals"
+        ],
+        "summary": "Advance a hospital to its next registration step (legacy)",
+        "description": "Moves registration_step one place along profile_setup -> credentials -> verification -> access_granted. The next step is derived server-side, so the step cannot be chosen or skipped; calling this on a hospital already at access_granted is a 409. Legacy endpoint, kept for backward compatibility and taking no Authorization header.",
+        "operationId": "advance_registration_step",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Hospital unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Advanced to the next registration step",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HospitalResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Hospital not found"
+          },
+          "409": {
+            "description": "Registration is already complete"
+          }
+        },
+        "security": []
       }
     },
     "/api/v1/hospitals/{id}/location": {
@@ -4327,6 +4547,7 @@
           "consultation-notes"
         ],
         "summary": "Start a new voice-recorded consultation note for a patient",
+        "description": "Send `{}` (or no body) for an ad-hoc note. Send `shift_id` to attach it to a shift, which requires being that shift's assigned clinician and makes the note appear in the hospital's per-shift roll-up.",
         "operationId": "start_note",
         "parameters": [
           {
@@ -4340,6 +4561,22 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/StartConsultationNoteRequest"
+                  }
+                ]
+              }
+            }
+          }
+        },
         "responses": {
           "201": {
             "description": "Consultation note started",
@@ -4350,6 +4587,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Not this patient's hospital, or not the shift's assigned clinician"
           }
         }
       }
@@ -5765,6 +6005,90 @@
         }
       }
     },
+    "/api/v1/shifts/{shift_id}/consult/handoff": {
+      "post": {
+        "tags": [
+          "video"
+        ],
+        "summary": "Continue this consultation on another device",
+        "description": "Returns a single-use code and the URL to open on the second device. The code lives for 3 minutes, is good for one redemption, and carries the code in the URL *fragment* so it never reaches a server log — render it as a QR code. Both devices stay in the call; the phone joins as a companion identity and does not re-trigger clock-in.",
+        "operationId": "create_handoff",
+        "parameters": [
+          {
+            "name": "shift_id",
+            "in": "path",
+            "description": "Shift unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateHandoffRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Handoff code minted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateHandoffResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not a party to this consultation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Shift or session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The consultation has ended, or the shift is outside its window",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/shifts/{shift_id}/consult/leave": {
       "post": {
         "tags": [
@@ -5818,6 +6142,404 @@
           },
           "404": {
             "description": "Shift or session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/shifts/{shift_id}/consult/queue": {
+      "get": {
+        "tags": [
+          "patient-records"
+        ],
+        "summary": "Read the consultation's waiting room",
+        "description": "Counts are always present. `patients` is populated for the assigned clinician and admins of the owning hospital, and empty for platform admins, who get no patient identities.",
+        "operationId": "get_waiting_room",
+        "parameters": [
+          {
+            "name": "shift_id",
+            "in": "path",
+            "description": "Shift unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The waiting room",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsultWaitingRoomView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not a party to this shift",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Shift not found, or no consultation started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "patient-records"
+        ],
+        "summary": "Add a patient to the consultation's waiting room",
+        "description": "Send `patient_id` to queue someone already on file, or `patient` to intake a new one and queue them in the same transaction — the ML triage prediction is queued either way. Returns the whole waiting room so the caller needs no follow-up read.",
+        "operationId": "add_patient_to_queue",
+        "parameters": [
+          {
+            "name": "shift_id",
+            "in": "path",
+            "description": "Shift unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddPatientToQueueRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Patient queued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsultWaitingRoomView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not an admin of this shift's hospital",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Shift or patient not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already queued, or the consultation has ended",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/shifts/{shift_id}/consult/queue/{entry_id}": {
+      "delete": {
+        "tags": [
+          "patient-records"
+        ],
+        "summary": "Withdraw a patient from the waiting room",
+        "description": "Marks the entry `removed` rather than deleting it, so the queue stays auditable.",
+        "operationId": "remove_from_queue",
+        "parameters": [
+          {
+            "name": "shift_id",
+            "in": "path",
+            "description": "Shift unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "entry_id",
+            "in": "path",
+            "description": "Queue entry unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Patient withdrawn from the queue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsultWaitingRoomView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not an admin of this shift's hospital",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Queue entry not found on this shift",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/shifts/{shift_id}/consult/queue/{entry_id}/call": {
+      "post": {
+        "tags": [
+          "patient-records"
+        ],
+        "summary": "Call the next patient in",
+        "description": "Moves the entry `waiting` -> `in_consult`. At most one patient per session can be in consultation, enforced in the database — a second call returns 409 rather than queue-jumping.",
+        "operationId": "call_patient",
+        "parameters": [
+          {
+            "name": "shift_id",
+            "in": "path",
+            "description": "Shift unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "entry_id",
+            "in": "path",
+            "description": "Queue entry unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Patient called in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsultWaitingRoomView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not the clinician assigned to this shift",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Queue entry not found on this shift",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Another patient is already in consultation, or the entry is not waiting",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/shifts/{shift_id}/consult/queue/{entry_id}/seen": {
+      "post": {
+        "tags": [
+          "patient-records"
+        ],
+        "summary": "Mark the current patient seen",
+        "description": "Moves the entry `in_consult` -> `seen` and frees the in-consultation slot.",
+        "operationId": "mark_patient_seen",
+        "parameters": [
+          {
+            "name": "shift_id",
+            "in": "path",
+            "description": "Shift unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "entry_id",
+            "in": "path",
+            "description": "Queue entry unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Patient released",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsultWaitingRoomView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not the clinician assigned to this shift",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Queue entry not found on this shift",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The entry is not in consultation",
             "content": {
               "application/json": {
                 "schema": {
@@ -6713,6 +7435,323 @@
           },
           "409": {
             "description": "Clinician did not express interest, shift not open, already offered, or worker already declined this shift",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/shifts/{shift_id}/patient-records": {
+      "get": {
+        "tags": [
+          "patient-records"
+        ],
+        "summary": "The hospital's read of everything a shift produced",
+        "description": "Per patient: the clinician's consultation notes and the on-site party's handover note. Available during the shift and permanently after it completes — `shift_status` tells a live shift from a final record. Platform admins receive counts only, with `metadata_only: true` and an empty `patients`.",
+        "operationId": "shift_patient_records",
+        "parameters": [
+          {
+            "name": "shift_id",
+            "in": "path",
+            "description": "Shift unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every patient the shift produced a record for",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShiftPatientRecordsView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not a party to this shift",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Shift not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/shifts/{shift_id}/patients/{patient_id}/consultation-notes": {
+      "get": {
+        "tags": [
+          "patient-records"
+        ],
+        "summary": "List a patient's consultation notes for one shift",
+        "description": "Readable by the shift's assigned clinician and by admins of the owning hospital, during the shift and permanently after it completes. Writes go through POST /api/v1/patients/{patient_id}/consultation-notes.",
+        "operationId": "list_shift_patient_notes",
+        "parameters": [
+          {
+            "name": "shift_id",
+            "in": "path",
+            "description": "Shift unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "patient_id",
+            "in": "path",
+            "description": "Patient unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "This patient's notes for this shift",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ConsultationNote"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not a party to this shift",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Shift or patient not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/shifts/{shift_id}/patients/{patient_id}/handover-note": {
+      "get": {
+        "tags": [
+          "patient-records"
+        ],
+        "summary": "Read one patient's handover note",
+        "description": "Readable by the shift's assigned clinician and by admins of the owning hospital, during the shift and permanently after it completes. 404 means no note has been filed for this patient yet, which is an ordinary state rather than an error — the on-site party may simply not have written it.",
+        "operationId": "get_handover_note",
+        "parameters": [
+          {
+            "name": "shift_id",
+            "in": "path",
+            "description": "Shift unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "patient_id",
+            "in": "path",
+            "description": "Patient unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The handover note",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PatientHandoverNoteView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not a party to this shift",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No handover note filed for this patient",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "patient-records"
+        ],
+        "summary": "File the on-site party's handover note for one patient",
+        "description": "Written by whoever is on site for this patient: an admin of the shift's hospital, or the shift's assigned clinician — who is the on-site party on an in-person shift. Any other health worker is refused. Authorship is taken from the token, never the body. Idempotent — one note per (shift, patient); resubmitting inside the one-hour edit window updates it rather than inserting a second. `escalation_reason` is required when `escalation_required` is true.",
+        "operationId": "submit_handover_note",
+        "parameters": [
+          {
+            "name": "shift_id",
+            "in": "path",
+            "description": "Shift unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "patient_id",
+            "in": "path",
+            "description": "Patient unique identifier",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitPatientHandoverNoteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Handover note filed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PatientHandoverNoteView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not a party on site for this shift",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Shift or patient not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The edit window has closed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation error",
             "content": {
               "application/json": {
                 "schema": {
@@ -8267,6 +9306,31 @@
           }
         }
       },
+      "AddPatientToQueueRequest": {
+        "type": "object",
+        "description": "`POST /api/v1/shifts/{shift_id}/consult/queue`.\n\nSupply **exactly one** of `patient_id` (an existing patient of this\nhospital) or `patient` (intake details for someone not yet on file).\nNeither or both is a validation error. Creating a patient through\n`patient` also runs the ML triage pipeline, identically to standalone\nintake.\n\nExactly one of `patient_id` (queue someone already on file) or `patient`\n(intake a new one and queue them in the same transaction) must be set. That\nis a conditional rule, so it is enforced in the service rather than by\n`validator`, matching how `ShiftService::validate_request` handles the\n`pay_type`-dependent compensation fields.",
+        "properties": {
+          "patient": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NewPatientRequest",
+                "description": "Intake details for a patient who is not on file yet. Creating them here\nalso runs the ML triage pipeline, exactly as the standalone intake does."
+              }
+            ]
+          },
+          "patient_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "An existing patient of this hospital. Supply this **or** `patient`,\nnever both and never neither."
+          }
+        }
+      },
       "Address": {
         "type": "object",
         "description": "Address structure for hospital registration",
@@ -9072,7 +10136,8 @@
           "identity",
           "participant_role",
           "connected",
-          "is_publisher"
+          "is_publisher",
+          "device_ordinal"
         ],
         "properties": {
           "clocked_in_at": {
@@ -9084,6 +10149,18 @@
           },
           "connected": {
             "type": "boolean"
+          },
+          "device_label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Whatever the user called the device when handing off, e.g. \"iPhone\".\n`null` when they gave no label."
+          },
+          "device_ordinal": {
+            "type": "integer",
+            "format": "int32",
+            "description": "`1` for the primary device, `2`+ for a companion device. Two entries\nwhose `identity` shares a `u:<uuid>` prefix are one person on two\ndevices — group on it if you render a person list, not a device list."
           },
           "display_name": {
             "type": [
@@ -9116,6 +10193,98 @@
           }
         }
       },
+      "ConsultQueuePatientView": {
+        "type": "object",
+        "description": "One patient in the waiting room. Carries no clinical detail beyond triage —\nthe notes themselves are fetched per patient.",
+        "required": [
+          "entry_id",
+          "patient_id",
+          "full_name",
+          "age",
+          "gender",
+          "severity_level",
+          "state",
+          "position",
+          "queued_at",
+          "has_clinical_note",
+          "has_handover_note"
+        ],
+        "properties": {
+          "age": {
+            "type": "number",
+            "format": "float",
+            "description": "Years, as a float — the ML triage model's input type."
+          },
+          "called_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the clinician called this patient in; `null` while `waiting`."
+          },
+          "entry_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The queue entry's own id. Use this — not `patient_id` — on the\n`/call`, `/seen` and `DELETE` routes."
+          },
+          "full_name": {
+            "type": "string",
+            "description": "The patient's full name. Absent for platform admins, who never receive\nthis list at all."
+          },
+          "gender": {
+            "type": "string",
+            "description": "As recorded at intake."
+          },
+          "has_clinical_note": {
+            "type": "boolean",
+            "description": "Whether the doctor has filed a clinical note, so the list needs no\nper-patient follow-up request."
+          },
+          "has_handover_note": {
+            "type": "boolean",
+            "description": "Whether the hospital-side party has filed a handover note."
+          },
+          "patient_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The patient this entry refers to."
+          },
+          "position": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Queue order, ascending. Not unique and not renumbered on removal, so\nsort by it rather than treating it as an index."
+          },
+          "predictive_risk_score": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "From the ML triage pipeline; `null` until the prediction completes."
+          },
+          "queued_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the patient was added to the waiting room."
+          },
+          "seen_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the consultation finished; `null` until `seen`."
+          },
+          "severity_level": {
+            "type": "string",
+            "description": "Triage severity recorded at intake."
+          },
+          "state": {
+            "$ref": "#/components/schemas/QueueEntryState",
+            "description": "`waiting` -> `in_consult` -> `seen`, or `removed`."
+          }
+        }
+      },
       "ConsultRecordingView": {
         "type": "object",
         "description": "Recording state. Always `{ \"enabled\": false, \"status\": null }` in this\nrelease; it ships now so the recording indicator has a stable shape.",
@@ -9144,6 +10313,7 @@
           "live",
           "clock_in_recorded",
           "participants",
+          "waiting_room",
           "recording"
         ],
         "properties": {
@@ -9199,6 +10369,10 @@
           },
           "status": {
             "$ref": "#/components/schemas/VideoSessionStatus"
+          },
+          "waiting_room": {
+            "$ref": "#/components/schemas/ConsultWaitingRoomView",
+            "description": "Patients queued for this session. Counts are always present; `patients`\nis empty for platform admins, who get no patient identities."
           }
         }
       },
@@ -9243,6 +10417,46 @@
           }
         }
       },
+      "ConsultWaitingRoomView": {
+        "type": "object",
+        "description": "The waiting-room block on `GET /consult` and `GET /consult/queue`.\n\n`patients` is empty for platform admins, who get the counts but never\npatient identities — the same NDPR line `authorize_shift_access` already\ndraws for the video stream.",
+        "required": [
+          "waiting",
+          "in_consult",
+          "seen",
+          "total",
+          "patients"
+        ],
+        "properties": {
+          "in_consult": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Patients currently with the doctor. At most `1` per session."
+          },
+          "patients": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConsultQueuePatientView"
+            },
+            "description": "Empty for platform admins. Render counts from the fields above, never\nfrom this array's length."
+          },
+          "seen": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Patients whose consultation has finished."
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Everything ever queued for this session, `removed` included. The three\nlive counts above do not sum to it."
+          },
+          "waiting": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Patients queued and not yet called. This is the waiting-room badge."
+          }
+        }
+      },
       "ConsultationNote": {
         "type": "object",
         "description": "Voice-recorded consultation note — maps to `consultation_notes`. The\nstructured fields (chief_complaint..plan) are filled in by the clinician\nby hand, referencing `full_transcript` — there is no LLM summarization\nstep in this phase.",
@@ -9255,10 +10469,20 @@
           "full_transcript",
           "language",
           "duration_seconds",
+          "vitals",
+          "medications",
           "created_at",
           "updated_at"
         ],
         "properties": {
+          "amends_note_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Set when this note amends an earlier, locked one. The original is never\nrewritten."
+          },
           "assessment": {
             "type": [
               "string",
@@ -9282,9 +10506,32 @@
             "type": "string",
             "format": "date-time"
           },
+          "diagnosis": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The doctor's diagnosis, alongside the existing SOAP fields."
+          },
           "duration_seconds": {
             "type": "integer",
             "format": "int32"
+          },
+          "editable_until": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Past this, the note is locked and an amendment needs a new row. `None`\nmeans *not governed by a window*, which is treated as **closed** — see\n`ConsultationNoteRepository::update_fields`."
+          },
+          "follow_up_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the patient should be seen again; `null` if no follow-up is due."
           },
           "full_transcript": {
             "type": "string"
@@ -9306,6 +10553,9 @@
           "language": {
             "type": "string"
           },
+          "medications": {
+            "description": "JSON array of what was prescribed. Defaults to `[]`."
+          },
           "patient_id": {
             "type": "string",
             "format": "uuid"
@@ -9320,12 +10570,31 @@
             "type": "string",
             "format": "uuid"
           },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The consultation the note was written in. `ON DELETE SET NULL`: the\nclinical record outlives the video session."
+          },
+          "shift_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The shift this note was written during. `None` for an ad-hoc note, and\nfor every note written before `20240063` — those are simply absent from\nthe per-shift roll-up."
+          },
           "status": {
             "type": "string"
           },
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "vitals": {
+            "description": "Free-form, e.g. `{\"bp\":\"120/80\",\"temp_c\":37.1}` — deliberately unshaped\nso a note is never blocked on a vitals schema the ML model owns."
           }
         }
       },
@@ -9489,6 +10758,83 @@
           "amount_naira": {
             "$ref": "#/components/schemas/Naira",
             "description": "Amount in **naira** (e.g. 100000 = ₦100,000). Minimum ₦1,000.\n\nValidated by a custom function rather than `range`: the stored value is\nkobo, so a `range` bound here would be read as a naira bound by anyone\nediting it and as a kobo bound by `validator`. Comparing kobo to kobo\nleaves nothing to misread."
+          }
+        }
+      },
+      "CreateHandoffRequest": {
+        "type": "object",
+        "description": "`POST /api/v1/shifts/{shift_id}/consult/handoff` — every field optional.",
+        "properties": {
+          "device_label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Free text shown beside the device in the participant list, e.g. \"iPhone\"."
+          }
+        }
+      },
+      "CreateHandoffResponse": {
+        "type": "object",
+        "description": "`200` from `POST /consult/handoff`.\n\n`handoff_url` carries the code in the URL **fragment**, which browsers never\nsend to the server — so the credential stays out of access logs, out of any\n`Referer`, and out of the proxy chain. Show it as a QR code or hand it to\nthe user's own device; it is single-use and short-lived.",
+        "required": [
+          "session_id",
+          "handoff_url",
+          "code",
+          "device_ordinal",
+          "expires_at"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The plaintext code, returned exactly once. Only its hash is stored."
+          },
+          "device_ordinal": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The slot the companion device will occupy: `2` for the first phone,\n`3` for the next. Slot `1` is always the primary device."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "180 seconds out. After this the code is dead and a new one is needed."
+          },
+          "handoff_url": {
+            "type": "string",
+            "description": "Open this on the second device. The code sits in the `#c=` fragment."
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The consultation the companion device will join."
+          }
+        }
+      },
+      "CreateHospitalRequest": {
+        "type": "object",
+        "description": "Payload for Step 1 (Setup) of hospital registration.",
+        "required": [
+          "name",
+          "registration_number",
+          "email",
+          "address",
+          "phone_number"
+        ],
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "phone_number": {
+            "type": "string"
+          },
+          "registration_number": {
+            "type": "string"
           }
         }
       },
@@ -10499,6 +11845,44 @@
           }
         }
       },
+      "GetIdentityResponse": {
+        "type": "object",
+        "required": [
+          "verified"
+        ],
+        "properties": {
+          "first_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "full_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The name as held on the identity record, title-cased."
+          },
+          "identity_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`\"BVN\"` or `\"NIN\"` — which record was verified."
+          },
+          "last_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verified": {
+            "type": "boolean",
+            "description": "Whether a verified BVN/NIN record exists. When `false`, every field\nbelow is omitted from the JSON rather than sent as null."
+          }
+        }
+      },
       "HandoverAppealRequest": {
         "type": "object",
         "description": "Body for `POST /api/v1/shifts/{shift_id}/handover/appeal`.",
@@ -11267,6 +12651,105 @@
           }
         }
       },
+      "HospitalResponse": {
+        "type": "object",
+        "description": "Response shape returned to clients.",
+        "required": [
+          "id",
+          "name",
+          "registration_number",
+          "email",
+          "address",
+          "phone_number",
+          "verification_status",
+          "registration_step",
+          "setup_progress_percent",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "admin_registration_status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RegistrationStatus"
+              }
+            ]
+          },
+          "approved_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "approved_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "email": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "legal_submitted_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "logo_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "phone_number": {
+            "type": "string"
+          },
+          "registration_number": {
+            "type": "string"
+          },
+          "registration_step": {
+            "$ref": "#/components/schemas/RegistrationStep"
+          },
+          "rejection_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_progress_percent": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "verification_status": {
+            "$ref": "#/components/schemas/VerificationStatus"
+          }
+        }
+      },
       "HospitalSearchHit": {
         "type": "object",
         "description": "One match. `kind` is redundant with the bucket it arrives in, and is included\nanyway so a client that flattens the buckets for a combined list does not\nhave to track provenance.",
@@ -11638,7 +13121,7 @@
       },
       "JoinMode": {
         "type": "string",
-        "description": "How the caller wants to join. `Observer` is hospital-admin only; a worker\nasking for it gets a 403.",
+        "description": "How the caller wants to join. `Observer` is hospital-admin only; a worker\nasking for it gets a 403.\n\n`sqlx::Type` because `consult_device_handoffs.mode` persists the choice made\nwhen a companion-device handoff was issued.",
         "enum": [
           "participant",
           "observer"
@@ -12356,6 +13839,152 @@
           }
         ]
       },
+      "PatientHandoverNoteView": {
+        "type": "object",
+        "description": "A per-patient handover note as returned to an entitled reader.",
+        "required": [
+          "id",
+          "shift_id",
+          "patient_id",
+          "author_user_id",
+          "summary",
+          "outstanding_tasks",
+          "medications_given",
+          "escalation_required",
+          "submitted_at",
+          "editable",
+          "editable_until"
+        ],
+        "properties": {
+          "author_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Display name for the author; `null` if it could not be resolved."
+          },
+          "author_user_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The hospital-side author, resolved from their token — never accepted\nfrom the request body."
+          },
+          "editable": {
+            "type": "boolean",
+            "description": "`false` once `editable_until` has passed."
+          },
+          "editable_until": {
+            "type": "string",
+            "format": "date-time",
+            "description": "One hour after the note was first filed. A later submit is a 409."
+          },
+          "escalation_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why escalation is needed; `null` unless `escalation_required`."
+          },
+          "escalation_required": {
+            "type": "boolean",
+            "description": "Whether this patient was flagged as needing escalation."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The note's own id."
+          },
+          "medications_given": {
+            "description": "The JSON array submitted as `medications_given`."
+          },
+          "outstanding_tasks": {
+            "description": "The JSON array submitted as `outstanding_tasks`."
+          },
+          "patient_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The patient this note is about."
+          },
+          "shift_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The shift this note belongs to."
+          },
+          "submitted_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the note was last submitted, not when the row was created."
+          },
+          "summary": {
+            "type": "string",
+            "description": "The handover narrative for this patient."
+          }
+        }
+      },
+      "PatientRecordView": {
+        "type": "object",
+        "description": "One patient's complete record for a shift.\n\n`queue_state` is `null` when the patient was never queued for this shift —\na clinical record outlives its queue entry. `handover_note` is `null` until\nthe hospital-side party files one.",
+        "required": [
+          "patient_id",
+          "full_name",
+          "age",
+          "gender",
+          "severity_level",
+          "clinical_notes"
+        ],
+        "properties": {
+          "age": {
+            "type": "number",
+            "format": "float",
+            "description": "Years, as a float — the ML triage model's input type."
+          },
+          "clinical_notes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConsultationNote"
+            },
+            "description": "Every note the doctor filed for this patient on this shift, newest\nfirst. Amendments appear as their own entries, linked by\n`amends_note_id`."
+          },
+          "full_name": {
+            "type": "string",
+            "description": "The patient's full name."
+          },
+          "gender": {
+            "type": "string",
+            "description": "As recorded at intake."
+          },
+          "handover_note": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PatientHandoverNoteView",
+                "description": "The hospital-side note, if one was filed."
+              }
+            ]
+          },
+          "patient_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The patient these records are about."
+          },
+          "queue_state": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/QueueEntryState",
+                "description": "`null` when the patient was never queued for this shift — a clinical\nrecord outlives its queue entry."
+              }
+            ]
+          },
+          "severity_level": {
+            "type": "string",
+            "description": "Triage severity recorded at intake."
+          }
+        }
+      },
       "PatientResponse": {
         "type": "object",
         "description": "Response shape for patient endpoints.",
@@ -12934,6 +14563,16 @@
           }
         }
       },
+      "QueueEntryState": {
+        "type": "string",
+        "description": "Where a queued patient is in the consultation. `Removed` is a withdrawal by\nthe hospital, not a clinical outcome — kept rather than deleted so the queue\nstays auditable.",
+        "enum": [
+          "waiting",
+          "in_consult",
+          "seen",
+          "removed"
+        ]
+      },
       "RankedInterestedClinician": {
         "type": "object",
         "description": "One row in the \"Interested Workers\" ranked list a hospital admin sees on",
@@ -13243,6 +14882,19 @@
           }
         }
       },
+      "RedeemHandoffRequest": {
+        "type": "object",
+        "description": "`POST /api/v1/consult/handoff/redeem` — unauthenticated; the code is the\ncredential.",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The single-use code, read from the `#c=` fragment of `handoff_url`.\nValid for 180 seconds and good for exactly one redemption."
+          }
+        }
+      },
       "RefreshTokenRequest": {
         "type": "object",
         "description": "Request to refresh an access token (AC-04).",
@@ -13324,6 +14976,16 @@
             "format": "date-time"
           }
         }
+      },
+      "RegistrationStep": {
+        "type": "string",
+        "description": "Registration step in the 4-step onboarding flow matching the UI labels:",
+        "enum": [
+          "profile_setup",
+          "credentials",
+          "verification",
+          "access_granted"
+        ]
       },
       "RejectionRequest": {
         "type": "object",
@@ -14334,6 +15996,58 @@
           }
         }
       },
+      "ShiftPatientRecordsView": {
+        "type": "object",
+        "description": "`GET /api/v1/shifts/{shift_id}/patient-records` — the hospital's read of\neverything a shift produced. Remains available after the shift completes.",
+        "required": [
+          "shift_id",
+          "shift_status",
+          "patients_total",
+          "patients_seen",
+          "patients",
+          "metadata_only"
+        ],
+        "properties": {
+          "metadata_only": {
+            "type": "boolean",
+            "description": "`true` when the caller was served counts without clinical content."
+          },
+          "patients": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PatientRecordView"
+            },
+            "description": "Empty for platform admins, who receive counts only."
+          },
+          "patients_seen": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many of them reached the `seen` state."
+          },
+          "patients_total": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Every patient this shift touched, via the queue, a clinical note or a\nhandover note."
+          },
+          "shift_ended_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "`null` until the shift ends."
+          },
+          "shift_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The shift these records belong to."
+          },
+          "shift_status": {
+            "type": "string",
+            "description": "Lets the UI tell a live shift from a final record."
+          }
+        }
+      },
       "ShiftPreviewResponse": {
         "type": "object",
         "description": "Response for shift preview",
@@ -14564,6 +16278,27 @@
           }
         }
       },
+      "StartConsultationNoteRequest": {
+        "type": "object",
+        "description": "Body for `POST /api/v1/patients/{patient_id}/consultation-notes`.\n\n`shift_id` is optional and, when present, is authorized server-side: the\ncaller must be that shift's assigned clinician. The session is derived from\nthe shift rather than accepted, so a client cannot attach a note to someone\nelse's consultation.",
+        "properties": {
+          "amends_note_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Amend a note whose edit window has closed. Must belong to the same\npatient, and to the same shift when one is given."
+          },
+          "shift_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          }
+        }
+      },
       "StartConsultationNoteResponse": {
         "type": "object",
         "required": [
@@ -14675,6 +16410,40 @@
           }
         }
       },
+      "SubmitPatientHandoverNoteRequest": {
+        "type": "object",
+        "description": "`PUT /api/v1/shifts/{shift_id}/patients/{patient_id}/handover-note`.\nIdempotent: a second submit inside the edit window updates the single row\nfor this `(shift, patient)`.",
+        "required": [
+          "summary"
+        ],
+        "properties": {
+          "escalation_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why escalation is needed. Required whenever `escalation_required` is\n`true`; a blank reason is a validation error, not a silent accept."
+          },
+          "escalation_required": {
+            "type": "boolean",
+            "description": "Flags this patient as needing escalation. When `true`,\n`escalation_reason` must be non-blank or the request is rejected."
+          },
+          "medications_given": {
+            "type": "array",
+            "items": {},
+            "description": "Free-form JSON records of what was administered during the shift."
+          },
+          "outstanding_tasks": {
+            "type": "array",
+            "items": {},
+            "description": "Free-form JSON items still to be done for this patient."
+          },
+          "summary": {
+            "type": "string",
+            "description": "What the on-site party is handing over about this patient. Required."
+          }
+        }
+      },
       "TimeInfo": {
         "type": "object",
         "required": [
@@ -14762,17 +16531,41 @@
               "null"
             ]
           },
+          "diagnosis": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "follow_up_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
           "history_of_present_illness": {
             "type": [
               "string",
               "null"
             ]
           },
+          "medications": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {},
+            "description": "Replaces the stored array wholesale."
+          },
           "plan": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "vitals": {
+            "description": "Replaces the stored object wholesale; it is not merged field by field."
           }
         }
       },
@@ -15052,6 +16845,16 @@
             "description": "\"BVN\" or \"NIN\""
           }
         }
+      },
+      "VerificationStatus": {
+        "type": "string",
+        "description": "Verification status of a hospital against the CAC register.",
+        "enum": [
+          "pending",
+          "verified",
+          "rejected",
+          "under_review"
+        ]
       },
       "VerifyOtpRequest": {
         "type": "object",
@@ -15742,6 +17545,14 @@
     {
       "name": "video",
       "description": "Virtual consultations — LiveKit rooms, join tokens, and session state"
+    },
+    {
+      "name": "patient-records",
+      "description": "Patient clinical records, per-patient handover notes, and the consultation waiting room"
+    },
+    {
+      "name": "consultation-notes",
+      "description": "Voice-recorded consultation notes and their transcripts"
     },
     {
       "name": "webhooks",

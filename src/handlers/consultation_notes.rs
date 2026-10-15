@@ -8,7 +8,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::models::consultation_note::{
-    ConsultationNote, ConsultationNoteDetail, UpdateConsultationNoteRequest,
+    ConsultationNote, ConsultationNoteDetail, StartConsultationNoteRequest,
+    UpdateConsultationNoteRequest,
 };
 use crate::routes::AppState;
 use crate::services::consultation_note_service::ConsultationNoteError;
@@ -21,6 +22,32 @@ fn map_service_error(e: ConsultationNoteError) -> AppError {
     match e {
         ConsultationNoteError::Repository(e) => AppError::InternalServerError(e.to_string()),
         ConsultationNoteError::Storage(e) => AppError::InternalServerError(e.to_string()),
+        ConsultationNoteError::Database(e) => AppError::Database(e),
+        ConsultationNoteError::NotFound(id) => {
+            AppError::NotFound(format!("Consultation note {id} not found"))
+        }
+        ConsultationNoteError::PatientNotFound(id) => {
+            AppError::NotFound(format!("Patient {id} not found"))
+        }
+        // Deliberately the same shape as a 403 elsewhere: the caller learns it
+        // may not have this note, not whether the id exists.
+        ConsultationNoteError::WrongHospital => AppError::Forbidden(
+            "This consultation note belongs to a different hospital".to_string(),
+        ),
+        ConsultationNoteError::NoHospital => {
+            AppError::Forbidden("No hospital associated with this account".to_string())
+        }
+        ConsultationNoteError::NotTheAssignedClinician => AppError::Forbidden(
+            "Only the clinician assigned to this shift can record against it".to_string(),
+        ),
+        ConsultationNoteError::EditWindowClosed => AppError::Conflict(
+            "The edit window for this note has closed — post a new note with amends_note_id"
+                .to_string(),
+        ),
+        ConsultationNoteError::NotAuthorized => {
+            AppError::Forbidden("Not authorized to access this consultation note".to_string())
+        }
+        ConsultationNoteError::Validation(m) => AppError::Validation(m),
     }
 }
 
@@ -34,31 +61,47 @@ pub struct StartConsultationNoteResponse {
     post,
     path = "/api/v1/patients/{patient_id}/consultation-notes",
     params(("patient_id" = Uuid, Path, description = "Patient ID")),
+    request_body = Option<StartConsultationNoteRequest>,
     responses(
-        (status = 201, description = "Consultation note started", body = StartConsultationNoteResponse)
+        (status = 201, description = "Consultation note started", body = StartConsultationNoteResponse),
+        (status = 403, description = "Not this patient's hospital, or not the shift's assigned clinician"),
     ),
     tag = "consultation-notes",
-    summary = "Start a new voice-recorded consultation note for a patient"
+    summary = "Start a new voice-recorded consultation note for a patient",
+    description = "Send `{}` (or no body) for an ad-hoc note. Send `shift_id` to attach it \
+                   to a shift, which requires being that shift's assigned clinician and \
+                   makes the note appear in the hospital's per-shift roll-up."
 )]
 pub async fn start_note(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(patient_id): Path<Uuid>,
+    headers: HeaderMap,
+    payload: Option<Json<StartConsultationNoteRequest>>,
 ) -> AppResult<Json<StartConsultationNoteResponse>> {
+    // Optional body: the pre-existing ad-hoc flow posts nothing at all, and
+    // must keep working.
+    let payload = payload.map(|Json(p)| p).unwrap_or_default();
     let claims = extract_claims(&headers)?;
     let recorded_by = Uuid::parse_str(&claims.sub)
         .map_err(|_| AppError::Unauthorized("Invalid user ID in token".to_string()))?;
+    // Not required: a health worker's token carries no hospital, because
+    // clinicians are marketplace-wide. With a `shift_id` the service derives the
+    // hospital from the shift; without one it demands this.
     let hospital_id = claims
         .hospital_id
         .as_deref()
-        .and_then(|s| Uuid::parse_str(s).ok())
-        .ok_or_else(|| {
-            AppError::Forbidden("No hospital associated with this account".to_string())
-        })?;
+        .and_then(|s| Uuid::parse_str(s).ok());
 
     let note = state
         .consultation_note_service
-        .start(patient_id, hospital_id, recorded_by)
+        .start(
+            patient_id,
+            hospital_id,
+            recorded_by,
+            payload.shift_id,
+            payload.amends_note_id,
+            &claims,
+        )
         .await
         .map_err(map_service_error)?;
 
@@ -79,10 +122,12 @@ pub async fn start_note(
 pub async fn list_for_patient(
     State(state): State<AppState>,
     Path(patient_id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> AppResult<Json<Vec<ConsultationNote>>> {
+    let claims = extract_claims(&headers)?;
     let notes = state
         .consultation_note_service
-        .list_for_patient(patient_id)
+        .list_for_patient(patient_id, &claims)
         .await
         .map_err(map_service_error)?;
     Ok(Json(notes))
@@ -103,13 +148,14 @@ pub async fn list_for_patient(
 pub async fn get_note(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> AppResult<Json<ConsultationNoteDetail>> {
+    let claims = extract_claims(&headers)?;
     let detail = state
         .consultation_note_service
-        .get_detail(id)
+        .get_detail(id, &claims)
         .await
-        .map_err(map_service_error)?
-        .ok_or_else(|| AppError::NotFound(format!("Consultation note {id} not found")))?;
+        .map_err(map_service_error)?;
     Ok(Json(detail))
 }
 
@@ -139,8 +185,18 @@ pub struct AudioChunkResponse {
 pub async fn upload_audio_chunk(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> AppResult<Json<AudioChunkResponse>> {
+    // Appending audio to a note is a write to it, so it needs the same tenancy
+    // check as reading one. Done before the upload is consumed.
+    let claims = extract_claims(&headers)?;
+    state
+        .consultation_note_service
+        .authorize_note(id, &claims)
+        .await
+        .map_err(map_service_error)?;
+
     let mut sequence: Option<i32> = None;
     let mut audio_bytes: Option<Vec<u8>> = None;
     let mut filename = "chunk.webm".to_string();
@@ -188,10 +244,9 @@ pub async fn upload_audio_chunk(
 
     let detail = state
         .consultation_note_service
-        .get_detail(id)
+        .get_detail(id, &claims)
         .await
-        .map_err(map_service_error)?
-        .ok_or_else(|| AppError::NotFound(format!("Consultation note {id} not found")))?;
+        .map_err(map_service_error)?;
 
     Ok(Json(AudioChunkResponse {
         sequence: segment.sequence,
@@ -208,25 +263,26 @@ pub async fn upload_audio_chunk(
     params(("id" = Uuid, Path, description = "Consultation note ID")),
     request_body = UpdateConsultationNoteRequest,
     responses(
-        (status = 200, description = "Updated note", body = ConsultationNote)
+        (status = 200, description = "Updated note", body = ConsultationNote),
+        (status = 403, description = "Not your hospital's note, or not its author"),
+        (status = 409, description = "The edit window has closed"),
     ),
     tag = "consultation-notes",
-    summary = "Save the clinician's structured note fields"
+    summary = "Save the clinician's structured note fields",
+    description = "Patches in place while the note's edit window is open. Once it closes, \
+                   start a new note carrying `amends_note_id` — a locked clinical record is \
+                   never rewritten."
 )]
 pub async fn update_note(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(payload): Json<UpdateConsultationNoteRequest>,
 ) -> AppResult<Json<ConsultationNote>> {
+    let claims = extract_claims(&headers)?;
     let note = state
         .consultation_note_service
-        .update_fields(
-            id,
-            payload.chief_complaint.as_deref(),
-            payload.history_of_present_illness.as_deref(),
-            payload.assessment.as_deref(),
-            payload.plan.as_deref(),
-        )
+        .update_fields(id, &claims, payload)
         .await
         .map_err(map_service_error)?;
     Ok(Json(note))
@@ -246,10 +302,12 @@ pub async fn update_note(
 pub async fn complete_note(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> AppResult<Json<ConsultationNote>> {
+    let claims = extract_claims(&headers)?;
     let note = state
         .consultation_note_service
-        .complete(id)
+        .complete(id, &claims)
         .await
         .map_err(map_service_error)?;
     Ok(Json(note))

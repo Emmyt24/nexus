@@ -510,13 +510,42 @@ admins get metadata only and can never obtain a token.
     { "identity": "u:9d4e…", "display_name": "Dr. Amina Bello",
       "participant_role": "clinician", "connected": true,
       "joined_at": "2026-08-21T10:02:11Z", "left_at": null,
-      "is_publisher": true, "clocked_in_at": "2026-08-21T10:02:12Z" }
+      "is_publisher": true, "clocked_in_at": "2026-08-21T10:02:12Z",
+      "device_ordinal": 1, "device_label": null }
   ],
+  "waiting_room": {
+    "waiting": 2, "in_consult": 1, "seen": 3, "total": 6,
+    "patients": [
+      { "entry_id": "aa11…", "patient_id": "bb22…", "full_name": "Ada Lovelace",
+        "age": 36.0, "gender": "female", "severity_level": "medium",
+        "predictive_risk_score": 0.42,
+        "state": "waiting", "position": 2,
+        "called_at": null, "seen_at": null,
+        "queued_at": "2026-08-21T10:04:00Z",
+        "has_clinical_note": false, "has_handover_note": false }
+    ]
+  },
   "recording": { "enabled": false, "status": null }
 }
 ```
 
 `status` is `pending` → `active` → `ended` and only ever moves forward.
+
+`device_ordinal` is `1` for the primary device and `2`+ for a companion device
+added through "Continue on phone" (below). One person on two devices is **two**
+`participants` entries but still counts as **one** person — see
+`remaining_participants`.
+
+`waiting_room.patients` is `[]` for `SuperAdmin` / `OperationsAdmin`: platform
+staff get counts so support can work, never patient identities. The four counts
+are **always** populated, so render the waiting badge from `waiting`, never from
+`patients.length`. `total` includes `removed` entries; the three live states do
+not sum to it.
+
+`state` moves `waiting` → `in_consult` → `seen`, and at most one patient per
+session can be `in_consult` at a time (enforced by a partial unique index, so a
+second call-in is a **409**, not a silent overwrite). `predictive_risk_score` is
+`null` until the ML triage prediction completes.
 
 `404` only if nobody has ever requested a token. Once one has been issued you get
 `200` with `status: "pending"`, so the pre-join screen never handles a 404.
@@ -532,6 +561,10 @@ Roles: `HealthWorker`, `HospitalAdmin`. Idempotent, always `200`.
 
 Does not end the call for anyone else and does not clock the worker out.
 Clock-out still requires a handover, then `POST …/clockout`.
+
+`remaining_participants` counts **people, not connections** — someone in the
+call on a laptop and a phone counts once. That is what makes "am I the last one
+here?" answerable.
 
 ## `POST /api/v1/shifts/{shift_id}/consult/end`
 
@@ -549,11 +582,67 @@ Request `{ "reason": "Consultation complete" }` (optional) → `200 OK`:
 Idempotent: ending an already-ended session returns the **original** `ended_at`.
 After this, `/token` returns `409` — there is no rejoining an ended session.
 
+## `POST /api/v1/shifts/{shift_id}/consult/handoff` — "Continue on phone"
+
+Roles: `HealthWorker`, `HospitalAdmin`. Authorized exactly like `/token`: if you
+could not get a token for yourself, you cannot get one for your phone.
+
+Request `{ "device_label": "iPhone" }` (optional) → `200 OK`:
+
+```json
+{ "session_id": "8f1c…",
+  "handoff_url": "https://app.example.com/consults/3b2a…/continue#c=Xy7…",
+  "code": "Xy7…", "device_ordinal": 2,
+  "expires_at": "2026-08-21T10:05:11Z" }
+```
+
+**The desktop does not drop.** The phone joins as a second device and both stay
+in the call.
+
+The code lives in the URL **fragment**, which browsers never send to a server —
+so the credential stays out of access logs, out of any `Referer`, and out of the
+proxy chain. Read it with `location.hash`, not from a query string, and do not
+log it. It is valid for **180 seconds** and is single-use. Only its SHA-256 hash
+is stored server-side; the plaintext is returned once and never again.
+
+The grant carries the issuer's own publish/observe mode, so a phone handed off
+by a hospital observer cannot upgrade itself into a publisher.
+
+`409` means the consultation has ended or the shift fell outside its window;
+`403` means you are not a party to this consultation.
+
+## `POST /api/v1/consult/handoff/redeem`
+
+**No `Authorization` header** — the single-use code *is* the credential, which is
+the whole point: the phone has no app session. Send
+`{ "code": "<from location.hash>" }` and you get back the same
+`JoinConsultResponse` shape `/token` returns, so the existing join path is
+reused verbatim.
+
+Unknown, expired and already-redeemed codes all fail **identically**, leaking
+nothing about which case it was.
+
+Redeeming **does not touch attendance**: clock-in is keyed on the person, not the
+device, so a phone joining never records a second clock-in and never moves the
+original `clocked_in_at`. The join preconditions are re-checked at redeem time,
+because a shift can complete during the three minutes the code lives.
+
+The redeemed device holds no app JWT, so it cannot call `/leave` or
+`GET /consult`. That is deliberate and sufficient: LiveKit's `participant_left`
+webhook is the authoritative departure signal, and the redeem response carries a
+full session snapshot so the phone needs no follow-up poll.
+
 ## `POST /api/v1/webhooks/livekit`
 
 LiveKit Cloud calls this, not you. Listed so nobody wires the app at it.
 
 ## Not in this release
+
+Room capacity defaults to **6** from `20240063` onward (two people with one
+companion device each is 4, so the old default of 4 left no headroom). Sessions
+created before that migration keep their stored `4`: LiveKit's `create_room`
+returns an existing room *without* re-applying options, so a live room's
+capacity cannot be widened after the fact.
 
 `recording` is always `{ "enabled": false, "status": null }`. It ships now so the
 recording indicator can be built against a stable shape, but nothing records and

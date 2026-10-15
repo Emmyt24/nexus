@@ -17,6 +17,7 @@ use nexuscare_backend::models::video_session::{
     JoinConsultRequest, JoinMode, ParticipantRole, VideoSessionStatus,
 };
 use nexuscare_backend::repositories::notification::NotificationRepository;
+use nexuscare_backend::repositories::patient_record::PatientRecordRepository;
 use nexuscare_backend::repositories::shift::ShiftRepository;
 use nexuscare_backend::repositories::video_session::VideoSessionRepository;
 use nexuscare_backend::repositories::wallet::WalletRepository;
@@ -89,6 +90,7 @@ fn video_service(pool: &PgPool, virtual_clockin_enabled: bool) -> Arc<VideoServi
 
     Arc::new(VideoService::with_virtual_clockin(
         Arc::new(VideoSessionRepository::new(pool.clone())),
+        Arc::new(PatientRecordRepository::new(pool.clone())),
         shift_repo,
         shift_service,
         // Empty credentials == mock mode.

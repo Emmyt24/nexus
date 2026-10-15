@@ -70,7 +70,13 @@ impl ParticipantRole {
 
 /// How the caller wants to join. `Observer` is hospital-admin only; a worker
 /// asking for it gets a 403.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+///
+/// `sqlx::Type` because `consult_device_handoffs.mode` persists the choice made
+/// when a companion-device handoff was issued.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, sqlx::Type, ToSchema,
+)]
+#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum JoinMode {
     /// Camera and microphone on — the default.
@@ -134,6 +140,12 @@ pub struct VideoSessionParticipant {
     pub participant_role: ParticipantRole,
     pub can_publish: bool,
 
+    /// Which of this user's devices this row is. `1` is the primary device,
+    /// whose identity is the bare `"u:<uuid>"`; a companion device from a
+    /// "Continue on phone" handoff is `2`+ with identity `"u:<uuid>#d<n>"`.
+    pub device_ordinal: i32,
+    pub device_label: Option<String>,
+
     pub token_issued_at: DateTime<Utc>,
     pub token_expires_at: DateTime<Utc>,
     pub token_issue_count: i32,
@@ -143,7 +155,9 @@ pub struct VideoSessionParticipant {
     pub left_at: Option<DateTime<Utc>>,
     pub disconnect_reason: Option<String>,
     /// Set by `claim_clockin_slot`; the row lock behind it is what makes two
-    /// concurrent `participant_joined` deliveries produce one clock-in.
+    /// concurrent `participant_joined` deliveries produce one clock-in. Only
+    /// ever populated on the *primary* device row, because the clock-in belongs
+    /// to the person — a companion device must not record a second one.
     pub clocked_in_at: Option<DateTime<Utc>>,
 
     pub created_at: DateTime<Utc>,
@@ -275,6 +289,13 @@ pub struct ConsultParticipantView {
     pub left_at: Option<DateTime<Utc>>,
     pub is_publisher: bool,
     pub clocked_in_at: Option<DateTime<Utc>>,
+    /// `1` for the primary device, `2`+ for a companion device. Two entries
+    /// whose `identity` shares a `u:<uuid>` prefix are one person on two
+    /// devices — group on it if you render a person list, not a device list.
+    pub device_ordinal: i32,
+    /// Whatever the user called the device when handing off, e.g. "iPhone".
+    /// `null` when they gave no label.
+    pub device_label: Option<String>,
 }
 
 /// `200` from `GET /api/v1/shifts/{shift_id}/consult`.
@@ -293,6 +314,9 @@ pub struct ConsultSessionView {
     pub live: bool,
     pub clock_in_recorded: bool,
     pub participants: Vec<ConsultParticipantView>,
+    /// Patients queued for this session. Counts are always present; `patients`
+    /// is empty for platform admins, who get no patient identities.
+    pub waiting_room: crate::models::patient_record::ConsultWaitingRoomView,
     pub recording: ConsultRecordingView,
 }
 

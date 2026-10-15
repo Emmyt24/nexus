@@ -44,7 +44,7 @@ pub struct HospitalPublicDetail {
 }
 
 /// Verification status of a hospital against the CAC register.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, ToSchema)]
 #[sqlx(type_name = "verification_status", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum VerificationStatus {
@@ -55,7 +55,7 @@ pub enum VerificationStatus {
 }
 
 /// Registration step in the 4-step onboarding flow matching the UI labels:
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, ToSchema)]
 #[sqlx(type_name = "registration_step", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum RegistrationStep {
@@ -102,7 +102,7 @@ pub struct Hospital {
 }
 
 /// Payload for Step 1 (Setup) of hospital registration.
-#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[derive(Debug, Clone, Serialize, Deserialize, Validate, ToSchema)]
 pub struct CreateHospitalRequest {
     #[validate(length(
         min = 2,
@@ -163,7 +163,7 @@ pub struct UpdateHospitalRequest {
 }
 
 /// Response shape returned to clients.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HospitalResponse {
     pub id: Uuid,
     pub name: String,

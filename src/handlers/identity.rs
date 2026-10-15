@@ -39,13 +39,17 @@ pub struct IdentityStatusResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct GetIdentityResponse {
+    /// Whether a verified BVN/NIN record exists. When `false`, every field
+    /// below is omitted from the JSON rather than sent as null.
     pub verified: bool,
+    /// `"BVN"` or `"NIN"` — which record was verified.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_name: Option<String>,
+    /// The name as held on the identity record, title-cased.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub full_name: Option<String>,
 }
@@ -345,7 +349,9 @@ pub async fn resolve_account(
         (status = 200, description = "Hospital identity status and names", body = GetIdentityResponse)
     ),
     tag = "identity",
-    summary = "Get hospital admin verified identity details"
+    security(),
+    summary = "Get hospital admin verified identity details",
+    description = "An unverified hospital is a 200 with `verified: false`, not a 404 — absence of a verification is an ordinary state. The name fields are omitted entirely rather than sent as null when unverified, so read `verified` first. Takes no Authorization header."
 )]
 pub async fn hospital_get_identity(
     State(state): State<AppState>,
@@ -363,7 +369,9 @@ pub async fn hospital_get_identity(
         (status = 200, description = "Clinician identity status and names", body = GetIdentityResponse)
     ),
     tag = "identity",
-    summary = "Get clinician verified identity details"
+    security(),
+    summary = "Get clinician verified identity details",
+    description = "An unverified clinician is a 200 with `verified: false`, not a 404. The name fields are omitted entirely rather than sent as null when unverified, so read `verified` first. Names come from the BVN/NIN record, title-cased. Takes no Authorization header."
 )]
 pub async fn clinician_get_identity(
     State(state): State<AppState>,

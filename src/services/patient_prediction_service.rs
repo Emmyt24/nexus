@@ -61,14 +61,31 @@ impl PatientPredictionService {
         req: NewPatientRequest,
     ) -> Result<(Patient, PatientPrediction), PatientPredictionError> {
         let mut tx = self.pool.begin().await?;
+        let result = self
+            .ingest_patient_in_tx(&mut tx, hospital_id, created_by, req)
+            .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
 
+    /// The same intake, inside a transaction the caller owns and commits.
+    ///
+    /// Exists so adding a patient mid-consultation can put the patient row, its
+    /// pending prediction and the waiting-room entry in one transaction. The
+    /// public `ingest_patient` is this plus a commit, so there is one intake
+    /// path and ML triage fires identically either way.
+    pub async fn ingest_patient_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        hospital_id: Uuid,
+        created_by: Uuid,
+        req: NewPatientRequest,
+    ) -> Result<(Patient, PatientPrediction), PatientPredictionError> {
         let patient = self
             .patient_repo
-            .create(&mut tx, hospital_id, created_by, req)
+            .create(tx, hospital_id, created_by, req)
             .await?;
-        let prediction = self.prediction_repo.create_pending(&mut tx, patient.id).await?;
-
-        tx.commit().await?;
+        let prediction = self.prediction_repo.create_pending(tx, patient.id).await?;
 
         Ok((patient, prediction))
     }

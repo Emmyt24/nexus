@@ -17,6 +17,7 @@ use axum::{
 use uuid::Uuid;
 
 use crate::{
+    models::patient_record::{CreateHandoffRequest, CreateHandoffResponse, RedeemHandoffRequest},
     models::video_session::{
         ConsultSessionView, EndConsultRequest, EndConsultResponse, JoinConsultRequest,
         JoinConsultResponse, LeaveConsultResponse,
@@ -159,6 +160,75 @@ pub async fn end_session(
     state
         .video_service
         .end_session(shift_id, &claims, payload.reason)
+        .await
+        .map(Json)
+        .map_err(map_video_error)
+}
+
+/// POST /api/v1/shifts/{shift_id}/consult/handoff
+#[utoipa::path(
+    post,
+    path = "/api/v1/shifts/{shift_id}/consult/handoff",
+    request_body = CreateHandoffRequest,
+    params(("shift_id" = Uuid, Path, description = "Shift unique identifier")),
+    responses(
+        (status = 200, description = "Handoff code minted", body = CreateHandoffResponse),
+        (status = 401, description = "Missing or invalid token", body = crate::handlers::shifts::ErrorResponse),
+        (status = 403, description = "Not a party to this consultation", body = crate::handlers::shifts::ErrorResponse),
+        (status = 404, description = "Shift or session not found", body = crate::handlers::shifts::ErrorResponse),
+        (status = 409, description = "The consultation has ended, or the shift is outside its window", body = crate::handlers::shifts::ErrorResponse)
+    ),
+    tag = "video",
+    summary = "Continue this consultation on another device",
+    description = "Returns a single-use code and the URL to open on the second device. The code lives for 3 minutes, is good for one redemption, and carries the code in the URL *fragment* so it never reaches a server log — render it as a QR code. Both devices stay in the call; the phone joins as a companion identity and does not re-trigger clock-in."
+)]
+pub async fn create_handoff(
+    State(state): State<AppState>,
+    Path(shift_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateHandoffRequest>,
+) -> AppResult<Json<CreateHandoffResponse>> {
+    let claims = extract_claims(&headers)?;
+
+    state
+        .video_service
+        .create_handoff(shift_id, &claims, payload)
+        .await
+        .map(Json)
+        .map_err(map_video_error)
+}
+
+/// POST /api/v1/consult/handoff/redeem
+///
+/// Deliberately unauthenticated — the code *is* the credential. See the route
+/// registration in `app_routes.rs`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/consult/handoff/redeem",
+    request_body = RedeemHandoffRequest,
+    responses(
+        (status = 200, description = "Join token minted for the companion device", body = JoinConsultResponse),
+        (status = 403, description = "Unknown, expired or already-redeemed code", body = crate::handlers::shifts::ErrorResponse),
+        (status = 409, description = "The consultation has ended, or the shift left its window", body = crate::handlers::shifts::ErrorResponse),
+        (status = 422, description = "Validation error", body = crate::handlers::shifts::ErrorResponse)
+    ),
+    tag = "video",
+    summary = "Redeem a \"Continue on phone\" code for a join token",
+    security(),
+    description = "Takes no Authorization header: the single-use code stands in for one. Read it from the URL fragment and POST it here. Unknown, expired and spent codes all fail identically, so nothing can be probed. The response is the same shape as POST /consult/token, so the client reuses its generated types."
+)]
+pub async fn redeem_handoff(
+    State(state): State<AppState>,
+    Json(payload): Json<RedeemHandoffRequest>,
+) -> AppResult<Json<JoinConsultResponse>> {
+    use validator::Validate;
+    payload
+        .validate()
+        .map_err(|e| AppError::Validation(e.to_string()))?;
+
+    state
+        .video_service
+        .redeem_handoff(&payload.code)
         .await
         .map(Json)
         .map_err(map_video_error)

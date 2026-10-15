@@ -16,9 +16,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
+use crate::models::patient_record::{
+    ConsultQueuePatientView, ConsultWaitingRoomView, CreateHandoffRequest, CreateHandoffResponse,
+};
 use crate::models::shift::{Shift, ShiftStatus, ShiftType};
 use crate::models::user::{Claims, UserRole};
 use crate::models::video_session::{
@@ -27,6 +30,7 @@ use crate::models::video_session::{
     LeaveConsultResponse, NewVideoSessionEvent, ParticipantRole, VideoSession,
     VideoSessionParticipant, VideoSessionStatus,
 };
+use crate::repositories::patient_record::PatientRecordRepository;
 use crate::repositories::shift::ShiftRepository;
 use crate::repositories::video_session::VideoSessionRepository;
 use crate::services::livekit::{grants_for, LiveKitClient, LiveKitError, LiveKitWebhookEvent};
@@ -53,6 +57,10 @@ const ROOM_NAME_PREFIX: &str = "shift-";
 /// A clinician must be within this many km of the hospital to join the call.
 const CALL_GEOFENCE_KM: f64 = 10.0;
 const HANDOVER_REMINDER_EVENT: &str = "handover_reminder_sent";
+/// How long a "Continue on phone" code stays redeemable. Short on purpose: the
+/// user is looking at the QR code while they scan it, and the code is the whole
+/// credential.
+const HANDOFF_TTL_SECONDS: i64 = 180;
 
 #[derive(Debug, thiserror::Error)]
 pub enum VideoServiceError {
@@ -94,6 +102,46 @@ pub enum VideoServiceError {
 
     #[error("LiveKit is not configured")]
     NotConfigured,
+}
+
+/// What a reader is entitled to see. Platform staff get counts and metadata so
+/// support can work, but never clinical content or patient identities — the
+/// same NDPR line `authorize_shift_access` draws for the video stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClinicalAccess {
+    /// The owning hospital, or the shift's assigned clinician.
+    Full,
+    /// `SuperAdmin` / `OperationsAdmin`.
+    MetadataOnly,
+}
+
+impl ClinicalAccess {
+    pub fn is_full(&self) -> bool {
+        matches!(self, ClinicalAccess::Full)
+    }
+}
+
+/// Who the caller is *relative to one shift*. The single tenant decision for
+/// everything a shift owns — the room, the waiting room, and the clinical
+/// record — so those three can never drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftDataRole {
+    /// The shift's assigned clinician, carrying their `clinicians.id`.
+    Clinician(Uuid),
+    /// An admin of the hospital that owns the shift.
+    HospitalAdmin,
+    /// `SuperAdmin` / `OperationsAdmin` — support, not care.
+    PlatformAdmin,
+}
+
+impl ShiftDataRole {
+    /// Platform staff may read counts and metadata, never clinical content.
+    pub fn clinical_access(&self) -> ClinicalAccess {
+        match self {
+            ShiftDataRole::PlatformAdmin => ClinicalAccess::MetadataOnly,
+            _ => ClinicalAccess::Full,
+        }
+    }
 }
 
 /// What a webhook delivery did. All four are 200s — LiveKit retries on non-2xx.
@@ -155,8 +203,67 @@ fn identity_for_user(user_id: Uuid) -> String {
     format!("u:{user_id}")
 }
 
+/// The LiveKit identity for one of a user's devices. Slot 1 is the primary
+/// device and keeps the bare `"u:<uuid>"`, so every token minted before
+/// companion devices existed still maps to the same row.
+pub fn identity_for_device(user_id: Uuid, device_ordinal: i32) -> String {
+    if device_ordinal <= 1 {
+        identity_for_user(user_id)
+    } else {
+        format!("u:{user_id}#d{device_ordinal}")
+    }
+}
+
+/// `"u:<uuid>#d2"` → `"u:<uuid>"`; anything else is returned unchanged.
+///
+/// Used to key the clock-in on the *person*. Claiming per device would let a
+/// companion device take a second slot, and checking a sibling row with
+/// `NOT EXISTS` instead would not be serialised by `claim_clockin_slot`'s row
+/// lock — two devices joining at once would both see no sibling clocked in.
+pub fn primary_identity(identity: &str) -> &str {
+    identity.split_once('#').map_or(identity, |(base, _)| base)
+}
+
+/// 256 bits from the OS, URL-safe and unpadded so it survives being pasted
+/// into a URL fragment or encoded as a QR code.
+fn generate_handoff_code() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+}
+
+/// Only this ever reaches the database. A plain SHA-256 is the right primitive:
+/// unlike a password the input is 256 bits of uniform randomness, so there is
+/// nothing to brute-force and no need for a slow KDF. Same reasoning as
+/// `identity_number_hash` (20240039).
+fn hash_handoff_code(code: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(code.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// The second URL. Shaped like `consult_deep_link` — a link into OUR app, not a
+/// LiveKit URL — with the code in the **fragment**, which browsers never send to
+/// the server. So the credential stays out of our access logs, out of any
+/// `Referer`, and out of the proxy chain; the page reads `location.hash` and
+/// POSTs it to the redeem endpoint.
+fn handoff_url(shift_id: Uuid, code: &str) -> String {
+    let base = std::env::var("APP_PUBLIC_BASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "https://app.nexuscare.com".to_string());
+    let base = base.trim_end_matches('/');
+    format!("{base}/consults/{shift_id}/continue#c={code}")
+}
+
 pub struct VideoService {
     repo: Arc<VideoSessionRepository>,
+    /// Read-only here: the waiting-room counts ride along on `GET /consult` so
+    /// the client needs one request, not two. Every *mutation* of the queue
+    /// lives in `PatientRecordService`.
+    queue_repo: Arc<PatientRecordRepository>,
     shift_repo: Arc<ShiftRepository>,
     shift_service: Arc<ShiftService>,
     livekit: Arc<LiveKitClient>,
@@ -168,8 +275,10 @@ pub struct VideoService {
 }
 
 impl VideoService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: Arc<VideoSessionRepository>,
+        queue_repo: Arc<PatientRecordRepository>,
         shift_repo: Arc<ShiftRepository>,
         shift_service: Arc<ShiftService>,
         livekit: Arc<LiveKitClient>,
@@ -180,6 +289,7 @@ impl VideoService {
             .unwrap_or(false);
         Self::with_virtual_clockin(
             repo,
+            queue_repo,
             shift_repo,
             shift_service,
             livekit,
@@ -190,8 +300,10 @@ impl VideoService {
 
     /// Explicit-flag constructor, so tests do not have to mutate the process
     /// environment to exercise the clock-in branch.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_virtual_clockin(
         repo: Arc<VideoSessionRepository>,
+        queue_repo: Arc<PatientRecordRepository>,
         shift_repo: Arc<ShiftRepository>,
         shift_service: Arc<ShiftService>,
         livekit: Arc<LiveKitClient>,
@@ -200,6 +312,7 @@ impl VideoService {
     ) -> Self {
         Self {
             repo,
+            queue_repo,
             shift_repo,
             shift_service,
             livekit,
@@ -300,6 +413,10 @@ impl VideoService {
                 role,
                 grants.can_publish,
                 minted.expires_at,
+                // The primary device. Companion slots are allocated only by
+                // `redeem_handoff`, never by a plain token request.
+                1,
+                request.device_label.as_deref(),
             )
             .await?;
 
@@ -361,7 +478,7 @@ impl VideoService {
         claims: &Claims,
     ) -> Result<ConsultSessionView, VideoServiceError> {
         let shift = self.load_shift(shift_id).await?;
-        self.authorize_session_read(&shift, claims).await?;
+        let access = self.authorize_session_read(&shift, claims).await?;
 
         let session = self
             .repo
@@ -369,7 +486,217 @@ impl VideoService {
             .await?
             .ok_or(VideoServiceError::SessionNotFound)?;
 
-        self.session_view(&session).await
+        self.session_view(&session, access.is_full()).await
+    }
+
+    // Companion devices ("Continue on phone")
+
+    /// Mint a single-use code the user's second device can exchange for a join
+    /// token.
+    ///
+    /// The code is the only credential the phone will hold, so: 256 bits of
+    /// entropy, a 3-minute life, single use, and only its SHA-256 digest is
+    /// stored. Both the issue and the redeem land in `video_session_events`, so
+    /// abuse is visible.
+    ///
+    /// Authorization is the ordinary join check: if you could not get a token
+    /// for yourself, you cannot get one for your phone either.
+    pub async fn create_handoff(
+        &self,
+        shift_id: Uuid,
+        claims: &Claims,
+        request: CreateHandoffRequest,
+    ) -> Result<CreateHandoffResponse, VideoServiceError> {
+        let user_id = claims_user_id(claims)?;
+        let shift = self.load_shift(shift_id).await?;
+        let (role, _clinician_id) = self.authorize_shift_access(&shift, claims).await?;
+
+        let session = self
+            .repo
+            .find_by_shift(shift_id)
+            .await?
+            .ok_or(VideoServiceError::SessionNotFound)?;
+        if session.status == VideoSessionStatus::Ended {
+            return Err(VideoServiceError::SessionEnded);
+        }
+
+        // The grant carries the issuer's own publish rights, so a phone handed
+        // off from an observer seat cannot quietly upgrade itself to publishing.
+        let primary = self
+            .repo
+            .find_participant(session.id, &identity_for_user(user_id))
+            .await?;
+        let mode = match &primary {
+            Some(p) if !p.can_publish => JoinMode::Observer,
+            _ => JoinMode::Participant,
+        };
+
+        let device_ordinal = self.repo.next_device_ordinal(session.id, user_id).await?;
+        let code = generate_handoff_code();
+        let expires_at = Utc::now() + Duration::seconds(HANDOFF_TTL_SECONDS);
+
+        self.repo
+            .insert_handoff(
+                session.id,
+                user_id,
+                &hash_handoff_code(&code),
+                device_ordinal,
+                role,
+                mode,
+                request.device_label.as_deref(),
+                expires_at,
+            )
+            .await?;
+
+        self.audit(
+            Some(session.id),
+            &session.room_name,
+            "handoff_issued",
+            Some(&identity_for_device(user_id, device_ordinal)),
+            Some(user_id),
+            None,
+            // Never the code, nor its hash: this trail is read by support.
+            Some(serde_json::json!({
+                "device_ordinal": device_ordinal,
+                "mode": mode.as_str(),
+                "device_label": request.device_label,
+            })),
+            Utc::now(),
+        )
+        .await;
+
+        Ok(CreateHandoffResponse {
+            session_id: session.id,
+            handoff_url: handoff_url(shift_id, &code),
+            code,
+            device_ordinal,
+            expires_at,
+        })
+    }
+
+    /// Exchange a handoff code for a join token. **Unauthenticated**: the code
+    /// is the credential, so nothing here reads `Claims`.
+    ///
+    /// `claim_handoff` spends the code in one statement, so a replay loses the
+    /// race rather than minting a second token. Every failure returns the same
+    /// `NotAuthorized`, so a caller cannot distinguish "wrong code" from
+    /// "expired" from "already used", and cannot probe for live sessions.
+    pub async fn redeem_handoff(
+        &self,
+        code: &str,
+    ) -> Result<JoinConsultResponse, VideoServiceError> {
+        let grant = self
+            .repo
+            .claim_handoff(&hash_handoff_code(code))
+            .await?
+            .ok_or(VideoServiceError::NotAuthorized)?;
+
+        let session = self
+            .repo
+            .find_session_by_id(grant.session_id)
+            .await?
+            .ok_or(VideoServiceError::NotAuthorized)?;
+        if session.status == VideoSessionStatus::Ended {
+            return Err(VideoServiceError::SessionEnded);
+        }
+
+        // Re-checked at redemption, not just at issue: a shift can complete or
+        // fall out of its window during the 3 minutes the code is alive.
+        let shift_id = session.shift_id.ok_or(VideoServiceError::NotAuthorized)?;
+        let shift = self.load_shift(shift_id).await?;
+        self.check_join_preconditions(&shift)?;
+
+        // Both copied from the primary row rather than resolved again: the grant
+        // already fixed who this device acts as.
+        let primary = self
+            .repo
+            .find_participant(session.id, &identity_for_user(grant.user_id))
+            .await?;
+        let display_name = primary
+            .as_ref()
+            .and_then(|p| p.display_name.clone())
+            .unwrap_or_else(|| "Companion device".to_string());
+        let clinician_id = primary.as_ref().and_then(|p| p.clinician_id);
+
+        let identity = identity_for_device(grant.user_id, grant.device_ordinal);
+        let grants = grants_for(grant.participant_role, &session.room_name, grant.mode);
+        let attributes = HashMap::from([
+            (
+                "nx_role".to_string(),
+                grant.participant_role.as_str().to_string(),
+            ),
+            ("nx_shift_id".to_string(), shift.id.to_string()),
+            ("nx_session_id".to_string(), session.id.to_string()),
+            ("nx_device".to_string(), grant.device_ordinal.to_string()),
+        ]);
+
+        let minted = self.livekit.mint_token(
+            &identity,
+            &display_name,
+            &attributes,
+            &grants,
+            self.livekit.token_ttl(),
+        )?;
+
+        self.repo
+            .upsert_participant_on_token(
+                session.id,
+                &identity,
+                Some(grant.user_id),
+                clinician_id,
+                &display_name,
+                grant.participant_role,
+                grants.can_publish,
+                minted.expires_at,
+                grant.device_ordinal,
+                grant.device_label.as_deref(),
+            )
+            .await?;
+
+        self.audit(
+            Some(session.id),
+            &session.room_name,
+            "handoff_redeemed",
+            Some(&identity),
+            Some(grant.user_id),
+            None,
+            Some(serde_json::json!({
+                "device_ordinal": grant.device_ordinal,
+                "handoff_id": grant.id,
+            })),
+            Utc::now(),
+        )
+        .await;
+
+        let clocked_in_at = self.shift_repo.get_attendance_clockin(shift.id).await?;
+
+        Ok(JoinConsultResponse {
+            session_id: session.id,
+            room_name: session.room_name.clone(),
+            url: self.livekit.ws_url().to_string(),
+            token: minted.token,
+            identity: minted.identity,
+            display_name,
+            participant_role: grant.participant_role,
+            mode: grant.mode,
+            can_publish: grants.can_publish,
+            can_subscribe: grants.can_subscribe,
+            expires_at: minted.expires_at,
+            session_status: session.status,
+            shift: shift_summary(&shift),
+            clock_in: ConsultClockInView {
+                mode: if self.virtual_clockin_enabled {
+                    "auto_on_join".to_string()
+                } else {
+                    "manual".to_string()
+                },
+                already_clocked_in: clocked_in_at.is_some(),
+                clocked_in_at,
+                fallback_endpoint: format!("/api/v1/shifts/{}/clockin", shift.id),
+            },
+            recording: ConsultRecordingView::disabled(),
+            mock: self.livekit.is_mock(),
+        })
     }
 
     /// Best-effort departure notice, fired from the Leave button and
@@ -686,9 +1013,13 @@ impl VideoService {
             return Ok(());
         };
 
+        // The clock-in belongs to the person, not the device they joined on, so
+        // the slot is always claimed on their primary row.
+        let clockin_identity = primary_identity(&participant.identity).to_string();
+
         if self
             .repo
-            .claim_clockin_slot(session.id, &participant.identity, at)
+            .claim_clockin_slot(session.id, &clockin_identity, at)
             .await?
             .is_none()
         {
@@ -707,7 +1038,7 @@ impl VideoService {
                 // Only a genuine failure hands the slot back, so the reconciler
                 // retries this join instead of the webhook silently losing it.
                 self.repo
-                    .release_clockin_slot(session.id, &participant.identity)
+                    .release_clockin_slot(session.id, &clockin_identity)
                     .await?;
                 tracing::error!("Virtual clock-in failed for shift {shift_id}: {e}");
                 return Ok(());
@@ -1005,13 +1336,60 @@ impl VideoService {
         &self,
         shift: &Shift,
         claims: &Claims,
-    ) -> Result<(), VideoServiceError> {
+    ) -> Result<ClinicalAccess, VideoServiceError> {
+        // Reading the *room* still requires a virtual shift; reading the shift's
+        // patient data does not, which is the one precondition
+        // `authorize_shift_data_access` deliberately leaves out.
         if shift.shift_type != ShiftType::Virtual {
             return Err(VideoServiceError::NotVirtualShift);
         }
+        Ok(self
+            .authorize_shift_data_access(shift, claims)
+            .await?
+            .clinical_access())
+    }
 
+    /// Load a shift for an authorization decision made by another service.
+    ///
+    /// `load_shift` is private and `ShiftRepository::get_by_id` returns a bare
+    /// `Option`; this gives callers the same `ShiftNotFound` they would get
+    /// from the video endpoints, so error mapping stays consistent.
+    pub async fn load_shift_for_authz(
+        &self,
+        shift_id: Uuid,
+    ) -> Result<Shift, VideoServiceError> {
+        self.load_shift(shift_id).await
+    }
+
+    /// The consult session for a shift, if one has been started. `None` is not
+    /// an error: a clinical note can be written for an in-person shift, or
+    /// before anybody requests a token.
+    pub async fn session_id_for_shift(
+        &self,
+        shift_id: Uuid,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        Ok(self.repo.find_by_shift(shift_id).await?.map(|s| s.id))
+    }
+
+    /// The tenant boundary for everything a shift owns. There is no RLS — this
+    /// check *is* it.
+    ///
+    /// Deliberately omits both of `authorize_shift_access`'s join preconditions:
+    /// a patient record is not a room, so it is readable for an in-person shift
+    /// and long after the consultation window has closed. Writing is narrowed by
+    /// the caller, not here.
+    ///
+    /// This is the `claims.hospital_id == shift.hospital_id` idiom, **not** the
+    /// `shift.created_by == claims.sub` one used elsewhere in the shifts domain:
+    /// the latter would 403 a second admin at the same hospital, and would break
+    /// entirely once the posting admin is deactivated.
+    pub async fn authorize_shift_data_access(
+        &self,
+        shift: &Shift,
+        claims: &Claims,
+    ) -> Result<ShiftDataRole, VideoServiceError> {
         match claims.role {
-            UserRole::SuperAdmin | UserRole::OperationsAdmin => Ok(()),
+            UserRole::SuperAdmin | UserRole::OperationsAdmin => Ok(ShiftDataRole::PlatformAdmin),
             UserRole::HealthWorker => {
                 let user_id = claims_user_id(claims)?;
                 let clinician_id = self
@@ -1019,16 +1397,18 @@ impl VideoService {
                     .find_clinician_id_for_user(user_id)
                     .await?
                     .ok_or(VideoServiceError::NoClinicianProfile)?;
+                // Having applied, been offered, or declined confers nothing —
+                // only the accepted assignment does.
                 if shift.assigned_clinician_id != Some(clinician_id) {
                     return Err(VideoServiceError::NotAuthorized);
                 }
-                Ok(())
+                Ok(ShiftDataRole::Clinician(clinician_id))
             }
             UserRole::HospitalAdmin => {
                 if claims_hospital_id(claims) != Some(shift.hospital_id) {
                     return Err(VideoServiceError::NotAuthorized);
                 }
-                Ok(())
+                Ok(ShiftDataRole::HospitalAdmin)
             }
             _ => Err(VideoServiceError::NotAuthorized),
         }
@@ -1082,9 +1462,12 @@ impl VideoService {
 
     /// Reconcile the participant list against LiveKit where we can. `live` tells
     /// the client which of the two it is looking at.
+    /// `with_patient_detail` is the NDPR split: the owning hospital and the
+    /// assigned clinician see who is waiting, platform admins see only how many.
     async fn session_view(
         &self,
         session: &VideoSession,
+        with_patient_detail: bool,
     ) -> Result<ConsultSessionView, VideoServiceError> {
         let stored = self.repo.list_participants(session.id).await?;
 
@@ -1129,9 +1512,15 @@ impl VideoService {
                         None => p.can_publish,
                     },
                     clocked_in_at: p.clocked_in_at,
+                    device_ordinal: p.device_ordinal,
+                    device_label: p.device_label.clone(),
                 }
             })
             .collect();
+
+        let waiting_room = self
+            .waiting_room_view(session.id, with_patient_detail)
+            .await?;
 
         Ok(ConsultSessionView {
             session_id: session.id,
@@ -1144,7 +1533,53 @@ impl VideoService {
             live,
             clock_in_recorded: stored.iter().any(|p| p.clocked_in_at.is_some()),
             participants,
+            waiting_room,
             recording: ConsultRecordingView::disabled(),
+        })
+    }
+
+    /// Counts always; the patient list only for a caller entitled to clinical
+    /// content. Built here rather than in `PatientRecordService` because
+    /// `GET /consult` already holds the session and must stay one round trip.
+    pub(crate) async fn waiting_room_view(
+        &self,
+        session_id: Uuid,
+        with_patient_detail: bool,
+    ) -> Result<ConsultWaitingRoomView, VideoServiceError> {
+        let counts = self.queue_repo.counts_for_session(session_id).await?;
+
+        let patients = if with_patient_detail {
+            self.queue_repo
+                .list_for_session(session_id)
+                .await?
+                .into_iter()
+                .map(|e| ConsultQueuePatientView {
+                    entry_id: e.id,
+                    patient_id: e.patient_id,
+                    full_name: e.full_name,
+                    age: e.age,
+                    gender: e.gender,
+                    severity_level: e.severity_level,
+                    predictive_risk_score: e.predictive_risk_score,
+                    state: e.state,
+                    position: e.position,
+                    called_at: e.called_at,
+                    seen_at: e.seen_at,
+                    queued_at: e.created_at,
+                    has_clinical_note: e.has_clinical_note,
+                    has_handover_note: e.has_handover_note,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        Ok(ConsultWaitingRoomView {
+            waiting: counts.waiting,
+            in_consult: counts.in_consult,
+            seen: counts.seen,
+            total: counts.total,
+            patients,
         })
     }
 

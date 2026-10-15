@@ -6,8 +6,9 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::models::patient_record::ConsultDeviceHandoff;
 use crate::models::video_session::{
-    NewVideoSessionEvent, ParticipantRole, PendingClockout, VideoSession,
+    JoinMode, NewVideoSessionEvent, ParticipantRole, PendingClockout, VideoSession,
     VideoSessionParticipant,
 };
 
@@ -22,9 +23,16 @@ const SESSION_COLUMNS: &str = r#"
 
 const PARTICIPANT_COLUMNS: &str = r#"
     id, session_id, identity, user_id, clinician_id, display_name,
-    participant_role, can_publish, token_issued_at, token_expires_at,
+    participant_role, can_publish, device_ordinal, device_label,
+    token_issued_at, token_expires_at,
     token_issue_count, participant_sid, joined_at, left_at, disconnect_reason,
     clocked_in_at, created_at, updated_at
+"#;
+
+/// Every column of `consult_device_handoffs`, in declaration order.
+const HANDOFF_COLUMNS: &str = r#"
+    id, session_id, user_id, code_hash, device_ordinal, participant_role, mode,
+    device_label, expires_at, redeemed_at, created_at
 "#;
 
 pub struct VideoSessionRepository {
@@ -50,6 +58,22 @@ impl VideoSessionRepository {
         .await
     }
 
+    /// Look a session up by its own id. Needed by the handoff redeem, which
+    /// starts from a grant row rather than from a shift.
+    pub async fn find_session_by_id(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<VideoSession>, sqlx::Error> {
+        sqlx::query_as::<_, VideoSession>(&format!(
+            r#"
+            SELECT {SESSION_COLUMNS} FROM video_sessions WHERE id = $1
+            "#
+        ))
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     pub async fn find_by_room_name(
         &self,
         room_name: &str,
@@ -65,6 +89,12 @@ impl VideoSessionRepository {
     /// Seed-and-store the room for a shift. The `DO UPDATE` (rather than
     /// `DO NOTHING`) is what makes this safe under two concurrent join
     /// requests — `DO NOTHING` returns no row for the loser.
+    ///
+    /// The conflict branch re-asserts the room knobs from config instead of
+    /// leaving them frozen at whatever the row was born with, so raising a
+    /// default reaches shifts that have already hosted a consult. Safe because
+    /// no caller ever passes a per-session custom value — the only one is
+    /// `ensure_session_for_shift`, which always passes `livekit.room_defaults()`.
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_session_for_shift(
         &self,
@@ -83,7 +113,10 @@ impl VideoSessionRepository {
                  max_participants, empty_timeout_s, departure_timeout_s)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (shift_id) DO UPDATE
-               SET updated_at = NOW()
+               SET max_participants    = EXCLUDED.max_participants,
+                   empty_timeout_s     = EXCLUDED.empty_timeout_s,
+                   departure_timeout_s = EXCLUDED.departure_timeout_s,
+                   updated_at          = NOW()
             RETURNING {SESSION_COLUMNS}
             "#
         ))
@@ -190,13 +223,16 @@ impl VideoSessionRepository {
         participant_role: ParticipantRole,
         can_publish: bool,
         token_expires_at: DateTime<Utc>,
+        device_ordinal: i32,
+        device_label: Option<&str>,
     ) -> Result<VideoSessionParticipant, sqlx::Error> {
         sqlx::query_as::<_, VideoSessionParticipant>(&format!(
             r#"
             INSERT INTO video_session_participants
                 (session_id, identity, user_id, clinician_id, display_name,
-                 participant_role, can_publish, token_expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 participant_role, can_publish, token_expires_at,
+                 device_ordinal, device_label)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             ON CONFLICT (session_id, identity) DO UPDATE
                SET user_id           = EXCLUDED.user_id,
                    clinician_id      = EXCLUDED.clinician_id,
@@ -206,6 +242,11 @@ impl VideoSessionRepository {
                    token_issued_at   = NOW(),
                    token_expires_at  = EXCLUDED.token_expires_at,
                    token_issue_count = video_session_participants.token_issue_count + 1,
+                   device_ordinal    = EXCLUDED.device_ordinal,
+                   -- COALESCE so re-issuing a token without a label does not
+                   -- erase one the device already told us.
+                   device_label      = COALESCE(EXCLUDED.device_label,
+                                                video_session_participants.device_label),
                    left_at           = NULL,
                    disconnect_reason = NULL,
                    updated_at        = NOW()
@@ -220,6 +261,36 @@ impl VideoSessionRepository {
         .bind(participant_role.as_str())
         .bind(can_publish)
         .bind(token_expires_at)
+        .bind(device_ordinal)
+        .bind(device_label)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// The next free device slot for this user in this session. `1` is the
+    /// primary device, so the first handoff yields `2`.
+    ///
+    /// Considers live handoffs as well as existing participant rows, so two
+    /// handoffs issued back to back do not both claim slot 2.
+    pub async fn next_device_ordinal(
+        &self,
+        session_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<i32, sqlx::Error> {
+        sqlx::query_scalar::<_, i32>(
+            r#"
+            SELECT GREATEST(
+                COALESCE((SELECT MAX(device_ordinal)
+                            FROM video_session_participants
+                           WHERE session_id = $1 AND user_id = $2), 1),
+                COALESCE((SELECT MAX(device_ordinal)
+                            FROM consult_device_handoffs
+                           WHERE session_id = $1 AND user_id = $2), 1)
+            ) + 1
+            "#,
+        )
+        .bind(session_id)
+        .bind(user_id)
         .fetch_one(&self.pool)
         .await
     }
@@ -317,13 +388,16 @@ impl VideoSessionRepository {
         Ok(())
     }
 
+    /// How many *people* are connected. `DISTINCT` on the user, because one
+    /// person on a laptop and a handed-off phone is two rows but one
+    /// participant — which is what every caller of this means.
     pub async fn count_connected_participants(
         &self,
         session_id: Uuid,
     ) -> Result<i64, sqlx::Error> {
         sqlx::query_scalar::<_, i64>(
             r#"
-            SELECT COUNT(*)
+            SELECT COUNT(DISTINCT COALESCE(user_id::text, identity))
               FROM video_session_participants
              WHERE session_id = $1
                AND joined_at IS NOT NULL
@@ -338,6 +412,11 @@ impl VideoSessionRepository {
     /// Second idempotency layer. The single `UPDATE … WHERE clocked_in_at IS
     /// NULL RETURNING id` means the row lock resolves concurrent deliveries:
     /// exactly one caller gets `Some`.
+    ///
+    /// Callers pass the user's **primary** identity, never the joining device's
+    /// — see `video_service::primary_identity`. Claiming per device would let a
+    /// companion device take a second slot, and a sibling-row `NOT EXISTS`
+    /// check would not be serialised by this row lock.
     pub async fn claim_clockin_slot(
         &self,
         session_id: Uuid,
@@ -382,6 +461,66 @@ impl VideoSessionRepository {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    // Companion-device handoffs ("Continue on phone")
+
+    /// Store a grant. `code_hash` is a SHA-256 hex digest — the plaintext code
+    /// is returned to the issuing client once and never persisted.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_handoff(
+        &self,
+        session_id: Uuid,
+        user_id: Uuid,
+        code_hash: &str,
+        device_ordinal: i32,
+        participant_role: ParticipantRole,
+        mode: JoinMode,
+        device_label: Option<&str>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<ConsultDeviceHandoff, sqlx::Error> {
+        sqlx::query_as::<_, ConsultDeviceHandoff>(&format!(
+            r#"
+            INSERT INTO consult_device_handoffs
+                (session_id, user_id, code_hash, device_ordinal,
+                 participant_role, mode, device_label, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING {HANDOFF_COLUMNS}
+            "#
+        ))
+        .bind(session_id)
+        .bind(user_id)
+        .bind(code_hash)
+        .bind(device_ordinal)
+        .bind(participant_role.as_str())
+        .bind(mode.as_str())
+        .bind(device_label)
+        .bind(expires_at)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Spend a grant. One statement, so the row lock makes redemption
+    /// single-use: a concurrent second redeem of the same code gets `None`.
+    /// `None` is also what an unknown or expired code returns, so a caller
+    /// cannot tell those apart — and therefore cannot probe for live sessions.
+    pub async fn claim_handoff(
+        &self,
+        code_hash: &str,
+    ) -> Result<Option<ConsultDeviceHandoff>, sqlx::Error> {
+        sqlx::query_as::<_, ConsultDeviceHandoff>(&format!(
+            r#"
+            UPDATE consult_device_handoffs
+               SET redeemed_at = NOW()
+             WHERE code_hash   = $1
+               AND redeemed_at IS NULL
+               AND expires_at  > NOW()
+            RETURNING {HANDOFF_COLUMNS}
+            "#
+        ))
+        .bind(code_hash)
+        .fetch_optional(&self.pool)
+        .await
     }
 
     // Audit trail

@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -21,26 +22,79 @@ impl ConsultationNoteRepository {
         Self { pool }
     }
 
+    /// `shift_id` / `session_id` are `None` for an ad-hoc note, which keeps the
+    /// pre-`20240063` flow working unchanged.
+    ///
+    /// `editable_until = NOW() + 1 hour` is set by the statement rather than the
+    /// caller — the same window and the same mechanism as
+    /// `ShiftRepository::upsert_handover`, so the two cannot drift.
     pub async fn create(
         &self,
         patient_id: Uuid,
         hospital_id: Uuid,
         recorded_by: Uuid,
+        shift_id: Option<Uuid>,
+        session_id: Option<Uuid>,
+        amends_note_id: Option<Uuid>,
     ) -> Result<ConsultationNote, RepositoryError> {
         let note = sqlx::query_as::<_, ConsultationNote>(
             r#"
-            INSERT INTO consultation_notes (patient_id, hospital_id, recorded_by)
-            VALUES ($1, $2, $3)
+            INSERT INTO consultation_notes
+                (patient_id, hospital_id, recorded_by, shift_id, session_id,
+                 amends_note_id, editable_until)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '1 hour')
             RETURNING *
             "#,
         )
         .bind(patient_id)
         .bind(hospital_id)
         .bind(recorded_by)
+        .bind(shift_id)
+        .bind(session_id)
+        .bind(amends_note_id)
         .fetch_one(&self.pool)
         .await?;
 
         Ok(note)
+    }
+
+    /// Every note a shift produced, oldest first per patient.
+    pub async fn list_by_shift(
+        &self,
+        shift_id: Uuid,
+    ) -> Result<Vec<ConsultationNote>, RepositoryError> {
+        let notes = sqlx::query_as::<_, ConsultationNote>(
+            r#"
+            SELECT * FROM consultation_notes
+             WHERE shift_id = $1
+             ORDER BY patient_id, created_at ASC
+            "#,
+        )
+        .bind(shift_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(notes)
+    }
+
+    pub async fn list_by_shift_patient(
+        &self,
+        shift_id: Uuid,
+        patient_id: Uuid,
+    ) -> Result<Vec<ConsultationNote>, RepositoryError> {
+        let notes = sqlx::query_as::<_, ConsultationNote>(
+            r#"
+            SELECT * FROM consultation_notes
+             WHERE shift_id = $1 AND patient_id = $2
+             ORDER BY created_at ASC
+            "#,
+        )
+        .bind(shift_id)
+        .bind(patient_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(notes)
     }
 
     pub async fn find_by_id(
@@ -140,6 +194,16 @@ impl ConsultationNoteRepository {
         Ok(segment)
     }
 
+    /// In-place patch, allowed only inside the note's own edit window.
+    ///
+    /// Returns `Ok(None)` when the window has closed, so the caller can answer
+    /// 409 and point at the amendment path instead of silently no-op'ing.
+    ///
+    /// `editable_until IS NOT NULL` is spelled out deliberately: for a row
+    /// written before `20240063` the column is NULL, and a bare
+    /// `editable_until > NOW()` evaluates to NULL rather than TRUE. That
+    /// happens to exclude the row, but only by accident — this says it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_fields(
         &self,
         id: Uuid,
@@ -147,15 +211,25 @@ impl ConsultationNoteRepository {
         history_of_present_illness: Option<&str>,
         assessment: Option<&str>,
         plan: Option<&str>,
-    ) -> Result<ConsultationNote, RepositoryError> {
+        diagnosis: Option<&str>,
+        vitals: Option<&serde_json::Value>,
+        medications: Option<&serde_json::Value>,
+        follow_up_at: Option<DateTime<Utc>>,
+    ) -> Result<Option<ConsultationNote>, RepositoryError> {
         let note = sqlx::query_as::<_, ConsultationNote>(
             r#"
             UPDATE consultation_notes
             SET chief_complaint = COALESCE($2, chief_complaint),
                 history_of_present_illness = COALESCE($3, history_of_present_illness),
                 assessment = COALESCE($4, assessment),
-                plan = COALESCE($5, plan)
+                plan = COALESCE($5, plan),
+                diagnosis = COALESCE($6, diagnosis),
+                vitals = COALESCE($7, vitals),
+                medications = COALESCE($8, medications),
+                follow_up_at = COALESCE($9, follow_up_at)
             WHERE id = $1
+              AND editable_until IS NOT NULL
+              AND editable_until > NOW()
             RETURNING *
             "#,
         )
@@ -164,9 +238,12 @@ impl ConsultationNoteRepository {
         .bind(history_of_present_illness)
         .bind(assessment)
         .bind(plan)
+        .bind(diagnosis)
+        .bind(vitals)
+        .bind(medications)
+        .bind(follow_up_at)
         .fetch_optional(&self.pool)
-        .await?
-        .ok_or(RepositoryError::NotFound(id))?;
+        .await?;
 
         Ok(note)
     }

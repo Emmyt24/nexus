@@ -18,6 +18,7 @@ pub mod ml_client;
 pub mod ml_service_launcher;
 pub mod notification_service;
 pub mod patient_prediction_service;
+pub mod patient_record_service;
 pub mod payout_service;
 pub mod push_service;
 pub mod registration_service;
@@ -49,6 +50,7 @@ pub use notification_service::{NotificationError, NotificationService};
 pub use patient_prediction_service::{
     PatientPredictionError, PatientPredictionService, PatientPredictionWorker,
 };
+pub use patient_record_service::{PatientRecordService, PatientRecordServiceError};
 pub use payout_service::{PayoutService, PayoutServiceError};
 pub use push_service::{PushError, PushService};
 pub use registration_service::{

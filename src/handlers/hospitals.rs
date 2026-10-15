@@ -15,8 +15,21 @@ use crate::{
     utils::errors::{AppError, AppResult},
 };
 
-/// POST /api/v1/hospitals
-
+/// POST /api/v1/hospitals/create
+#[utoipa::path(
+    post,
+    path = "/api/v1/hospitals/create",
+    request_body = CreateHospitalRequest,
+    responses(
+        (status = 201, description = "Hospital created, awaiting verification", body = HospitalResponse),
+        (status = 409, description = "A hospital with this registration number or email already exists"),
+        (status = 422, description = "Validation error")
+    ),
+    tag = "hospitals",
+    security(),
+    summary = "Create a hospital (legacy)",
+    description = "Legacy endpoint kept for backward compatibility. New integrations should use POST /api/v1/hospitals/register, which also provisions the admin user and drives the OTP flow. Takes no Authorization header. The new hospital starts at verification_status `pending` and registration_step `profile_setup`; advance it with PATCH /api/v1/hospitals/{id}/advance-step."
+)]
 pub async fn create_hospital(
     State(state): State<AppState>,
     Json(payload): Json<CreateHospitalRequest>,
@@ -251,8 +264,21 @@ pub async fn get_hospital_location(
         .ok_or_else(|| AppError::NotFound(format!("Location for hospital {id} not found")))
 }
 
-/// PATCH /api/v1/hospitals/:id/advance-step
-
+/// PATCH /api/v1/hospitals/{id}/advance-step
+#[utoipa::path(
+    patch,
+    path = "/api/v1/hospitals/{id}/advance-step",
+    params(("id" = Uuid, Path, description = "Hospital unique identifier")),
+    responses(
+        (status = 200, description = "Advanced to the next registration step", body = HospitalResponse),
+        (status = 404, description = "Hospital not found"),
+        (status = 409, description = "Registration is already complete")
+    ),
+    tag = "hospitals",
+    security(),
+    summary = "Advance a hospital to its next registration step (legacy)",
+    description = "Moves registration_step one place along profile_setup -> credentials -> verification -> access_granted. The next step is derived server-side, so the step cannot be chosen or skipped; calling this on a hospital already at access_granted is a 409. Legacy endpoint, kept for backward compatibility and taking no Authorization header."
+)]
 pub async fn advance_registration_step(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

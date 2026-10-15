@@ -15,6 +15,7 @@ pub mod permission;
 pub mod notification;
 pub mod patient;
 pub mod patient_prediction;
+pub mod patient_record;
 pub mod registration;
 pub mod search;
 pub mod shift;

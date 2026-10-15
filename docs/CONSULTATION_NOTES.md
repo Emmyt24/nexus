@@ -48,6 +48,32 @@ ml-service side — a materially bigger lift, and not needed yet.
   is the running concatenation of every segment's text. `chief_complaint`,
   `history_of_present_illness`, `assessment`, `plan` are clinician-authored,
   nullable until saved via `PATCH`.
+`migrations/20240063_patient_records_and_consult_devices.sql` extends this
+table so a note can belong to a shift. All eight columns are **nullable or
+defaulted**, so the ad-hoc flow above keeps working unchanged:
+
+| Column | Purpose |
+|---|---|
+| `shift_id` | The shift this note was written on. `NULL` for an ad-hoc note, which is legal and simply never appears in a shift roll-up. |
+| `session_id` | The video session it was written during. `ON DELETE SET NULL` — the clinical record must outlive the call. |
+| `diagnosis` | Free text, alongside the existing SOAP fields. |
+| `vitals` / `medications` | `JSONB`, defaulting to `{}` / `[]`. |
+| `follow_up_at` | When the patient should be seen again. |
+| `editable_until` | Closes the edit window one hour after creation. |
+| `amends_note_id` | Points at the note this one amends. |
+
+**The edit window treats `NULL` as closed, not open.** Rows written before
+`20240063` have no window, so the update guard reads
+`editable_until IS NOT NULL AND editable_until > NOW()`. A `PATCH` after the
+window closes is a **409**, not a silent no-op; the way to change a locked
+note is to file an amendment, which creates a *new* row pointing at the
+original through `amends_note_id` and leaves the original byte-for-byte
+intact.
+
+`status` remains a bare `VARCHAR(20)` validated in Rust only — `20240063`
+deliberately adds no `CHECK` to it, as constraining existing rows is a
+separate and riskier change.
+
 - **`consultation_transcript_segments`** — one row per audio chunk:
   `audio_path` (where the chunk landed on local disk), `transcript_text`,
   `status` (`completed`/`failed` — a failed chunk doesn't fail the whole
@@ -64,6 +90,16 @@ multiple backend instances without shared disk.
 All role-gated to `HealthWorker`/`HospitalAdmin`, same as the rest of the
 patients API.
 
+**The role guard is not the tenant boundary.** A role only proves the caller
+is *a* health worker or *a* hospital admin, never *which* hospital they
+belong to, and there is no row-level security in Postgres. Every read and
+write below therefore also compares `claims.hospital_id` against the note's
+own `hospital_id` in `ConsultationNoteService` and returns **403** on a
+mismatch. A health worker's JWT carries no hospital, so for those callers the
+check falls back to the note's shift: being that shift's assigned clinician
+is the claim. Platform staff (`SuperAdmin` / `OperationsAdmin`) are refused
+outright — NDPR gives them no lawful basis for clinical content.
+
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/v1/patients/{patient_id}/consultation-notes` | Start a new note |
@@ -72,6 +108,13 @@ patients API.
 | `POST` | `/api/v1/consultation-notes/{id}/audio-chunk` | Upload + transcribe one audio chunk (multipart: `sequence`, `audio`) |
 | `PATCH` | `/api/v1/consultation-notes/{id}` | Save structured fields (all optional — partial saves supported) |
 | `POST` | `/api/v1/consultation-notes/{id}/complete` | Mark the note completed |
+| `GET` | `/api/v1/shifts/{shift_id}/patients/{patient_id}/consultation-notes` | This patient's notes for one shift (see `docs/VIDEO_CONSULTATIONS_FRONTEND.md`) |
+
+`POST /api/v1/patients/{patient_id}/consultation-notes` accepts optional
+`shift_id` and `session_id` in the body. When `shift_id` is supplied the
+caller must be that shift's **assigned clinician**, and the patient must
+belong to the shift's hospital. Neither the author nor the hospital is ever
+read from the request body — both are resolved from the JWT and the shift.
 
 Full request/response shapes: Swagger at `/api/docs` (tag
 `consultation-notes`), or `src/handlers/consultation_notes.rs` directly.
@@ -127,3 +170,7 @@ curl -X POST "http://localhost:8080/api/v1/consultation-notes/$NOTE_ID/complete"
 - No AI-generated note summary (see above).
 - Audio stored on local disk, not object storage — see Schema section.
 - Near-live, not true streaming transcription — see Data flow section.
+- `GET /api/v1/consultation-notes/{id}` returns `ConsultationNoteDetail`,
+  which `#[serde(flatten)]`s `ConsultationNote`. The eight columns added in
+  `20240063` therefore appear as new top-level keys on that response. This is
+  additive — no existing key changed name, type or meaning.

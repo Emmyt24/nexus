@@ -12,6 +12,7 @@ pub mod hospitals;
 pub mod identity;
 pub mod location;
 pub mod notifications;
+pub mod patient_records;
 pub mod patients;
 pub mod pipeline;
 pub mod platform;

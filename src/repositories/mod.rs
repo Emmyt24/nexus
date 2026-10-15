@@ -11,6 +11,7 @@ pub mod location;
 pub mod notification;
 pub mod patient;
 pub mod patient_prediction;
+pub mod patient_record;
 pub mod search;
 pub mod shift;
 pub mod video_session;
@@ -30,5 +31,6 @@ pub use identity_verification::{IdentityRepoError, IdentityVerificationRepositor
 pub use location::LocationRepository;
 pub use patient::{PatientRepository, RepositoryError as PatientRepoError};
 pub use patient_prediction::PatientPredictionRepository;
+pub use patient_record::PatientRecordRepository;
 pub use video_session::VideoSessionRepository;
 pub use wallet::{WalletRepoError, WalletRepository};
